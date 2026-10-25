@@ -96,6 +96,28 @@ test('catalog uses the effective price factor, not the crossed-out original pric
   assert.equal(byId['paid-model'].free, false);
 });
 
+test('trial ignores literal null SSE frames instead of throwing', async () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  const encoder = new TextEncoder();
+  client.chat = async () => ({
+    ok: true,
+    text: async () => '',
+    body: new ReadableStream({
+      start(controller) {
+        controller.enqueue(encoder.encode('data: null\n\n'));
+        controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"pong"}}],"usage":{"total_tokens":3}}\n\n'));
+        controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+        controller.close();
+      },
+    }),
+  });
+  const result = await client.test({
+    model: 'auto', prompt: 'ping', firstByteTimeoutMs: 2000, idleTimeoutMs: 2000,
+  });
+  assert.equal(result.text, 'pong');
+  assert.equal(result.usage.total_tokens, 3);
+});
+
 test('importPat exchanges identity and stores a token-sourced account', async () => {
   const client = new QoderClient({ region: 'global', log: () => {} });
   await withFetch(async (url) => {

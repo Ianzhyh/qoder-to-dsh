@@ -44,6 +44,24 @@ test('stream error frames finish as errors instead of pretending success', () =>
   assert.match(finish.reason.failure.message, /E1/);
 });
 
+test('null and primitive SSE frames are ignored without throwing', () => {
+  const translator = new StreamTranslator();
+  assert.deepEqual(translator.pushLine('data: null'), []);
+  assert.deepEqual(translator.pushLine('data: 42'), []);
+  assert.deepEqual(translator.pushLine('data: []'), []);
+  assert.deepEqual(translator.pushLine('data: {"choices":[{"delta":{"content":"ok"}}]}').filter((chunk) => chunk.type === 'text-delta').map((chunk) => chunk.text), ['ok']);
+  const finish = translator.finish().find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'stop');
+});
+
+test('a string error frame still fails the stream visibly', () => {
+  const translator = new StreamTranslator();
+  translator.pushLine('data: {"error":"upstream nope"}');
+  const finish = translator.finish().find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.match(finish.reason.failure.message, /upstream nope/);
+});
+
 test('classifyError recognizes queue responses as rate limits', () => {
   assert.equal(classifyError('{"isQueued":true,"retryAfterSeconds":30}', 403), CODE.RATE_LIMIT);
   assert.equal(classifyError('unauthorized', 401), CODE.AUTH);
