@@ -284,6 +284,15 @@ test('diagnostics and test routes fail visibly instead of pretending success', a
   assert.match(String(testRun.json.error), /登录|凭据|Qoder/);
 });
 
+test('the bare /qoder command defaults to status instead of an unknown subcommand', async () => {
+  const command = commands.find((item) => item.name === 'qoder');
+  for (const rawInput of ['', '   ', undefined]) {
+    const result = await command.handler({ rawInput });
+    assert.equal(result.kind, 'success', `rawInput=${JSON.stringify(rawInput)} should fall back to status`);
+    assert.match(result.text, /登录：/);
+  }
+});
+
 test('login command reuses the panel session, reports pending, and recovers from expiry', async () => {
   const client = adapters[0].adapter.client;
   const previousBegin = client.beginDeviceAuth;

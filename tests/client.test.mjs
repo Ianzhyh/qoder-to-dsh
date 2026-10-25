@@ -178,3 +178,40 @@ test('a throwing poll callback does not stop later ticks', async () => {
   stop();
   assert.ok(ticks >= 2, 'polling should survive a callback error');
 });
+
+test('quota timestamps treat second-level epochs like the official client', async () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  const seconds = 1_790_000_000;
+  assert.equal(exports.toEpochMs(seconds), seconds * 1000);
+  assert.equal(exports.toEpochMs(seconds * 1000), seconds * 1000);
+  assert.equal(exports.toEpochMs('1790000000'), seconds * 1000);
+  assert.equal(exports.toEpochMs(0), null);
+  assert.equal(exports.toEpochMs('2026-10-25'), null, '日期字符串交给 Date 解析，不能当数字');
+});
+
+test('auto output tokens follows the same clamping as the host resolver', async () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  assert.equal(exports.autoOutputTokens(64_000, 32_000, 32_000), 32_000, '插件默认高于模型上限时要收敛');
+  assert.equal(exports.autoOutputTokens(16_000, 128_000, 32_000), 16_000);
+  assert.equal(exports.autoOutputTokens(0, 128_000, 32_000), 128_000);
+  assert.equal(exports.autoOutputTokens(0, 0, 32_000), 32_000);
+});
+
+test('a per-request timeout can outlive the default so deep diagnostics can finish', async () => {
+  const { exports } = loadClient((url, init) => new Promise((resolve, reject) => {
+    const signal = init && init.signal;
+    const fail = () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+    if (!signal) return;
+    if (signal.aborted) fail();
+    else signal.addEventListener('abort', fail, { once: true });
+  }));
+  const started = Date.now();
+  await assert.rejects(
+    exports.getJson('/qoder/diagnostics', { timeoutMs: 30 }),
+    (error) => {
+      assert.match(error.message, /请求超时/);
+      return true;
+    },
+  );
+  assert.ok(Date.now() - started < 1000, '应按本次请求的 30ms 超时，而不是默认 20 秒');
+});

@@ -847,7 +847,10 @@ export function apply(ctx, rawConfig = {}) {
           description: 'Qoder 接入：状态 / 登录 / 模型 / 用量 / 签到 / 诊断 / 刷新',
           input: { hint: 'status | models | usage | checkin [run] | login | logout | diagnose | refresh | test [model]' },
           async handler({ rawInput }) {
-            const [arg = 'status', ...rest] = String(rawInput || '').trim().split(/\s+/);
+            const [first = 'status', ...rest] = String(rawInput || '').trim().split(/\s+/).filter(Boolean);
+            // `/qoder` 不带参数时按 status 处理：空字符串 split 后是 ['']，
+            // 旧写法会把 arg 变成空串并回复“未知子命令：”。
+            const arg = first || 'status';
             if (arg === 'status') {
               const data = await snapshot({});
               return {

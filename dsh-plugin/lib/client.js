@@ -16,6 +16,9 @@
     // 宿主半死时 fetch 可以一直挂着，按钮就永远 busy、晚到的响应还会盖掉新数据。
     // 自己带 signal 的调用（试跑的取消）沿用调用方的信号，其余统一 20 秒。
     const REQUEST_TIMEOUT_MS = 20_000;
+    // 诊断/深度状态会同步刷新目录与额度：目录要按网关逐个重试（每个 20 秒），
+    // 再用客户端的 20 秒去卡它只会得到“请求超时”，后端其实还在正常干活。
+    const DEEP_TIMEOUT_MS = 90_000;
     // dsh 的 Web 兜底处理器在插件路由挂上之前对未命中路径回 404。刷新页面
     // 正好撞上这个启动窗口时，快速重试几次比把红字挂到下一轮轮询更好。
     const ROUTE_READY_RETRY_MS = [350, 800, 1300];
@@ -23,15 +26,16 @@
     const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
     async function requestOnce(path, opts) {
-      const controller = opts.signal ? null : new AbortController();
-      const timer = controller ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS) : null;
+      const { timeoutMs = REQUEST_TIMEOUT_MS, ...init } = opts;
+      const controller = init.signal ? null : new AbortController();
+      const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
       try {
         const res = await fetch(path, {
           credentials: 'same-origin',
           cache: 'no-store',
-          ...opts,
-          signal: opts.signal || controller.signal,
-          headers: { ...(opts.headers), ...(opts.body ? PANEL_HEADERS : READ_HEADERS) },
+          ...init,
+          signal: init.signal || controller.signal,
+          headers: { ...(init.headers), ...(init.body ? PANEL_HEADERS : READ_HEADERS) },
         });
         let data = null;
         try { data = await res.json(); } catch { data = null; }
@@ -45,7 +49,7 @@
         return data || { ok: false, error: '空响应' };
       } catch (error) {
         if (controller && controller.signal.aborted) {
-          const timeout = new Error('请求超时（' + (REQUEST_TIMEOUT_MS / 1000) + ' 秒未响应）');
+          const timeout = new Error('请求超时（' + (timeoutMs / 1000) + ' 秒未响应）');
           timeout.status = 0;
           throw timeout;
         }
@@ -77,7 +81,7 @@
       }
     }
 
-    const getJson = (path) => requestJson(path);
+    const getJson = (path, options) => requestJson(path, options);
     const postJson = (path, body, extra) => requestJson(path, { method: 'POST', body: JSON.stringify(body || {}), ...extra });
 
     const documentVisible = (doc) => !doc || doc.visibilityState !== 'hidden';
@@ -138,6 +142,14 @@
       return String(Math.round(value));
     }
     const pct = (n) => (n === null || n === undefined || !Number.isFinite(Number(n)) ? '—' : Math.round(Number(n) * 100) + '%');
+    // 与服务端 resolveModel 同一条公式：有插件默认先取默认值，再受模型输出
+    // 上限收敛；否则用模型上限，最后才退回 Qoder CLI 的 32K。
+    const autoOutputTokens = (pluginMaxTokens, modelMaxTokens, providerDefault) => {
+      const cap = num(modelMaxTokens);
+      const fallback = num(providerDefault) || 32000;
+      const base = num(pluginMaxTokens) || cap || fallback;
+      return cap > 0 ? Math.min(base, cap) : base;
+    };
     const dayLabel = (date) => (date ? String(date).slice(5) : '');
     const money = (n) => {
       if (n === null || n === undefined) return '—';
@@ -189,9 +201,17 @@
       const time = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
       return d.toDateString() === now.toDateString() ? time : `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${time}`;
     };
+    const toEpochMs = (value) => {
+      const n = Number(value);
+      if (!Number.isFinite(n) || n <= 0) return null;
+      // 上游的额度/套餐到期时间是秒级 epoch（官方客户端同样按 <1e10 判秒），
+      // 直接塞给 Date 会显示成 1970 年。
+      return n < 1e10 ? n * 1000 : n;
+    };
     const dateLabel = (value) => {
       if (!value) return '';
-      const d = new Date(Number(value) > 1e12 ? Number(value) : value);
+      const epoch = toEpochMs(value);
+      const d = new Date(epoch === null ? value : epoch);
       return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('zh-CN');
     };
     const duration = (ms) => {
@@ -738,8 +758,10 @@
       const effectiveTemp = nextParams.temperature === undefined
         ? (pluginTemperature !== null ? `未指定（插件默认 ${pluginTemperature}）` : '未指定（不传）')
         : String(nextParams.temperature);
-      const autoMaxTokens = pluginMaxTokens || maxCap || providerMaxTokens;
-      const autoMaxSource = pluginMaxTokens ? '插件默认' : (maxCap ? '模型上限' : 'Qoder 默认');
+      const autoMaxTokens = autoOutputTokens(pluginMaxTokens, maxCap, providerMaxTokens);
+      const autoMaxSource = pluginMaxTokens
+        ? (maxCap && pluginMaxTokens > maxCap ? '插件默认（已按模型上限收敛）' : '插件默认')
+        : (maxCap ? '模型上限' : 'Qoder 默认');
       const effectiveMaxText = nextParams.maxTokens
         ? compact(nextParams.maxTokens)
         : `${compact(autoMaxTokens)}（${autoMaxSource}）`;
@@ -934,19 +956,21 @@
       useEffect(() => {
         if (presetModel) setModelId(presetModel);
       }, [presetModel]);
-      useEffect(() => {
-        if (modelId && all.some((model) => model.id === modelId)) return;
-        const next = pinned || (list[0] && list[0].id) || (all[0] && all[0].id) || '';
-        if (next) setModelId(next);
-      }, [all.length, pinned]); // eslint-disable-line react-hooks/exhaustive-deps
-      useEffect(() => {
-        // 试跑默认用最低档，避免一次连通性检查先等十几秒思考；用户可切回已保存档位。
-        const target = all.find((item) => item.id === modelId);
-        const levels = target && Array.isArray(target.reasoningEfforts) ? target.reasoningEfforts : [];
-        setEffort(levels[0] || '');
-      }, [modelId, all.length]);
+      // 目录刷新/换号后模型集合可能变化但数量不变（例如同数量的模型被替换），
+      // 只盯 all.length 会让试跑停在一个已经不存在的 id 上，下一次请求直接 400。
       const model = all.find((item) => item.id === modelId) || null;
       const efforts = model && Array.isArray(model.reasoningEfforts) ? model.reasoningEfforts : [];
+      const modelSignature = all.map((item) => item.id).join('\u0000');
+      const effortSignature = efforts.join('\u0000');
+      useEffect(() => {
+        if (modelId && all.some((item) => item.id === modelId)) return;
+        const next = pinned || (list[0] && list[0].id) || (all[0] && all[0].id) || '';
+        if (next) setModelId(next);
+      }, [modelSignature, pinned]); // eslint-disable-line react-hooks/exhaustive-deps
+      useEffect(() => {
+        // 试跑默认用最低档，避免一次连通性检查先等十几秒思考；用户可切回已保存档位。
+        setEffort(efforts[0] || '');
+      }, [modelId, effortSignature]);
       const run = async () => {
         if (busy) return;
         if (!modelId) return setError('先选择一个模型');
@@ -1698,7 +1722,10 @@
           const params = [];
           if (deep) params.push('deep=1');
           if (rescan) params.push('rescan=1');
-          const data = await getJson('/qoder/status' + (params.length ? `?${params.join('&')}` : ''));
+          const data = await getJson(
+            '/qoder/status' + (params.length ? `?${params.join('&')}` : ''),
+            deep ? { timeoutMs: DEEP_TIMEOUT_MS } : undefined,
+          );
           if (!mounted.current || seq !== statusSeq.current) return;
           setStatus(data);
           setStatusError('');
@@ -1868,12 +1895,15 @@
         }
       };
 
+      // 天窗口和 Credits 区间互不影响：切 7/14/30 天不该顺带重读整年热力图，
+      // 切换 Credits 区间也不该刷掉下方的逐条请求列表。
       useEffect(() => {
-        if (tab === 'usage') {
-          loadUsage(usageDays);
-          loadCredits(creditsRange);
-        }
-      }, [tab, usageDays, creditsRange, loadUsage, loadCredits]);
+        if (tab === 'usage') loadUsage(usageDays);
+      }, [tab, usageDays, loadUsage]);
+
+      useEffect(() => {
+        if (tab === 'usage') loadCredits(creditsRange);
+      }, [tab, creditsRange, loadCredits]);
 
       useVisibilityPoll(() => loadUsage(usageDays, true), 30_000, tab === 'usage');
 
@@ -1881,7 +1911,7 @@
         const seq = ++diagnosticsSeq.current;
         setDiagnosticsError('');
         try {
-          const data = await getJson('/qoder/diagnostics');
+          const data = await getJson('/qoder/diagnostics', { timeoutMs: DEEP_TIMEOUT_MS });
           if (!mounted.current || seq !== diagnosticsSeq.current) return;
           setDiagnostics(data);
         } catch (err) {
@@ -1925,6 +1955,12 @@
           setUsageError('');
           setCreditsError('');
           setModelsError('');
+          // 序号递增会让旧账号的在途请求在 finally 里直接返回；不清 busy 的话
+          // 账号/用量页会一直停在“读取中”，按钮也一直禁用。
+          setAccountBusy(false);
+          setUsageBusy(false);
+          setCreditsBusy(false);
+          setModelBusy('');
           setSwitcherOpen(false);
           setExpanded('');
           setEditorDirty(false);
@@ -3512,7 +3548,14 @@
           }, '打开授权页') : null,
           error ? h('span', { className: 'qdr-chat-login-error', title: error }, error) : null);
       }
-      const quota = quotaSummary((data && data.extras) || accountExtras);
+      // status 里的 extras 与 /qoder/account 拉到的 extras 都是同一份缓存的快照；
+      // 之前固定优先 status，导致 qoder:quota-changed 刚推来的新额度被旧值盖住，
+      // 胶囊要等下一次 45 秒轮询才更新。按 at 取更新的那份。
+      const statusExtras = data && data.extras;
+      const extras = statusExtras && accountExtras
+        ? ((Number(accountExtras.at) || 0) >= (Number(statusExtras.at) || 0) ? accountExtras : statusExtras)
+        : (accountExtras || statusExtras);
+      const quota = quotaSummary(extras);
       const low = quota && (quota.exceeded || quota.ratio >= 0.9);
       const title = quota
         ? `Qoder 额度：${money(quota.remaining)} / ${money(quota.total)} ${quota.unit} · 已用 ${Math.round(quota.ratio * 100)}%${quota.at ? ` · 更新于 ${stamp(quota.at)}` : ''}${quota.expiresAt ? ` · ${dateLabel(quota.expiresAt)} 到期` : ''} · 今日 ${today.requests || 0} 次（设置 → Qoder）`
@@ -3566,6 +3609,8 @@
     exports.getJson = getJson;
     exports.postJson = postJson;
     exports.startVisibilityPoll = startVisibilityPoll;
+    exports.toEpochMs = toEpochMs;
+    exports.autoOutputTokens = autoOutputTokens;
     return module.exports;
   }
 

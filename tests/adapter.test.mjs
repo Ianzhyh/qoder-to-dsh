@@ -44,6 +44,21 @@ test('stream error frames finish as errors instead of pretending success', () =>
   assert.match(finish.reason.failure.message, /E1/);
 });
 
+test('an in-stream error frame keeps its HTTP status so retry policy can act on it', () => {
+  const cases = [
+    [{ message: 'upstream refused', code: 503 }, CODE.SERVER],
+    [{ message: 'not allowed', code: 401 }, CODE.AUTH],
+    [{ message: 'slow down', code: 429 }, CODE.RATE_LIMIT],
+  ];
+  for (const [error, expected] of cases) {
+    const translator = new StreamTranslator();
+    translator.pushLine(`data: ${JSON.stringify({ error })}`);
+    const finish = translator.finish().find((chunk) => chunk.type === 'finish');
+    assert.equal(finish.reason.kind, 'error');
+    assert.equal(finish.reason.failure.code, expected, `code ${error.code} should classify as ${expected}`);
+  }
+});
+
 test('null and primitive SSE frames are ignored without throwing', () => {
   const translator = new StreamTranslator();
   assert.deepEqual(translator.pushLine('data: null'), []);
@@ -78,6 +93,8 @@ test('classifyError recognizes queue responses as rate limits', () => {
   assert.equal(classifyError('unauthorized', 401), CODE.AUTH);
   assert.equal(classifyError('context length exceeded', 400), CODE.CONTEXT);
   assert.equal(classifyError('socket hang up', 0), CODE.TRANSPORT);
+  assert.equal(classifyError('getaddrinfo ENOTFOUND api3.qoder.sh', 0), CODE.TRANSPORT, 'DNS 失败必须归到可重试的连接错误');
+  assert.equal(classifyError('EAI_AGAIN api2.qoder.sh', 0), CODE.TRANSPORT);
 });
 
 test('mapUsage keeps bucket sum equal to total', () => {
@@ -167,6 +184,15 @@ test('toWireMessage keeps assistant tool-call content as an empty string', async
   assert.equal(text.content, 'hi');
 });
 
+test('plain string content is not dropped on the way to the wire', async () => {
+  const user = await toWireMessage({ role: 'user', content: 'hello' }, async () => null);
+  assert.deepEqual(user, { role: 'user', content: 'hello' });
+  const tool = await toWireMessage({ role: 'tool', tool_call_id: 'c1', content: 'file contents' }, async () => null);
+  assert.equal(tool.content, 'file contents');
+  const assistant = await toWireMessage({ role: 'assistant', content: 'done' }, async () => null);
+  assert.equal(assistant.content, 'done');
+});
+
 test('toWireTools deduplicates by name and keeps JSON schema', () => {
   const tools = toWireTools({
     tools: [
@@ -218,6 +244,19 @@ test('catalog keeps the upstream cache timestamp instead of faking freshness', a
   assert.equal(adapter.catalogCache.at, staleAt, '刷新失败时不能把缓存时间改写成当前时间');
   assert.equal(adapter.catalogCache.staleMs, 3_600_000);
   assert.equal(adapter.catalogCache.error, '网关超时');
+});
+
+test('a catalog result without a timestamp is not reported as freshly refreshed', async () => {
+  const adapter = new QoderAdapter({
+    provider: 'qoder',
+    prefs: { visible: null, pinned: '', contextWindowByModel: {}, paramsByModel: {} },
+    client: {
+      listCatalog: async () => ({ models: [], at: 0, staleMs: 0, error: '尚未登录 Qoder' }),
+    },
+  });
+  await adapter.catalog();
+  assert.equal(adapter.catalogCache.at, 0, '没有时间戳时不能伪造“刚刚刷新”');
+  assert.equal(adapter.catalogCache.error, '尚未登录 Qoder');
 });
 
 test('resolveModel uses the public Qoder CLI 32K output default and clamps configured caps', async () => {

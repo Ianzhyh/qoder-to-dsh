@@ -1,8 +1,10 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import https from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { PassThrough } from 'node:stream';
 
 const home = mkdtempSync(join(tmpdir(), 'qoder-api-'));
 process.env.DSH_HOME = home;
@@ -11,7 +13,7 @@ process.env.APPDATA = join(home, 'appdata');
 process.env.USERPROFILE = join(home, 'user');
 process.env.QODER_REGION = 'global';
 
-const { QoderClient } = await import('../lib/qoder-api.mjs');
+const { QoderClient, shouldAdoptDesktopAuth } = await import('../lib/qoder-api.mjs');
 const { normalizeCatalog } = await import('../lib/qoder-api.mjs');
 const { QoderAdapter, StreamTranslator, CODE } = await import('../lib/adapter.mjs');
 const { PATHS } = await import('../lib/config.mjs');
@@ -284,6 +286,8 @@ test('a rejected PAT keeps the previous account instead of logging it out', asyn
     user: { id: 'u-pat-old', name: 'Old Account' },
     source: 'token',
   }, { silent: true });
+  client.catalogCache = { at: Date.now(), models: [{ id: 'keep-model', name: 'Keep' }], error: '', staleMs: 0 };
+  client.rawById = new Map([['keep-model', { id: 'keep-model', name: 'Keep' }]]);
   await client.flushAuthWrite();
 
   await withFetch(async (url) => {
@@ -296,6 +300,8 @@ test('a rejected PAT keeps the previous account instead of logging it out', asyn
   assert.equal(client.auth.user.id, 'u-pat-old');
   assert.equal(client.auth.accessToken, 'dt-pat-old');
   assert.equal(readEncryptedJson(PATHS.auth).user.id, 'u-pat-old');
+  assert.equal(client.catalogCache.models[0].id, 'keep-model', '回滚账号时也要把目录快照还原');
+  assert.equal(client.rawModel('keep-model').name, 'Keep');
 });
 
 test('device authorization polls into a persisted account for the requested region', async () => {
@@ -751,6 +757,146 @@ test('status can skip the desktop credential scan', () => {
 test('desktop key prewarm is a no-op without official clients', async () => {
   const { prewarmDesktopKeysAsync } = await import('../lib/desktop-auth.mjs');
   await prewarmDesktopKeysAsync();
+});
+
+test('desktop token adoption only moves forward to a newer token', () => {
+  const now = Date.now();
+  const current = { accessToken: 'dt-current', expiresAt: now + 3_600_000 };
+  assert.equal(shouldAdoptDesktopAuth(current, { accessToken: 'dt-current', expiresAt: now + 7_200_000 }, now), false, '同一个令牌无需切换');
+  assert.equal(shouldAdoptDesktopAuth(current, { accessToken: 'dt-older', expiresAt: now + 1_800_000 }, now), false, '官方文件更旧时不能覆盖插件刚刷新的令牌');
+  assert.equal(shouldAdoptDesktopAuth(current, { accessToken: 'dt-unknown', expiresAt: 0 }, now), false, '无法判断新旧时保留当前令牌');
+  assert.equal(shouldAdoptDesktopAuth(current, { accessToken: 'dt-newer', expiresAt: now + 7_200_000 }, now), true);
+
+  assert.equal(shouldAdoptDesktopAuth({ accessToken: '', expiresAt: 0 }, { accessToken: 'dt-any', expiresAt: 0 }, now), true, '没有访问令牌时必须采用官方令牌');
+  const expired = { accessToken: 'dt-expired', expiresAt: now - 1000 };
+  assert.equal(shouldAdoptDesktopAuth(expired, { accessToken: 'dt-also-expired', expiresAt: now - 500 }, now), false);
+  assert.equal(shouldAdoptDesktopAuth(expired, { accessToken: 'dt-fresh', expiresAt: now + 3_600_000 }, now), true);
+});
+
+test('a token refresh treats expires_in as milliseconds, like the official client', async () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  const rawSetAuth = client.setAuth.bind(client);
+  client.setAuth = (auth, options = {}) => rawSetAuth(auth, { ...options, persist: false });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: '',
+    refreshToken: 'drt-ms',
+    expiresAt: Date.now() - 1000,
+    user: { id: 'u-ms' },
+    source: 'token',
+  }, { silent: true });
+
+  const before = Date.now();
+  await withFetch(async (url) => {
+    assert.match(String(url), /\/api\/v1\/deviceToken\/refresh$/);
+    return json({ token: 'dt-ms', refresh_token: 'drt-ms-next', expires_in: 3_600_000 });
+  }, async () => {
+    await client.refreshAuth();
+  });
+
+  const ttl = client.auth.expiresAt - before;
+  assert.ok(ttl > 3_500_000 && ttl < 3_700_000, `expires_in 必须按毫秒累加，实际 ${ttl}ms`);
+});
+
+test('buildChatBody forwards the temperature preference to upstream parameters', () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-temperature',
+    user: { id: 'u-temperature' },
+    source: 'token',
+  }, { silent: true, persist: false });
+
+  const body = client.buildChatBody({
+    model: 'auto',
+    messages: [{ role: 'user', content: 'hi' }],
+    temperature: 0.3,
+    max_tokens: 512,
+  }, null);
+  assert.equal(body.parameters.temperature, 0.3);
+  assert.equal(body.parameters.max_tokens, 512);
+
+  const zero = client.buildChatBody({
+    model: 'auto', messages: [{ role: 'user', content: 'hi' }], temperature: 0, max_tokens: 8,
+  }, null);
+  assert.equal(zero.parameters.temperature, 0, '0 是合法温度，不能当成未设置');
+
+  const unset = client.buildChatBody({
+    model: 'auto', messages: [{ role: 'user', content: 'hi' }], max_tokens: 8,
+  }, null);
+  assert.equal('temperature' in unset.parameters, false, '未设置时必须继续由上游决定');
+});
+
+test('a catalog response that dies mid-body rejects instead of crashing or hanging', async () => {
+  const client = catalogClient();
+  const original = https.request;
+  let calls = 0;
+  https.request = (url, options, callback) => {
+    calls += 1;
+    const res = new PassThrough();
+    res.statusCode = 200;
+    callback(res);
+    setImmediate(() => res.destroy(new Error('socket hang up')));
+    return { on() {}, setTimeout() {}, write() {}, end() {}, destroy() {} };
+  };
+  try {
+    await assert.rejects(() => client.fetchCatalog(), /socket hang up/);
+    assert.equal(calls, 3, '每个候选网关都必须明确失败，而不是让请求悬住');
+  } finally {
+    https.request = original;
+  }
+});
+
+test('switching accounts clears the model catalog and discards in-flight models', async () => {
+  const client = catalogClient();
+  client.catalogCache = { at: Date.now(), models: [{ id: 'old-model', name: 'Old' }], error: '', staleMs: 0 };
+  client.rawById = new Map([['old-model', { id: 'old-model', name: 'Old' }]]);
+
+  const gate = deferred();
+  client.fetchCatalog = async () => {
+    await gate.promise;
+    return {
+      models: [{ id: 'old-model', name: 'Old' }],
+      rawById: new Map([['old-model', { id: 'old-model', name: 'Old' }]]),
+    };
+  };
+
+  const job = client.listCatalog({ refresh: true });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const generation = client.catalogGeneration;
+
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-account-b',
+    user: { id: 'u-account-b', name: 'Account B' },
+    source: 'token',
+  }, { silent: true, persist: false });
+
+  assert.equal(client.catalogCache.models.length, 0, '换号后不能继续展示上一个账号的模型');
+  assert.equal(client.rawById.size, 0);
+  assert.ok(client.catalogGeneration > generation);
+
+  gate.resolve();
+  const result = await job;
+  assert.deepEqual(result.models, []);
+  assert.equal(client.catalogCache.models.length, 0, '旧账号的目录结果不能写回新账号');
+  assert.equal(client.rawModel('old-model'), null);
+
+  // 同一账号的令牌刷新不属于换号：目录必须保留，否则每次刷新都会让选择器闪空。
+  client.catalogCache = { at: Date.now(), models: [{ id: 'keep' }], error: '', staleMs: 0 };
+  const keptGeneration = client.catalogGeneration;
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-account-b-next',
+    user: { id: 'u-account-b', name: 'Account B' },
+    source: 'token',
+  }, { silent: true, sameIdentity: true, persist: false });
+  assert.equal(client.catalogCache.models[0].id, 'keep');
+  assert.equal(client.catalogGeneration, keptGeneration);
 });
 
 test('cleanup', () => {
