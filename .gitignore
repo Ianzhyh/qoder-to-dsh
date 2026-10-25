@@ -3,6 +3,7 @@ node_modules/
 .tmp-qoder/
 .tmp-ui/
 .tmp-app/
+.workbuddy/
 *.log
 *.tgz
 .DS_Store
