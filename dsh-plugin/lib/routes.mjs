@@ -231,15 +231,23 @@ export function createRouteTable({ controller, log = () => {} }) {
         if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
         if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-qoder-panel header' });
         const body = await readJsonBody(req);
-        sendJson(res, 200, {
-          ok: true,
-          ...(await controller.test({
-            model: String(body?.model || ''),
-            prompt: String(body?.prompt || ''),
-            maxTokens: Number(body?.maxTokens) || 0,
-            reasoningEffort: String(body?.reasoningEffort || ''),
-          })),
-        });
+        const abort = new AbortController();
+        const onClose = () => { if (!res.writableEnded) abort.abort(new Error('试跑已取消')); };
+        res.on?.('close', onClose);
+        try {
+          sendJson(res, 200, {
+            ok: true,
+            ...(await controller.test({
+              model: String(body?.model || ''),
+              prompt: String(body?.prompt || ''),
+              maxTokens: Number(body?.maxTokens) || 0,
+              reasoningEffort: String(body?.reasoningEffort || ''),
+              signal: abort.signal,
+            })),
+          });
+        } finally {
+          res.off?.('close', onClose);
+        }
       }),
     },
     {

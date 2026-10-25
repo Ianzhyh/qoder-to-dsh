@@ -537,6 +537,10 @@ export function apply(ctx, rawConfig = {}) {
     const task = (async () => {
       const now = Date.now();
       const results = [];
+      // 一次签到可能跑多个账号、持续数秒；期间换号时不能用新账号的令牌
+      // 去执行旧账号的领取，否则会把 B 的今日权益记到 A 的条目上。
+      const runAuthGeneration = client.authGeneration;
+      const runAuthUid = String(client.auth?.user?.id || '');
       for (const account of targets) {
         const saved = checkinState.results[account.key];
         const doneToday = saved
@@ -552,14 +556,22 @@ export function apply(ctx, rawConfig = {}) {
               now,
               getToken: async () => {
                 if (account.active) {
+                  if (client.authGeneration !== runAuthGeneration
+                    || String(client.auth?.user?.id || '') !== runAuthUid) {
+                    return account.accessToken || '';
+                  }
                   await client.ensureAccessToken().catch(() => {});
+                  if (client.authGeneration !== runAuthGeneration) return account.accessToken || '';
                   return (client.auth && client.auth.accessToken) || account.accessToken || '';
                 }
                 return account.accessToken || rescanAccountToken(account);
               },
               refreshToken: async () => {
                 if (account.active) {
+                  if (client.authGeneration !== runAuthGeneration
+                    || String(client.auth?.user?.id || '') !== runAuthUid) return '';
                   await client.refreshAuth();
+                  if (client.authGeneration !== runAuthGeneration) return '';
                   return (client.auth && client.auth.accessToken) || '';
                 }
                 return rescanAccountToken(account);
@@ -722,7 +734,7 @@ export function apply(ctx, rawConfig = {}) {
       notifyAdaptersUpdated();
       return result;
     },
-    test: async ({ model, prompt, maxTokens, reasoningEffort: requestedEffort }) => {
+    test: async ({ model, prompt, maxTokens, reasoningEffort: requestedEffort, signal }) => {
       if (!model) return { ok: false, error: '请选择一个模型' };
       const text = String(prompt || '').trim().slice(0, 8000) || '用一句话介绍你自己。';
       const perModel = adapter.prefs.paramsByModel?.[model] || {};
@@ -757,6 +769,7 @@ export function apply(ctx, rawConfig = {}) {
           contextWindow: adapter.contextWindowFor(model),
           temperature,
           reasoningEffort,
+          signal,
           firstByteTimeoutMs: config.firstByteTimeoutMs,
           idleTimeoutMs: config.streamIdleTimeoutMs,
         });

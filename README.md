@@ -1,6 +1,6 @@
 # qoder-to-dsh
 
-把 **Qoder** 的模型额度原生接进 **DeepSeek Harness (DSH)**。当前版本 **1.1.2**。
+把 **Qoder** 的模型额度原生接进 **DeepSeek Harness (DSH)**。当前版本 **1.1.3**。
 
 这是一个纯 DSH 插件：没有本地桥进程，没有第二个端口，没有独立控制台。凭据读取、COSY 签名、模型目录、流式转发和设置面板都在 DSH 插件进程内完成。
 
@@ -71,13 +71,13 @@
 从 [Releases](https://github.com/Ianzhyh/qoder-to-dsh/releases) 下载 `qoder-to-dsh-<version>.tgz`，在下载目录执行：
 
 ```bash
-dsh plugin --profile desktop add ./qoder-to-dsh-1.1.2.tgz
+dsh plugin --profile desktop add ./qoder-to-dsh-1.1.3.tgz
 ```
 
 正文里带该资产的 SHA-256，可以先核对再装。也可以在 DSH 里让 agent 直接按 URL 装：
 
 ```text
-plugin_manager { action: "install_bundle", target: "https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.1.2/qoder-to-dsh-1.1.2.tgz" }
+plugin_manager { action: "install_bundle", target: "https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.1.3/qoder-to-dsh-1.1.3.tgz" }
 ```
 
 **B. GitHub 直装（不落地文件）**
@@ -219,7 +219,7 @@ npm run verify -- --offline # 只看文件和 profile 配置
 
 每个版本的完整变更见 **[CHANGELOG.md](CHANGELOG.md)**；发布说明（含升级步骤与资产 SHA-256）见 [Releases](https://github.com/Ianzhyh/qoder-to-dsh/releases)。
 
-当前版本 `1.1.2` 补齐面板在宿主刚启动、标签页在后台、账号刚切换时的行为：404 启动窗口快速自愈、后台不空转轮询、旧账号的在途响应不覆盖新账号。`1.1.1` 修掉三个「留到线上才暴露」的问题：断流被当成正常结束、不合法工具名导致整轮失败且不点名、面板请求没有超时。`1.1.0` 的要点是聊天 SSE 走持久连接、模型目录先返回后刷新、启动不再扫本机账号、凭据与用量异步落盘。详见 [v1.1.2 发布说明](docs/releases/v1.1.2.md)、[v1.1.1 发布说明](docs/releases/v1.1.1.md) 与 [v1.1.0 发布说明](docs/releases/v1.1.0.md)。
+当前版本 `1.1.3` 修流结束、令牌刷新、换号与本地账本之间的竞态：截断的信封流不再被补成成功、并发刷新合并并隔离账号、无效 PAT 回滚、试跑取消会中止上游、目录缓存按账号隔离、清除用量不再被在途写盘复活。`1.1.2` 补齐面板在宿主刚启动、标签页在后台、账号刚切换时的行为。`1.1.1` 修掉三个「留到线上才暴露」的问题：断流被当成正常结束、不合法工具名导致整轮失败且不点名、面板请求没有超时。`1.1.0` 的要点是聊天 SSE 走持久连接、模型目录先返回后刷新、启动不再扫本机账号、凭据与用量异步落盘。详见 [v1.1.3 发布说明](docs/releases/v1.1.3.md)、[v1.1.2 发布说明](docs/releases/v1.1.2.md)、[v1.1.1 发布说明](docs/releases/v1.1.1.md) 与 [v1.1.0 发布说明](docs/releases/v1.1.0.md)。
 
 ## 开发
 
@@ -241,7 +241,7 @@ npm run verify:release   # 校验 tgz：产物新鲜度 / 文件清单 / 双份�
 `verify:release` 也可以传 Release 资产 URL，直接校验**已发布**的那一份（只在内存里解包，不写磁盘）：
 
 ```bash
-npm run verify:release -- https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.1.2/qoder-to-dsh-1.1.2.tgz
+npm run verify:release -- https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.1.3/qoder-to-dsh-1.1.3.tgz
 ```
 
 第三方许可与归属信息见 [NOTICE.md](NOTICE.md)。

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -218,6 +218,21 @@ test('usage reads are cached and writes are coalesced', async () => {
     appendUsage({ at: now + 1, model: 'e', totalTokens: 6, ok: true }, path);
     clearUsage(path);
     assert.deepEqual(readUsage(path), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('clearing usage during an in-flight flush does not resurrect the ledger', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'qoder-usage-clear-'));
+  const path = join(dir, 'usage.json');
+  try {
+    appendUsage({ at: Date.now(), model: 'race', tokens: 1, totalTokens: 1, ok: true }, path);
+    const flushing = flushUsage(path);
+    clearUsage(path);
+    await flushing;
+    assert.deepEqual(readUsage(path), []);
+    assert.equal(existsSync(path), false);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

@@ -13,7 +13,7 @@ process.env.QODER_REGION = 'global';
 
 const { QoderClient } = await import('../lib/qoder-api.mjs');
 const { normalizeCatalog } = await import('../lib/qoder-api.mjs');
-const { QoderAdapter } = await import('../lib/adapter.mjs');
+const { QoderAdapter, StreamTranslator, CODE } = await import('../lib/adapter.mjs');
 const { PATHS } = await import('../lib/config.mjs');
 const { readEncryptedJson } = await import('../lib/secret-store.mjs');
 
@@ -25,6 +25,43 @@ function deferred() {
     reject = rej;
   });
   return { promise, resolve, reject };
+}
+
+const envelope = (inner) => `data: ${JSON.stringify({
+  statusCodeValue: 200,
+  body: typeof inner === 'string' ? inner : JSON.stringify(inner),
+})}\n\n`;
+
+function streamClient(chunks) {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-stream-token',
+    user: { id: 'u-stream', name: 'Stream Tester' },
+    source: 'token',
+  }, { silent: true, persist: false });
+  client.listCatalog = async () => ({ models: [], at: Date.now(), staleMs: 0, error: '' });
+  const encoder = new TextEncoder();
+  client.transport = async () => ({
+    ok: true,
+    status: 200,
+    body: new ReadableStream({
+      start(controller) {
+        for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+        controller.close();
+      },
+    }),
+    text: async () => '',
+    drain() {},
+  });
+  return client;
+}
+
+function translated(text) {
+  const translator = new StreamTranslator();
+  for (const line of text.split('\n')) translator.pushLine(line);
+  return translator.finish();
 }
 
 function catalogClient(options = {}) {
@@ -62,7 +99,8 @@ test('disk catalog restores raw model metadata for the first request after resta
   writeFileSync(join(process.env.QODER_TO_DSH_HOME, 'catalog.json'), JSON.stringify({
     at: Date.now(),
     region: 'global',
-    schema: 4,
+    account: 'u-cache',
+    schema: 5,
     models: [{
       id: 'vision', key: 'vision', name: 'Vision', display_name: 'Vision',
       context_window: 96000, context_window_max: 96000, max_input_tokens: 96000,
@@ -72,6 +110,14 @@ test('disk catalog restores raw model metadata for the first request after resta
   }));
 
   const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-cache-token',
+    user: { id: 'u-cache', name: 'Cache Tester' },
+    source: 'token',
+  }, { silent: true, persist: false });
+  client.loadDiskCatalog();
   const raw = client.rawModel('vision');
   assert.ok(raw, '缓存模型应能重建 raw 索引');
   assert.equal(raw.supports_images, true);
@@ -98,6 +144,31 @@ test('disk catalog restores raw model metadata for the first request after resta
 
   client.invalidateCatalog();
   assert.equal(client.rawModel('vision'), null, '切换账号/刷新失败后不能残留旧目录');
+});
+
+test('disk catalog cache is account-scoped after a switch', () => {
+  writeFileSync(join(process.env.QODER_TO_DSH_HOME, 'catalog.json'), JSON.stringify({
+    at: Date.now(),
+    region: 'global',
+    account: 'u-old',
+    schema: 5,
+    models: [{
+      id: 'old-only', key: 'old-only', name: 'Old only',
+      context_window: 96000, max_output_tokens: 8192, official: true,
+    }],
+  }));
+
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-new-token',
+    user: { id: 'u-new', name: 'New Account' },
+    source: 'token',
+  }, { silent: true, persist: false });
+  client.loadDiskCatalog();
+  assert.equal(client.rawModel('old-only'), null, '另一个账号的目录不能在新账号启动时恢复');
+  assert.equal(client.catalogCache.models.length, 0);
 });
 
 test('catalog uses the effective price factor, not the crossed-out original price', () => {
@@ -146,8 +217,48 @@ test('trial ignores literal null SSE frames instead of throwing', async () => {
   assert.equal(result.usage.total_tokens, 3);
 });
 
+test('envelope translation does not invent [DONE] when the upstream closes early', async () => {
+  const client = streamClient([envelope({ choices: [{ delta: { content: 'half' } }] })]);
+  const res = await client.chat({ model: 'auto', messages: [{ role: 'user', content: 'hi' }], stream: true });
+  const wire = await new Response(res.body).text();
+  assert.ok(!wire.includes('data: [DONE]'), 'truncated upstream must not be marked complete');
+  const finish = translated(wire).find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.TRANSPORT);
+});
+
+test('a finish_reason without an outer [DONE] still closes cleanly', async () => {
+  const client = streamClient([envelope({
+    choices: [{ delta: { content: 'complete' }, finish_reason: 'stop' }],
+  })]);
+  const res = await client.chat({ model: 'auto', messages: [{ role: 'user', content: 'hi' }], stream: true });
+  const wire = await new Response(res.body).text();
+  assert.ok(wire.includes('data: [DONE]'));
+  assert.equal(translated(wire).find((chunk) => chunk.type === 'finish').reason.kind, 'stop');
+});
+
+test('trial rejects a translated stream that closes before finish_reason', async () => {
+  const client = streamClient([envelope({ choices: [{ delta: { content: 'half' } }] })]);
+  await assert.rejects(
+    client.test({ model: 'auto', prompt: 'ping', firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 }),
+    /结束原因之前中断/,
+  );
+});
+
+test('trial accepts a finish_reason without an outer [DONE]', async () => {
+  const client = streamClient([envelope({
+    choices: [{ delta: { content: 'pong' }, finish_reason: 'stop' }],
+    usage: { total_tokens: 3 },
+  })]);
+  const result = await client.test({ model: 'auto', prompt: 'ping', firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 });
+  assert.equal(result.text, 'pong');
+  assert.equal(result.usage.total_tokens, 3);
+});
+
 test('importPat exchanges identity and stores a token-sourced account', async () => {
   const client = new QoderClient({ region: 'global', log: () => {} });
+  let authChanges = 0;
+  client.onAuthChange = () => { authChanges += 1; };
   await withFetch(async (url) => {
     assert.match(String(url), /\/api\/v1\/userinfo$/);
     return json({ id: 'u-1', name: 'Token Tester', email: 'tester@example.com', user_type: 'personal_professional' });
@@ -161,6 +272,30 @@ test('importPat exchanges identity and stores a token-sourced account', async ()
   assert.equal(client.auth.user.email, 'tester@example.com');
   assert.equal(client.status().account.sourceLabel, '访问令牌');
   assert.equal(readEncryptedJson(PATHS.auth).accessToken, 'dt-test-access-token', '登录成功前凭据已经异步落盘');
+  assert.equal(authChanges, 1, '一次登录只触发一次 auth-change');
+});
+
+test('a rejected PAT keeps the previous account instead of logging it out', async () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-pat-old',
+    user: { id: 'u-pat-old', name: 'Old Account' },
+    source: 'token',
+  }, { silent: true });
+  await client.flushAuthWrite();
+
+  await withFetch(async (url) => {
+    assert.match(String(url), /\/api\/v1\/userinfo$/);
+    return json({ message: 'invalid token' }, 401);
+  }, async () => {
+    await assert.rejects(client.importPat('dt-bad-token', 'global'), /令牌验证失败/);
+  });
+
+  assert.equal(client.auth.user.id, 'u-pat-old');
+  assert.equal(client.auth.accessToken, 'dt-pat-old');
+  assert.equal(readEncryptedJson(PATHS.auth).user.id, 'u-pat-old');
 });
 
 test('device authorization polls into a persisted account for the requested region', async () => {
@@ -188,6 +323,132 @@ test('device authorization polls into a persisted account for the requested regi
   assert.equal(client.auth.source, 'oauth');
   assert.equal(client.auth.region, 'cn');
   assert.equal(client.status().regionLabel, 'Qoder 国内版');
+});
+
+test('concurrent device polls share one upstream request', async () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  const rawSetAuth = client.setAuth.bind(client);
+  client.setAuth = (auth, options = {}) => rawSetAuth(auth, { ...options, persist: false });
+  client.pendingDevices.set('dev-1', {
+    verifier: 'verifier', nonce: 'nonce', region: 'global', createdAt: Date.now(), authUrl: 'https://qoder.com/device',
+  });
+
+  const release = deferred();
+  let polls = 0;
+  await withFetch(async (url) => {
+    const target = String(url);
+    if (target.includes('/api/v1/deviceToken/poll')) {
+      polls += 1;
+      await release.promise;
+      return json({ token: 'dt-device', refresh_token: 'drt-device', expires_in: 3600 });
+    }
+    if (target.endsWith('/api/v1/userinfo')) return json({ id: 'u-device', name: 'Device' });
+    throw new Error(`unexpected request ${target}`);
+  }, async () => {
+    const first = client.pollDeviceAuth('dev-1');
+    const second = client.pollDeviceAuth('dev-1');
+    await Promise.resolve();
+    assert.equal(polls, 1, '同一个设备会话的并发轮询只能打一次上游');
+    release.resolve();
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(a.status, 'ready');
+    assert.equal(b.status, 'ready');
+  });
+});
+
+test('concurrent token refresh is single-flight', async () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  const rawSetAuth = client.setAuth.bind(client);
+  client.setAuth = (auth, options = {}) => rawSetAuth(auth, { ...options, persist: false });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: '',
+    refreshToken: 'drt-concurrent',
+    expiresAt: Date.now() - 1000,
+    user: { id: 'u-refresh', name: 'Refresh Tester' },
+    source: 'token',
+  }, { silent: true });
+
+  const release = deferred();
+  let calls = 0;
+  await withFetch(async (url) => {
+    assert.match(String(url), /\/api\/v1\/deviceToken\/refresh$/);
+    calls += 1;
+    await release.promise;
+    return json({ token: 'dt-refreshed', refresh_token: 'drt-next', expires_in: 3600 });
+  }, async () => {
+    const first = client.refreshAuth();
+    const second = client.refreshAuth();
+    await Promise.resolve();
+    assert.equal(calls, 1, '同一账号的并发刷新只能打一次上游');
+    release.resolve();
+    const [a, b] = await Promise.all([first, second]);
+    assert.equal(a.accessToken, 'dt-refreshed');
+    assert.equal(b.accessToken, 'dt-refreshed');
+    assert.equal(client.auth.accessToken, 'dt-refreshed');
+    assert.equal(client.auth.refreshToken, 'drt-next');
+  });
+});
+
+test('refreshing an auth without a uid is not treated as an account switch', async () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  const rawSetAuth = client.setAuth.bind(client);
+  client.setAuth = (auth, options = {}) => rawSetAuth(auth, { ...options, persist: false });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: '',
+    refreshToken: 'drt-noid',
+    expiresAt: Date.now() - 1000,
+    user: { id: '', name: '', email: 'noid@example.com' },
+    source: 'pat',
+  }, { silent: true });
+
+  await withFetch(async (url) => {
+    assert.match(String(url), /\/api\/v1\/deviceToken\/refresh$/);
+    return json({ token: 'dt-noid', refresh_token: 'drt-noid-next', expires_in: 3600 });
+  }, async () => {
+    const auth = await client.ensureAccessToken();
+    assert.equal(auth.accessToken, 'dt-noid');
+  });
+  assert.equal(client.auth.user.email, 'noid@example.com', '刷新不能丢掉已有账号信息');
+});
+
+test('a refresh for the old account cannot overwrite a newly selected account', async () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  const rawSetAuth = client.setAuth.bind(client);
+  client.setAuth = (auth, options = {}) => rawSetAuth(auth, { ...options, persist: false });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: '',
+    refreshToken: 'drt-old',
+    expiresAt: Date.now() - 1000,
+    user: { id: 'u-old', name: 'Old' },
+    source: 'token',
+  }, { silent: true });
+
+  const release = deferred();
+  await withFetch(async (url) => {
+    assert.match(String(url), /\/api\/v1\/deviceToken\/refresh$/);
+    await release.promise;
+    return json({ token: 'dt-old-refreshed', refresh_token: 'drt-old-next', expires_in: 3600 });
+  }, async () => {
+    const oldTask = client.refreshAuth();
+    await Promise.resolve();
+    client.setAuth({
+      schemaVersion: 1,
+      region: 'global',
+      accessToken: 'dt-new',
+      user: { id: 'u-new', name: 'New' },
+      source: 'token',
+    }, { silent: true });
+    release.resolve();
+    await assert.rejects(oldTask, /账号已切换/);
+    assert.equal(client.auth.user.id, 'u-new');
+    assert.equal(client.auth.accessToken, 'dt-new');
+  });
 });
 
 test('refreshExtras refreshes an expired token once and retries both quota endpoints', async () => {

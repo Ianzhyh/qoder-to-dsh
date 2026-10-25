@@ -967,7 +967,7 @@
           onUsage && onUsage();
         } catch (err) {
           if (!alive.current) return;
-          if (err && err.name === 'AbortError') setError('已取消等待。上游可能仍会完成这次请求并计入用量。');
+          if (err && err.name === 'AbortError') setError('已取消本次试跑。');
           else setError(String(err.message || err));
         } finally {
           abortRef.current = null;
@@ -1054,7 +1054,7 @@
             h(Button, { variant: 'primary', icon: 'bolt', disabled: Boolean(busy) || !modelId || !prompt.trim(), onClick: run },
               busy ? `等待上游… ${elapsed}s` : '运行'),
             busy ? h(Button, { size: 'sm', variant: 'ghost', icon: 'close', onClick: () => { if (abortRef.current) abortRef.current.abort(); } }, '取消') : null,
-            h('span', { className: 'qdr-hint' }, busy ? '可随时取消本地等待；上游可能仍会计费。' : 'Ctrl/⌘ + Enter 运行 · 消耗 Qoder Credits · 不发送工具调用')),
+            h('span', { className: 'qdr-hint' }, busy ? '可随时取消；会同时中止上游等待（已产生的用量仍可能计费）。' : 'Ctrl/⌘ + Enter 运行 · 消耗 Qoder Credits · 不发送工具调用')),
           error ? h('div', { className: 'qdr-banner qdr-banner-error', role: 'alert' },
             h(Icon, { name: 'alert', size: 15 }), h('span', null, error)) : null),
         result ? h('div', { className: 'qdr-card qdr-trial-result' },
@@ -1912,6 +1912,7 @@
           creditsSeq.current += 1;
           accountSeq.current += 1;
           setDevice(null);
+          setStatus(null);
           setModels([]);
           setTrialModel('');
           setUsage(null);
@@ -3399,7 +3400,7 @@
           quotaSeq.current += 1;
           setAccountExtras(null);
           setQuotaTried(false);
-          setData((previous) => (previous ? { ...previous, extras: null } : previous));
+          setData(null);
           setAuthEpoch((value) => value + 1);
           loadStatus();
         };
