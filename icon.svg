@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" aria-label="Qoder">
+  <rect x="4" y="4" width="56" height="56" rx="15" fill="#3f6b52"/>
+  <circle cx="31" cy="30" r="12.5" fill="none" stroke="#ffffff" stroke-width="7"/>
+  <path d="M39 39 L46.5 46.5" stroke="#ffffff" stroke-width="7" stroke-linecap="round"/>
+</svg>

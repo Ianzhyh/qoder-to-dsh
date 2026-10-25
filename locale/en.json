@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Qoder",
+    "description": "Bring Qoder model quota into DSH natively: reuse the local Qoder sign-in, register the qoder provider, and ship a settings panel, usage stats, and diagnostics."
+  }
+}

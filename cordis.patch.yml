@@ -1,0 +1,12 @@
+# qoder-to-dsh —— bundle patch
+#
+# 只插入本插件自己的 Loader 条目。模型 provider 由插件运行时用
+# ctx.llm.registerAdapter(['qoder'], adapter) 注册，不写 settings.yaml，
+# 也不改 llm-pi-ai 条目。
+#
+# name 必须与 profile 中安装的包名一致：
+#   - github 直装（dsh plugin add github:Ianzhyh/qoder-to-dsh）→ qoder-to-dsh
+#   - 本地 link 安装 → 同样是 qoder-to-dsh
+- insert:
+    - id: qoder
+      name: qoder-to-dsh

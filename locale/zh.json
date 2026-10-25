@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "Qoder",
+    "description": "把 Qoder 的模型额度原生接进 DSH：直接用本机 Qoder 登录态，注册 qoder provider，带设置面板、用量统计与诊断。"
+  }
+}

@@ -1,0 +1,9 @@
+node_modules/
+.research/
+.tmp-qoder/
+.tmp-ui/
+.tmp-app/
+*.log
+*.tgz
+.DS_Store
+Thumbs.db
