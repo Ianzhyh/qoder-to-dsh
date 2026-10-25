@@ -1,6 +1,6 @@
 {
   "name": "qoder-to-dsh",
-  "version": "1.0.1",
+  "version": "1.0.2",
   "private": false,
   "description": "把 Qoder 的模型额度原生接进 DeepSeek Harness —— 纯 dsh 插件，单进程、无中转端口、无额外客户端。",
   "type": "module",

@@ -230,6 +230,7 @@ export function createRouteTable({ controller, log = () => {} }) {
             model: String(body?.model || ''),
             prompt: String(body?.prompt || ''),
             maxTokens: Number(body?.maxTokens) || 0,
+            reasoningEffort: String(body?.reasoningEffort || ''),
           })),
         });
       }),

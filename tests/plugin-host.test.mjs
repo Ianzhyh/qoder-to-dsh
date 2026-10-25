@@ -392,6 +392,42 @@ test('trial falls back to the public Qoder CLI 32K output default', async () => 
   }
 });
 
+test('trial accepts a supported reasoning effort and rejects unsupported ones', async () => {
+  const adapter = adapters[0].adapter;
+  const client = adapter.client;
+  const previousModels = adapter.catalogCache.models;
+  const previousTest = client.test;
+  const previousAuth = client.auth;
+  const calls = [];
+  adapter.catalogCache.models = [{
+    id: 'reasoner', name: 'Reasoner', reasoning_efforts: ['low', 'high'], context_window: 200000, context_window_max: 200000,
+  }];
+  client.auth = { source: 'desktop' };
+  client.test = async (args) => {
+    calls.push(args);
+    return { text: 'ok', reasoning: '', usage: { total_tokens: 1 }, firstByteMs: 1, latencyMs: 2 };
+  };
+  try {
+    const high = await call('POST', '/qoder/test', {
+      panel: true, body: { model: 'reasoner', prompt: 'ping', reasoningEffort: 'high' },
+    });
+    assert.equal(high.status, 200);
+    assert.equal(high.json.ok, true);
+    assert.equal(calls[0].reasoningEffort, 'high');
+    assert.equal(high.json.reasoningEffort, 'high');
+    const unsupported = await call('POST', '/qoder/test', {
+      panel: true, body: { model: 'reasoner', prompt: 'ping', reasoningEffort: 'max' },
+    });
+    assert.equal(unsupported.json.ok, false);
+    assert.match(String(unsupported.json.error), /只支持 low \/ high/);
+    assert.equal(calls.length, 1, '不支持的档位不能发到上游');
+  } finally {
+    adapter.catalogCache.models = previousModels;
+    client.test = previousTest;
+    client.auth = previousAuth;
+  }
+});
+
 test('auth routes keep a consistent envelope and reject malformed writes', async () => {
   const poll = await call('POST', '/qoder/auth/poll', { panel: true, body: {} });
   assert.equal(poll.status, 200);

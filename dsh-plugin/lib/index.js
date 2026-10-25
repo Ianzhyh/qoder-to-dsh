@@ -716,12 +716,23 @@ export function apply(ctx, rawConfig = {}) {
       notifyAdaptersUpdated();
       return result;
     },
-    test: async ({ model, prompt, maxTokens }) => {
+    test: async ({ model, prompt, maxTokens, reasoningEffort: requestedEffort }) => {
       if (!model) return { ok: false, error: '请选择一个模型' };
       const text = String(prompt || '').trim().slice(0, 8000) || '用一句话介绍你自己。';
       const perModel = adapter.prefs.paramsByModel?.[model] || {};
       const fallback = adapter.defaults || {};
       const raw = adapter.catalogCache.models.find((item) => item && item.id === model);
+      const supportedEfforts = Array.isArray(raw?.reasoning_efforts) ? raw.reasoning_efforts : [];
+      let reasoningEffort = typeof perModel.reasoningEffort === 'string' && perModel.reasoningEffort
+        ? perModel.reasoningEffort
+        : fallback.reasoningEffort;
+      if (requestedEffort) {
+        if (!supportedEfforts.length) return { ok: false, error: '当前模型不支持思考档位' };
+        if (!supportedEfforts.includes(requestedEffort)) {
+          return { ok: false, error: `当前模型只支持 ${supportedEfforts.join(' / ')}，请换一个档位` };
+        }
+        reasoningEffort = requestedEffort;
+      }
       const cap = Number(raw?.max_output_tokens ?? 0) || 0;
       const requested = Number(maxTokens) > 0
         ? Number(maxTokens)
@@ -731,9 +742,6 @@ export function apply(ctx, rawConfig = {}) {
       // 试跑与真实对话使用同一份已保存参数：只按模型上限收敛，不再额外截断。
       const budget = Math.max(16, cap ? Math.min(requested, cap) : requested);
       const temperature = typeof perModel.temperature === 'number' ? perModel.temperature : fallback.temperature;
-      const reasoningEffort = typeof perModel.reasoningEffort === 'string' && perModel.reasoningEffort
-        ? perModel.reasoningEffort
-        : fallback.reasoningEffort;
       const started = Date.now();
       try {
         const result = await client.test({
@@ -784,6 +792,7 @@ export function apply(ctx, rawConfig = {}) {
           usage,
           latencyMs,
           firstByteMs: result.firstByteMs || 0,
+          reasoningEffort: reasoningEffort || '',
         };
       } catch (error) {
         state.lastError = String(error?.message || error);

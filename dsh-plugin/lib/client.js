@@ -828,6 +828,7 @@
       const [elapsed, setElapsed] = useState(0);
       const [result, setResult] = useState(null);
       const [error, setError] = useState('');
+      const [effort, setEffort] = useState('');
       const alive = useRef(true);
       const abortRef = useRef(null);
       useEffect(() => () => { alive.current = false; if (abortRef.current) abortRef.current.abort(); }, []);
@@ -844,7 +845,14 @@
         const next = pinned || (list[0] && list[0].id) || (all[0] && all[0].id) || '';
         if (next) setModelId(next);
       }, [all.length, pinned]); // eslint-disable-line react-hooks/exhaustive-deps
+      useEffect(() => {
+        // 试跑默认用最低档，避免一次连通性检查先等十几秒思考；用户可切回已保存档位。
+        const target = all.find((item) => item.id === modelId);
+        const levels = target && Array.isArray(target.reasoningEfforts) ? target.reasoningEfforts : [];
+        setEffort(levels[0] || '');
+      }, [modelId, all.length]);
       const model = all.find((item) => item.id === modelId) || null;
+      const efforts = model && Array.isArray(model.reasoningEfforts) ? model.reasoningEfforts : [];
       const run = async () => {
         if (busy) return;
         if (!modelId) return setError('先选择一个模型');
@@ -854,7 +862,11 @@
         const controller = new AbortController();
         abortRef.current = controller;
         try {
-          const data = await postJson('/qoder/test', { model: modelId, prompt: prompt.trim() }, { signal: controller.signal });
+          const data = await postJson('/qoder/test', {
+            model: modelId,
+            prompt: prompt.trim(),
+            ...(effort ? { reasoningEffort: effort } : {}),
+          }, { signal: controller.signal });
           if (!alive.current) return;
           if (!data.ok) throw new Error(data.error || '试跑失败');
           setResult({ ...data, at: Date.now(), modelName: model ? model.name : modelId });
@@ -879,6 +891,10 @@
       const quick = ['回复 pong', '用三句话解释什么是上下文窗口', '写一个 JS 防抖函数，并说明边界情况'];
       const usage = result && result.usage;
       const cachedTokens = usage && usage.prompt_tokens_details && usage.prompt_tokens_details.cached_tokens;
+      const reasoningTokens = Number(usage && usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens) || 0;
+      const tokensPerSecond = usage && result.latencyMs
+        ? ((Number(usage.completion_tokens) || 0) / (result.latencyMs / 1000)).toFixed(1)
+        : '';
       const usageBits = usage ? [
         ['输入', compact(usage.prompt_tokens || 0)],
         ['输出', compact(usage.completion_tokens || 0)],
@@ -886,13 +902,16 @@
         ...(cachedTokens ? [['缓存', compact(cachedTokens)]] : []),
         ['首字', duration(result.firstByteMs)],
         ['耗时', duration(result.latencyMs)],
+        ['速度', tokensPerSecond ? `${tokensPerSecond} tok/s` : '—'],
       ] : [];
+      const generationMs = result ? Math.max(0, (result.latencyMs || 0) - (result.firstByteMs || 0)) : 0;
+      const effortIsLowest = Boolean(effort && efforts.length && effort === efforts[0]);
       return h('div', { className: 'qdr-panel' },
         h('div', { className: 'qdr-card qdr-trial' },
           h('div', { className: 'qdr-card-head' },
             h('div', null,
               h('div', { className: 'qdr-card-title' }, '试跑'),
-              h('div', { className: 'qdr-card-sub' }, '用当前模型和已保存参数发一次真实请求；结果会计入用量。')),
+              h('div', { className: 'qdr-card-sub' }, '用当前模型发一次真实请求；默认最低思考档位，结果会计入用量。')),
             model ? h('div', { className: 'qdr-trial-price' },
               model.free ? h(Badge, { tone: 'green' }, '免费')
                 : (model.credits !== null && model.credits !== undefined ? h(Badge, { tone: 'neutral' }, '×' + money(model.credits) + ' Credits') : null),
@@ -906,6 +925,18 @@
                 placeholder: '目录里还没有可用模型',
                 options: list.map((item) => ({ value: item.id, label: item.name, hint: item.id })),
               })),
+            efforts.length ? h('div', { className: 'qdr-field' },
+              h('span', { className: 'qdr-field-label' }, '本次思考档位'),
+              h(Select, {
+                value: effort, disabled: Boolean(busy), ariaLabel: '本次思考档位',
+                onChange: setEffort,
+                options: [
+                  { value: '', label: `跟随已保存${model.defaultReasoningEffort ? ` · ${model.defaultReasoningEffort}` : ''}` },
+                  ...efforts.map((value) => ({ value, label: value })),
+                ],
+              }),
+              h('span', { className: 'qdr-field-note' },
+                `默认最低档 ${efforts[0]}，避免等待过久；本次选择不保存`)) : null,
             h('label', { className: 'qdr-field qdr-field-wide' },
               h('span', { className: 'qdr-field-label' }, '发送内容'),
               h('textarea', {
@@ -936,7 +967,7 @@
           h('div', { className: 'qdr-card-head' },
             h('div', null,
               h('div', { className: 'qdr-card-title' }, '回复'),
-              h('div', { className: 'qdr-card-sub' }, `${result.modelName || result.model || ''} · ${stamp(result.at)} · 本次请求`)),
+              h('div', { className: 'qdr-card-sub' }, `${result.modelName || result.model || ''}${result.reasoningEffort ? ` · 档位 ${result.reasoningEffort}` : ''} · ${stamp(result.at)} · 本次请求`)),
             h('div', { className: 'qdr-card-actions' },
               h(Button, {
                 size: 'sm', variant: 'ghost', icon: 'copy', disabled: !result.text,
@@ -953,7 +984,11 @@
             result.reasoning && usage && usage.completion_tokens_details && usage.completion_tokens_details.reasoning_tokens
               ? h('span', null, h('span', { className: 'qdr-trial-usage-label' }, '思考'),
                 h('strong', null, compact(usage.completion_tokens_details.reasoning_tokens)))
-              : null))
+              : null),
+          generationMs > 1500 ? h('div', { className: 'qdr-trial-speed-note' },
+            h(Icon, { name: 'bolt', size: 12 }),
+            h('span', null,
+              `首字 ${duration(result.firstByteMs)}；其余 ${duration(generationMs)} 花在${reasoningTokens ? `思考（${compact(reasoningTokens)} tokens）与` : ''}输出上。${effortIsLowest ? '已经是当前模型最低档；想更快可换非思考模型或缩短输出。' : '想更快可降低本次思考档位、换非思考模型或缩短输出。'}`)) : null)
           : h('div', { className: 'qdr-card qdr-trial-empty' },
             h(Empty, {
               icon: 'bolt', title: '还没有试跑记录',
@@ -3074,6 +3109,7 @@
 .qdr-trial-usage>span{display:inline-flex;align-items:baseline;gap:4px}
 .qdr-trial-usage-label{color:var(--qdr-faint)}
 .qdr-trial-usage strong{color:var(--qdr-fg);font-weight:600}
+.qdr-trial-speed-note{display:flex;align-items:flex-start;gap:5px;margin-top:8px;font-size:10px;color:var(--qdr-faint);line-height:1.5}
 /* ── 对话页顶部快捷登录/用量 ──────────────────────────────────── */
 .qdr-chat-login-wrap{display:inline-flex;align-items:center;gap:8px;min-width:0}
 .qdr-chat-login{appearance:none;font-family:inherit;cursor:pointer}
