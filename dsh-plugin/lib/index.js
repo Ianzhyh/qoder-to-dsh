@@ -14,7 +14,8 @@ import { QoderAdapter } from '../../lib/adapter.mjs';
 import { createTools } from '../../lib/tools.mjs';
 import { createRouteTable, mountRoutes } from './routes.mjs';
 import { QoderClient } from '../../lib/qoder-api.mjs';
-import { invalidateDesktopScan, scanDesktopAuth } from '../../lib/desktop-auth.mjs';
+import { invalidateDesktopScan, prewarmDesktopKeysAsync, scanDesktopAuth } from '../../lib/desktop-auth.mjs';
+import { disposeChatTransport } from '../../lib/chat-transport.mjs';
 import {
   appendUsage, clearUsage as clearUsageFile, creditsReport, isWritableDir, log as writeLog,
   localDayKey, readCheckin, readPrefs, readUsage, reconcileUsage, recentLogs, summarizeUsage, writeCheckin, writePrefs,
@@ -118,10 +119,13 @@ export function apply(ctx, rawConfig = {}) {
   };
 
   const prefs = readPrefs();
+  let notifyCatalogUpdated = () => {};
   const client = new QoderClient({
     region: config.region,
     catalogTtlMs: config.catalogTtlMs,
     log,
+    // 后台 stale-while-revalidate 拿到新目录后，让 DSH 的选择器跟着更新。
+    onCatalogUpdated: () => notifyCatalogUpdated(),
     onAuthChange: () => {
       state.pendingDevice = null;
       adapter.invalidate();
@@ -185,6 +189,7 @@ export function apply(ctx, rawConfig = {}) {
     }
     return false;
   };
+  notifyCatalogUpdated = () => { notifyAdaptersUpdated(); };
 
   // ── 原生模型路由 ──────────────────────────────────────────────────────
   try {
@@ -208,7 +213,7 @@ export function apply(ctx, rawConfig = {}) {
 
   async function buildChecks({ deep = false } = {}) {
     const checks = [];
-    const status = client.status();
+    const status = client.status({ desktop: false });
     checks.push({
       id: 'auth',
       label: '登录凭据',
@@ -303,8 +308,8 @@ export function apply(ctx, rawConfig = {}) {
     return checks;
   }
 
-  async function snapshot({ signal, deep = false } = {}) {
-    const status = client.status();
+  async function snapshot({ signal, deep = false, desktop = true } = {}) {
+    const status = client.status({ desktop });
     const usageRecordsList = usageRecords();
     const usage = summarizeUsage(usageRecordsList, 14);
     const directory = (() => {
@@ -435,7 +440,8 @@ export function apply(ctx, rawConfig = {}) {
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
   function checkinAccounts() {
-    return buildCheckinAccounts({ activeAuth: client.auth, activeRegion: client.status().region });
+    // 不走 status()：那里会扫描本机账号，自动签到没必要为此阻塞事件循环。
+    return buildCheckinAccounts({ activeAuth: client.auth, activeRegion: client.auth?.region || client.region });
   }
 
   /**
@@ -947,8 +953,11 @@ export function apply(ctx, rawConfig = {}) {
     if (autoCheckinTimer) clearInterval(autoCheckinTimer);
   }, 'qoder.checkin-auto');
 
+  // 桌面端 DPAPI key 在后台子进程里解，首次签到/账号页扫描不再卡主线程。
+  prewarmDesktopKeysAsync().catch(() => {});
+
   // ── 启动预热（不阻塞插件加载） ─────────────────────────────────────────
-  if (client.status().signedIn) {
+  if (client.auth) {
     adapter.warmup().then(() => notifyAdaptersUpdated(), (error) => {
       state.catalogError = String(error?.message || error);
       log('启动目录预热失败', state.catalogError);
@@ -959,6 +968,7 @@ export function apply(ctx, rawConfig = {}) {
 
   ctx.effect(() => () => {
     try { adapter.invalidate(); } catch { /* ignore */ }
+    try { disposeChatTransport(); } catch { /* ignore */ }
   }, 'qoder.dispose');
 }
 

@@ -175,6 +175,39 @@ test('disabling first-byte timeout still applies the idle timeout to the first b
   assert.ok(Date.now() - started < 2000, '首块仍受 idle 超时保护');
 });
 
+function rawBody(text) {
+  return new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(text));
+      controller.close();
+    },
+  });
+}
+
+test('a stream that ends without finish_reason or [DONE] is a transport failure, not a silent success', async () => {
+  // 上游半路关连接：有内容、没有 finish_reason、也没有 [DONE]。
+  // 旧实现落到 mapFinishReason 的 default 分支返回 stop——半截回答被当成成功，
+  // 不重试，用户也不知道少了一段。
+  const chunks = await collect(adapterFor(fakeClient(rawBody(
+    'data: {"choices":[{"delta":{"content":"half an answer"}}]}\n\n',
+  ))));
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.TRANSPORT);
+  assert.match(finish.reason.failure.message, /中断/);
+  assert.equal(lastUsage().ok, false);
+  assert.equal(lastUsage().status, 'stream-error');
+});
+
+test('[DONE] alone still counts as a clean completion', async () => {
+  // 有些网关只发 [DONE]、不填 finish_reason；这仍是明确的收尾，不能报成中断。
+  const chunks = await collect(adapterFor(fakeClient(rawBody(
+    'data: {"choices":[{"delta":{"content":"complete"}}]}\n\ndata: [DONE]\n\n',
+  ))));
+  assert.equal(chunks.find((chunk) => chunk.type === 'finish').reason.kind, 'stop');
+  assert.equal(lastUsage().ok, true);
+});
+
 test('cleanup', () => {
   rmSync(home, { recursive: true, force: true });
 });

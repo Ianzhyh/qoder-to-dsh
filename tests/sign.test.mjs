@@ -14,6 +14,29 @@ test('qoderEncode / qoderDecode round-trip', () => {
   }
 });
 
+test('qoderEncode matches the original permutation at every padding length', () => {
+  const custom = '_doRTgHZBKcGVjlvpC,@aFSx#DPuNJme&i*MzLOEn)sUrthbf%Y^w.(kIQyXqWA!';
+  const std = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
+  const table = new Map();
+  for (let i = 0; i < 64; i += 1) table.set(std[i], custom[i]);
+  table.set('=', '$');
+  const reference = (plain) => {
+    const encoded = Buffer.from(plain).toString('base64');
+    const n = encoded.length;
+    const a = Math.floor(n / 3);
+    const rearranged = encoded.slice(n - a) + encoded.slice(a, n - a) + encoded.slice(0, a);
+    let out = '';
+    for (const ch of rearranged) out += table.get(ch) || ch;
+    return out;
+  };
+  for (let length = 0; length <= 300; length += 1) {
+    const bytes = randomBytes(length);
+    assert.equal(qoderEncode(bytes), reference(bytes), `buffer length ${length}`);
+    assert.equal(qoderEncode(bytes.toString('latin1')), reference(bytes.toString('latin1')), `string length ${length}`);
+  }
+  assert.equal(qoderEncode('中文 · emoji 🚀'), reference('中文 · emoji 🚀'));
+});
+
 test('sortedCompact sorts keys and keeps compact JSON', () => {
   assert.equal(sortedCompact({ b: 1, a: 'x', c: null }), '{"a":"x","b":1,"c":null}');
   assert.equal(sortedCompact({ z: [1, 2], a: { d: true, c: false } }), '{"a":{"c":false,"d":true},"z":[1,2]}');

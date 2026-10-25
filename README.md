@@ -1,6 +1,6 @@
 # qoder-to-dsh
 
-把 **Qoder** 的模型额度原生接进 **DeepSeek Harness (DSH)**。当前版本 **1.0.2**。
+把 **Qoder** 的模型额度原生接进 **DeepSeek Harness (DSH)**。当前版本 **1.1.2**。
 
 这是一个纯 DSH 插件：没有本地桥进程，没有第二个端口，没有独立控制台。凭据读取、COSY 签名、模型目录、流式转发和设置面板都在 DSH 插件进程内完成。
 
@@ -13,6 +13,9 @@
 - **同一份数据**：面板、模型选择器和真实请求共享同一份目录、偏好和额度状态。
 - **本地优先**：凭据、偏好、用量和日志都保存在本机；面板只返回非敏感元数据。
 - **数据驱动**：上下文档位、思考档位、价格倍率来自 Qoder 模型目录；上游新增字段时优先使用上游值。
+- **不挡首包**：目录有缓存就先返回、过期后台刷新，并发调用合并成一次；模型准备阶段不再为了目录等上游往返。
+- **启动不阻塞**：已登录启动时不在主线程扫描本机账号；桌面端 DPAPI key 在后台子进程预热，首次签到或账号页再读取候选账号。
+- **低开销热路径**：请求体签名编码走 Buffer 码表，流式帧只做必要翻译；聊天传输用 keep-alive 复用连接，用量记录合并异步落盘。
 
 ## 界面
 
@@ -61,17 +64,35 @@
 
 > **装包 ≠ 启用。** 只写进 profile 的 `dependencies` 时，DSH 不会加载插件，也不会报错；必须同时出现在 `dsh.profile.bundles` 里。
 
-推荐从本地目录安装。在 DSH 里让 agent 执行 `plugin_manager` 的 `install_bundle`：
+三种安装形态，按使用场景选一种。
 
-```text
-plugin_manager { action: "install_bundle", target: "/absolute/path/to/qoder-to-dsh" }
+**A. Release 的 tgz（多数人用这个）**
+
+从 [Releases](https://github.com/Ianzhyh/qoder-to-dsh/releases) 下载 `qoder-to-dsh-<version>.tgz`，在下载目录执行：
+
+```bash
+dsh plugin --profile desktop add ./qoder-to-dsh-1.1.2.tgz
 ```
 
-等价的命令行方式：
+正文里带该资产的 SHA-256，可以先核对再装。也可以在 DSH 里让 agent 直接按 URL 装：
+
+```text
+plugin_manager { action: "install_bundle", target: "https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.1.2/qoder-to-dsh-1.1.2.tgz" }
+```
+
+**B. GitHub 直装（不落地文件）**
+
+```bash
+dsh plugin --profile desktop add github:Ianzhyh/qoder-to-dsh
+```
+
+**C. 本地目录 link（改代码时用）**
 
 ```bash
 dsh plugin --profile desktop add link:/absolute/path/to/qoder-to-dsh
 ```
+
+或在 DSH 里让 agent 执行 `plugin_manager` 的 `install_bundle`，`target` 传包的绝对目录。
 
 装完确认 profile 的 `package.json` 里同时有依赖和 bundle 选择：
 
@@ -86,7 +107,9 @@ dsh plugin --profile desktop add link:/absolute/path/to/qoder-to-dsh
 }
 ```
 
-**装完自检**（只读，不会改动状态）：
+用 A / B 安装时，`dependencies` 的值是版本号或 `github:` 规格，不是 `link:`，其余不变。
+
+**装完自检**（只读，不会改动状态；需在仓库目录里执行）：
 
 ```bash
 npm run verify              # 连运行中的 dsh 一起检查
@@ -95,7 +118,7 @@ npm run verify -- --offline # 只看文件和 profile 配置
 
 它会检查「装包 ≠ 启用」、`link:` 是否指向本仓库、patch 里的 name 是否与包名一致、provider 是否注册、模型目录是否为空。任一项 FAIL 就退出码 1。
 
-最后重启 DSH 服务（或重新打开 desktop app）。
+最后**完全退出 DSH 再打开**（托盘退出；插件在宿主启动时加载，只重开面板不会换掉已加载的代码）。
 
 ### 2. 登录
 
@@ -132,7 +155,7 @@ npm run verify -- --offline # 只看文件和 profile 配置
 - **流式对话**：思考内容、正文、工具调用、usage、AbortSignal 全链路透传；首包 45 秒 / 块间空闲 120 秒超时，超时以可见的 `TIMEOUT` 结束，不会无限挂起。
 - **工具调用**：DSH 声明的 function tools 原样进入 Qoder 请求；工具结果回灌时剔除孤儿消息与空助手轮。
 - **图片**：通过 DSH `attachments.readImage` 转 data URL，交给支持视觉的模型。
-- **模型目录**：动态读取 `/algo/api/v2/model/list`；解析 `context_config`、`thinking_config`、`price_factor` 与谷时折扣；面板显示 200K / 400K / 1M 上下文档位、输出默认值、促销与官方标记。
+- **模型目录**：动态读取 `/algo/api/v2/model/list`；有缓存先展示、过期后台刷新，显式刷新仍等待上游；解析 `context_config`、`thinking_config`、`price_factor` 与谷时折扣；面板显示 200K / 400K / 1M 上下文档位、输出默认值、促销与官方标记。
 - **模型参数**：每个模型可单独设置上下文窗口、默认思考档位、温度和最大输出，并提供自动 / 0 / 0.3 / 0.7 / 1 与 4K / 8K / 16K / 32K 快捷值。输出「自动」对齐 Qoder 官方 CLI 的 32K 默认；模型声明了输出上限时优先用上限。温度「自动」表示不传 `temperature`，由上游决定。保存后写进 `prefs.json`，DSH 下一次 `listModels` / `stream` 就使用新值，可一键恢复官方默认。
 - **账号**：桌面端自动导入、OAuth 设备授权、PAT 导入、令牌自动刷新（`drt-` / `jrt-` / PAT 交换）。
 - **额度**：读取上游 `plan` 与 `quota`，显示套餐、加量包、剩余 / 总量、已用比例和到期时间；概览首屏就是额度卡，额度用尽会标红。对话页顶部胶囊也显示当前账号额度，而不是次数 / tokens。
@@ -144,6 +167,14 @@ npm run verify -- --offline # 只看文件和 profile 配置
 - **诊断**：凭据、令牌、目录、原生路由、存储、偏好、额度、签到设备身份、最近错误与运行环境；日志自动脱敏。
 - **面板**：概览 / 签到 / 模型 / 试跑 / 用量 / 账号 / 诊断；低饱和森林绿配色、带水平滑动高亮块的胶囊页签、自绘下拉菜单、账号栏底块、响应式布局，明暗主题跟随 DSH；无渐变、无 emoji、数字等宽，页签切换统一淡入上浮过渡并保留试跑状态，尊重 `prefers-reduced-motion`。首屏不会在状态未返回时误报未登录，读取失败会给出就地重试而不是无限骨架；页签、下拉、分段控件和图表都有键盘路径。
 - **斜杠命令 + 4 个只读工具**：agent 可以自己回答“Qoder 现在能不能用、有哪些模型、今天花了多少”。
+
+## 性能
+
+- **本地准备**：目录命中缓存时，`prepareCall` 只是内存查表；组包、COSY 签名和请求体编码走 Buffer 码表，典型请求的本地开销在毫秒级。
+- **不挡首包**：目录过期只触发后台刷新，显式刷新才等待上游；启动时不扫描本机账号，DPAPI key 在后台预热。
+- **连接复用**：聊天请求使用持久化 keep-alive Agent，不再受 Node `fetch` 默认 4 秒空闲回收的限制；服务端主动断开时仍会正常重连。
+- **流式与落盘**：SSE 帧到达即翻译并下发；用量记录内存合并后异步写入，不阻塞消息结束。
+- **真正的大头**：首包与首字时间主要来自上游排队与思考 tokens。面板「试跑」会显示首字、生成耗时、tok/s 和思考 tokens，方便判断是网络、排队还是思考开销。
 
 ## 数据与安全
 
@@ -177,19 +208,40 @@ npm run verify -- --offline # 只看文件和 profile 配置
 - **模型参数是本地偏好**：上下文窗口 / 思考档位 / 温度 / 最大输出只影响本插件发给上游的请求与 DSH 选择器，不会修改 Qoder 官方客户端设置；上游仍可能按自己的模型上限拒绝或截断。输出「自动」是 32K（Qoder 官方 CLI 默认），可手动调高；温度没有公开的聊天默认值，插件不猜。
 - **签到也是非官方接口**：使用本机 Qoder 客户端 `runtime-info` 生成的设备身份，活动每天 10:00（UTC+8）后开放；平台可能调整活动或风控。自动签到默认开启，可在「签到」页关闭，或用 `QODER_CHECKIN=0` 禁用；DSH 没运行时不会签到。没有活动时会明确显示「无活动」或「未开放」，不会混进待领取或异常；缺设备 / 需登录的账号当天不自动重试。
 - **超时是本地判定**：首包默认 45 秒、块间空闲默认 120 秒；可通过插件配置 `firstByteTimeoutMs` / `streamIdleTimeoutMs` 调整（0 表示不限）。超时只会停止本地等待，已经发出的上游请求仍可能产生少量 Credits。
+- **用量写入是合并异步的**：正常退出会同步补写；进程被强制结束时，最后一条记录可能还没落盘。只影响本地统计，对话内容仍然从不记录。
 - **多账号只切换插件**：账号来自本机官方客户端的只读扫描；切换只改插件当前使用的账号，不会写入或退出官方客户端。
 - **协议**：当前使用已实测的 COSY + `agent_chat_generation` 路径；更新版 Bearer 端点存在但模型 id 体系不同，未作为默认路径。
 - **设备授权 / PAT**：协议流程已实现，离线回归覆盖 PAT、设备授权与过期令牌重试；本次实机验证主要走桌面端导入，欢迎用真实 PAT 补一次实机回归。
 - **图片 / 工具调用**：取决于上游模型与账号能力；失败会以可见错误结束，不会伪造成功。
 - **Windows 凭据导入**依赖 PowerShell DPAPI；无 PowerShell 的精简环境会退回 AES 本地密钥模式（仍不落明文 token）。
 
+## 更新记录
+
+每个版本的完整变更见 **[CHANGELOG.md](CHANGELOG.md)**；发布说明（含升级步骤与资产 SHA-256）见 [Releases](https://github.com/Ianzhyh/qoder-to-dsh/releases)。
+
+当前版本 `1.1.2` 补齐面板在宿主刚启动、标签页在后台、账号刚切换时的行为：404 启动窗口快速自愈、后台不空转轮询、旧账号的在途响应不覆盖新账号。`1.1.1` 修掉三个「留到线上才暴露」的问题：断流被当成正常结束、不合法工具名导致整轮失败且不点名、面板请求没有超时。`1.1.0` 的要点是聊天 SSE 走持久连接、模型目录先返回后刷新、启动不再扫本机账号、凭据与用量异步落盘。详见 [v1.1.2 发布说明](docs/releases/v1.1.2.md)、[v1.1.1 发布说明](docs/releases/v1.1.1.md) 与 [v1.1.0 发布说明](docs/releases/v1.1.0.md)。
+
 ## 开发
 
 ```bash
-npm test                 # 纯函数 / 流翻译 / 流超时与失败统计 / 客户端缓存与登录 / 状态 / 签到 / Credits / 宿主路由
+npm test                 # 纯函数 / 流翻译 / 传输 keep-alive / 目录单飞与 SWR / 编码等价 / 用量合并写 / 登录 / 签到 / Credits / 宿主路由 / 客户端 404 与后台轮询
 npm run check            # 所有模块语法检查
 npm run verify           # 安装自检：文件 / profile / 运行态（只读）
 npm run test:live        # 实机回归：会真实调用一次 Qoder（消耗少量 Credits）
+```
+
+发版用的三个脚本：
+
+```bash
+npm run release:check    # 发版门禁：语法 + 全部用例 + 安装自检（--offline）
+npm run pack:release     # 生成 qoder-to-dsh-<version>.tgz
+npm run verify:release   # 校验 tgz：产物新鲜度 / 文件清单 / 双份版本号 / patch 名 / sha256
+```
+
+`verify:release` 也可以传 Release 资产 URL，直接校验**已发布**的那一份（只在内存里解包，不写磁盘）：
+
+```bash
+npm run verify:release -- https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.1.2/qoder-to-dsh-1.1.2.tgz
 ```
 
 第三方许可与归属信息见 [NOTICE.md](NOTICE.md)。

@@ -22,11 +22,18 @@ function httpError(status, message) {
 async function readJsonBody(req, limit = 256 * 1024) {
   const chunks = [];
   let size = 0;
+  let tooLarge = false;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > limit) throw httpError(413, '请求体过大');
+    // 超限后继续把剩余字节读掉再回 413：中途退出会让 Node 销毁请求流，
+    // 客户端可能在读到 413 之前先收到 ECONNRESET。
+    if (size > limit) {
+      tooLarge = true;
+      continue;
+    }
     chunks.push(chunk);
   }
+  if (tooLarge) throw httpError(413, '请求体过大');
   if (!chunks.length) return {};
   let parsed;
   try { parsed = JSON.parse(Buffer.concat(chunks).toString('utf8')); } catch { throw httpError(400, '请求体不是有效的 JSON'); }

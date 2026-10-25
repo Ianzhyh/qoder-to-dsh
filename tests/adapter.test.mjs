@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  CODE, QoderAdapter, StreamTranslator, classifyError, mapUsage, sanitizeWire, toWireMessage, toWireTools,
+  CODE, QoderAdapter, StreamTranslator, classifyError, findInvalidTool, mapUsage, sanitizeWire, toWireMessage, toWireTools,
 } from '../lib/adapter.mjs';
 
 test('StreamTranslator maps reasoning, text, tool calls and usage', () => {
@@ -50,8 +50,19 @@ test('null and primitive SSE frames are ignored without throwing', () => {
   assert.deepEqual(translator.pushLine('data: 42'), []);
   assert.deepEqual(translator.pushLine('data: []'), []);
   assert.deepEqual(translator.pushLine('data: {"choices":[{"delta":{"content":"ok"}}]}').filter((chunk) => chunk.type === 'text-delta').map((chunk) => chunk.text), ['ok']);
+  // 补上收尾标记：没有 finish_reason 又没有 [DONE] 的流现在算传输中断（见下一条用例），
+  // 这条用例只关心 null / 原始值帧是否被安静丢弃。
+  assert.deepEqual(translator.pushLine('data: [DONE]'), []);
   const finish = translator.finish().find((chunk) => chunk.type === 'finish');
   assert.equal(finish.reason.kind, 'stop');
+});
+
+test('a stream with content but no finish_reason and no [DONE] is a transport failure', () => {
+  const translator = new StreamTranslator();
+  translator.pushLine('data: {"choices":[{"delta":{"content":"half"}}]}');
+  const finish = translator.finish().find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.TRANSPORT);
 });
 
 test('a string error frame still fails the stream visibly', () => {
@@ -167,6 +178,29 @@ test('toWireTools deduplicates by name and keeps JSON schema', () => {
   assert.equal(tools.length, 2);
   assert.equal(tools[0].function.name, 'a');
   assert.deepEqual(tools[1].function.parameters, { type: 'object', properties: {} });
+});
+
+test('tool names that the gateway would reject are caught locally with a readable reason', () => {
+  // 上游对含点号 / 斜杠 / 空格 / 超长的工具名回确定性 400，且通常不说是哪个工具。
+  // 本地先拦，错误里点名。
+  assert.equal(findInvalidTool({ tools: [{ name: 'read_file' }] }), '');
+  assert.equal(findInvalidTool({ tools: [{ name: 'mcp__server__tool-2' }] }), '');
+  assert.equal(findInvalidTool({ tools: [] }), '');
+  // 历史里重复带同一批工具是常态，不算错。
+  assert.equal(findInvalidTool({
+    tools: [{ name: 'a' }],
+    toolHistory: { updates: [{ additions: [{ name: 'a' }] }] },
+  }), '');
+
+  const dotted = findInvalidTool({ tools: [{ name: 'a' }, { name: 'server.tool' }] });
+  assert.match(dotted, /server\.tool/);
+  assert.match(dotted, /不合法/);
+
+  const spaced = findInvalidTool({ tools: [{ name: 'my tool' }] });
+  assert.match(spaced, /my tool/);
+
+  const tooLong = findInvalidTool({ tools: [{ name: 'x'.repeat(65) }] });
+  assert.match(tooLong, /64/);
 });
 
 test('catalog keeps the upstream cache timestamp instead of faking freshness', async () => {

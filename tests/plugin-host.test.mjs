@@ -49,16 +49,22 @@ const ctx = {
 
 apply(ctx, { region: 'global' });
 
-function createReq({ method = 'GET', url = '/', body, raw, headers = {} } = {}) {
+function createReq({ method = 'GET', url = '/', body, raw, chunks, headers = {} } = {}) {
   const buffer = raw !== undefined ? Buffer.from(raw) : (body === undefined ? null : Buffer.from(JSON.stringify(body)));
-  return {
+  const parts = chunks || (buffer ? [buffer] : []);
+  const req = {
     method,
     url,
     headers: { host: '127.0.0.1', ...headers },
+    consumed: 0,
     async *[Symbol.asyncIterator]() {
-      if (buffer) yield buffer;
+      for (const part of parts) {
+        req.consumed += 1;
+        yield part;
+      }
     },
   };
+  return req;
 }
 
 function createRes() {
@@ -82,17 +88,17 @@ function createRes() {
   };
 }
 
-async function call(method, url, { body, raw, panel = false } = {}) {
+async function call(method, url, { body, raw, chunks, panel = false } = {}) {
   const path = url.split('?')[0];
   const route = routes.find((item) => item.path === path);
   assert.ok(route, `route ${path} should be mounted`);
-  const req = createReq({ method, url, body, raw, headers: panel ? { 'x-qoder-panel': '1' } : {} });
+  const req = createReq({ method, url, body, raw, chunks, headers: panel ? { 'x-qoder-panel': '1' } : {} });
   const res = createRes();
   await route.handler(req, res);
   await res.done;
   let json = null;
   try { json = JSON.parse(res.body); } catch { /* non json */ }
-  return { status: res.statusCode, json, headers: res.headers };
+  return { status: res.statusCode, json, headers: res.headers, req };
 }
 
 test('plugin registers one adapter, its tools, command and all panel routes', () => {
@@ -215,6 +221,17 @@ test('prefs require the panel header and persist per-model context/params', asyn
   assert.deepEqual(cleared.json.prefs.contextWindowByModel, {});
   assert.deepEqual(cleared.json.prefs.paramsByModel, {});
   assert.equal(cleared.json.customized, 0);
+});
+
+test('an oversized panel body is drained before the 413 so the client can read it', async () => {
+  const chunk = Buffer.alloc(200 * 1024, 0x20);
+  const { status, json, req } = await call('POST', '/qoder/prefs', {
+    panel: true,
+    chunks: [chunk, chunk],
+  });
+  assert.equal(status, 413);
+  assert.match(String(json.error), /请求体过大/);
+  assert.equal(req.consumed, 2, 'remaining chunks must be read instead of tearing down the stream');
 });
 
 test('checkin route exposes auto state, can be toggled, and stays offline with no accounts', async () => {

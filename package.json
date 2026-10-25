@@ -1,6 +1,6 @@
 {
   "name": "qoder-to-dsh",
-  "version": "1.0.2",
+  "version": "1.1.2",
   "private": false,
   "description": "把 Qoder 的模型额度原生接进 DeepSeek Harness —— 纯 dsh 插件，单进程、无中转端口、无额外客户端。",
   "type": "module",
@@ -27,7 +27,8 @@
     "icon.svg",
     "LICENSE",
     "NOTICE.md",
-    "README.md"
+    "README.md",
+    "CHANGELOG.md"
   ],
   "dsh": {
     "bundle": {
@@ -41,7 +42,10 @@
     "test": "node --test \"tests/*.test.mjs\"",
     "test:live": "node tests/live-adapter.mjs",
     "verify": "node tests/verify-install.mjs",
-    "check": "node --check dsh-plugin/lib/index.js && node --check dsh-plugin/lib/client.js && node --check dsh-plugin/lib/routes.mjs && node --check lib/config.mjs && node --check lib/adapter.mjs && node --check lib/models.mjs && node --check lib/state.mjs && node --check lib/qoder-api.mjs && node --check lib/qoder-sign.mjs && node --check lib/desktop-auth.mjs && node --check lib/secret-store.mjs && node --check lib/umid.mjs && node --check lib/checkin.mjs && node --check lib/tools.mjs && node --check lib/request-guard.mjs && node --check tests/verify-install.mjs"
+    "pack:release": "npm pack",
+    "verify:release": "node tests/verify-release.mjs",
+    "release:check": "npm run check && npm test && npm run verify -- --offline",
+    "check": "node --check dsh-plugin/lib/index.js && node --check dsh-plugin/lib/client.js && node --check dsh-plugin/lib/routes.mjs && node --check lib/config.mjs && node --check lib/adapter.mjs && node --check lib/models.mjs && node --check lib/state.mjs && node --check lib/qoder-api.mjs && node --check lib/chat-transport.mjs && node --check lib/qoder-sign.mjs && node --check lib/desktop-auth.mjs && node --check lib/secret-store.mjs && node --check lib/umid.mjs && node --check lib/checkin.mjs && node --check lib/tools.mjs && node --check lib/request-guard.mjs && node --check tests/verify-install.mjs && node --check tests/verify-release.mjs"
   },
   "keywords": [
     "deepseek-harness",

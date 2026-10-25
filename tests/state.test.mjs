@@ -1,8 +1,12 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 import {
-  creditsReport, normalizeCheckin, normalizePrefs, normalizeUsageRecord, reconcileUsage, redact, summarizeUsage,
+  appendUsage, clearUsage, creditsReport, flushUsage, normalizeCheckin, normalizePrefs,
+  normalizeUsageRecord, readUsage, reconcileUsage, redact, summarizeUsage,
 } from '../lib/state.mjs';
 
 test('normalizePrefs keeps the three visibility intents distinct', () => {
@@ -188,6 +192,35 @@ test('usage records keep the client source used for Credits grouping', () => {
   const record = normalizeUsageRecord({ at: 1, model: 'auto', client: 'cli', totalTokens: 1 });
   assert.equal(record.client, 'cli');
   assert.equal(normalizeUsageRecord({ at: 1 }).client, 'unknown');
+});
+
+test('usage reads are cached and writes are coalesced', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'qoder-usage-'));
+  const path = join(dir, 'usage.json');
+  const now = Date.now();
+  writeFileSync(path, `${JSON.stringify([
+    { at: now - 3000, model: 'a', totalTokens: 1, ok: true },
+    { at: now - 2000, model: 'b', totalTokens: 2, ok: true },
+  ], null, 2)}\n`);
+  try {
+    assert.deepEqual(readUsage(path).map((item) => item.model), ['a', 'b']);
+    appendUsage({ at: now - 1000, model: 'c', totalTokens: 3, ok: true }, path);
+    appendUsage({ at: now, model: 'd', totalTokens: 4, ok: true }, path);
+    assert.deepEqual(readUsage(path).map((item) => item.model), ['a', 'b', 'c', 'd'], '追加后内存立即可见');
+    await flushUsage(path);
+    const raw = readFileSync(path, 'utf8');
+    assert.ok(!raw.includes('\n  '), '用量文件使用紧凑 JSON');
+    assert.deepEqual(JSON.parse(raw).map((item) => item.model), ['a', 'b', 'c', 'd']);
+
+    writeFileSync(path, `${JSON.stringify([{ at: now, model: 'external', totalTokens: 5, ok: true }])}\n`);
+    assert.deepEqual(readUsage(path).map((item) => item.model), ['external'], '外部改写后重新加载');
+
+    appendUsage({ at: now + 1, model: 'e', totalTokens: 6, ok: true }, path);
+    clearUsage(path);
+    assert.deepEqual(readUsage(path), []);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('redact removes token prefixes and bearer values', () => {

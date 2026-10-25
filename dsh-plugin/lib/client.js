@@ -13,28 +13,122 @@
 
     const PANEL_HEADERS = { 'x-qoder-panel': '1', 'content-type': 'application/json', accept: 'application/json' };
     const READ_HEADERS = { accept: 'application/json' };
+    // 宿主半死时 fetch 可以一直挂着，按钮就永远 busy、晚到的响应还会盖掉新数据。
+    // 自己带 signal 的调用（试跑的取消）沿用调用方的信号，其余统一 20 秒。
+    const REQUEST_TIMEOUT_MS = 20_000;
+    // dsh 的 Web 兜底处理器在插件路由挂上之前对未命中路径回 404。刷新页面
+    // 正好撞上这个启动窗口时，快速重试几次比把红字挂到下一轮轮询更好。
+    const ROUTE_READY_RETRY_MS = [350, 800, 1300];
+
+    const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+    async function requestOnce(path, opts) {
+      const controller = opts.signal ? null : new AbortController();
+      const timer = controller ? setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS) : null;
+      try {
+        const res = await fetch(path, {
+          credentials: 'same-origin',
+          cache: 'no-store',
+          ...opts,
+          signal: opts.signal || controller.signal,
+          headers: { ...(opts.headers), ...(opts.body ? PANEL_HEADERS : READ_HEADERS) },
+        });
+        let data = null;
+        try { data = await res.json(); } catch { data = null; }
+        if (!res.ok) {
+          const message = data && (data.error || data.message) || ('HTTP ' + res.status);
+          const error = new Error(message);
+          error.status = res.status;
+          error.data = data;
+          throw error;
+        }
+        return data || { ok: false, error: '空响应' };
+      } catch (error) {
+        if (controller && controller.signal.aborted) {
+          const timeout = new Error('请求超时（' + (REQUEST_TIMEOUT_MS / 1000) + ' 秒未响应）');
+          timeout.status = 0;
+          throw timeout;
+        }
+        throw error;
+      } finally {
+        if (timer) clearTimeout(timer);
+      }
+    }
 
     async function requestJson(path, options) {
-      const res = await fetch(path, {
-        credentials: 'same-origin',
-        cache: 'no-store',
-        ...options,
-        headers: { ...(options && options.headers), ...(options && options.body ? PANEL_HEADERS : READ_HEADERS) },
-      });
-      let data = null;
-      try { data = await res.json(); } catch { data = null; }
-      if (!res.ok) {
-        const message = data && (data.error || data.message) || ('HTTP ' + res.status);
-        const error = new Error(message);
-        error.status = res.status;
-        error.data = data;
-        throw error;
+      const opts = options || {};
+      const panelRoute = typeof path === 'string' && path.startsWith('/qoder/');
+      const retryable = String(opts.method || 'GET').toUpperCase() === 'GET'
+        && !opts.signal
+        && panelRoute;
+      for (let attempt = 0; ; attempt += 1) {
+        try {
+          return await requestOnce(path, opts);
+        } catch (error) {
+          if (retryable && error && error.status === 404 && attempt < ROUTE_READY_RETRY_MS.length) {
+            await delay(ROUTE_READY_RETRY_MS[attempt]);
+            continue;
+          }
+          if (panelRoute && error && error.status === 404) {
+            error.message = '插件接口还没就绪（HTTP 404）：如果刚升级插件，请完全退出并重启 dsh，再刷新本页。';
+          }
+          throw error;
+        }
       }
-      return data || { ok: false, error: '空响应' };
     }
 
     const getJson = (path) => requestJson(path);
     const postJson = (path, body, extra) => requestJson(path, { method: 'POST', body: JSON.stringify(body || {}), ...extra });
+
+    const documentVisible = (doc) => !doc || doc.visibilityState !== 'hidden';
+
+    // 后台标签页不轮询；切回可见时立即补一次再恢复定时。初始就隐藏也要在
+    // 第一次可见时启动（不能让「打开时就在后台」变成永久停更）。重复事件由
+    // 状态翻转判定挡掉，避免一次切换触发多轮全量请求。
+    function startVisibilityPoll(doc, onTick, intervalMs) {
+      let timer = null;
+      let visible = documentVisible(doc);
+      const tick = () => {
+        if (!documentVisible(doc)) return;
+        try { onTick(); } catch { /* keep polling */ }
+      };
+      const stop = () => {
+        if (timer !== null) {
+          clearInterval(timer);
+          timer = null;
+        }
+      };
+      const start = () => {
+        stop();
+        timer = setInterval(tick, intervalMs);
+      };
+      const onChange = () => {
+        const next = documentVisible(doc);
+        if (next === visible) return;
+        visible = next;
+        if (visible) {
+          tick();
+          start();
+        } else {
+          stop();
+        }
+      };
+      if (visible) start();
+      if (doc && typeof doc.addEventListener === 'function') doc.addEventListener('visibilitychange', onChange);
+      return () => {
+        stop();
+        if (doc && typeof doc.removeEventListener === 'function') doc.removeEventListener('visibilitychange', onChange);
+      };
+    }
+
+    function useVisibilityPoll(onTick, intervalMs, enabled) {
+      const tickRef = useRef(onTick);
+      tickRef.current = onTick;
+      useEffect(() => {
+        if (enabled === false) return undefined;
+        return startVisibilityPoll(typeof document === 'undefined' ? null : document, () => tickRef.current(), intervalMs);
+      }, [intervalMs, enabled]);
+    }
 
     const num = (n) => (Number.isFinite(Number(n)) ? Number(n) : 0);
     function compact(n) {
@@ -1474,6 +1568,10 @@
       const creditsSeq = useRef(0);
       const usageSeq = useRef(0);
       const accountSeq = useRef(0);
+      const modelsSeq = useRef(0);
+      const statusSeq = useRef(0);
+      const checkinSeq = useRef(0);
+      const diagnosticsSeq = useRef(0);
       const mounted = useRef(true);
 
       useLayoutEffect(() => {
@@ -1578,28 +1676,30 @@
       }, []);
 
       const loadModels = useCallback(async (refresh) => {
+        const seq = ++modelsSeq.current;
         try {
           const data = await getJson('/qoder/models' + (refresh ? '?refresh=1' : ''));
-          if (!mounted.current) return;
+          if (!mounted.current || seq !== modelsSeq.current) return;
           setModels(data.models || []);
           setModelsError('');
-          if (data.error) setError(data.error);
+          if (data.error && !/尚未登录|未登录/.test(String(data.error))) setError(data.error);
         } catch (err) {
-          if (!mounted.current) return;
+          if (!mounted.current || seq !== modelsSeq.current) return;
           const message = String(err.message || err);
           setModels((previous) => previous || []);
           setModelsError(message);
-          setError(message);
+          if (!/尚未登录|未登录/.test(message)) setError(message);
         }
       }, []);
 
       const loadStatus = useCallback(async (deep, rescan = false) => {
+        const seq = ++statusSeq.current;
         try {
           const params = [];
           if (deep) params.push('deep=1');
           if (rescan) params.push('rescan=1');
           const data = await getJson('/qoder/status' + (params.length ? `?${params.join('&')}` : ''));
-          if (!mounted.current) return;
+          if (!mounted.current || seq !== statusSeq.current) return;
           setStatus(data);
           setStatusError('');
           setError('');
@@ -1611,7 +1711,7 @@
             if (data.signedIn) loadModels(false);
           }
         } catch (err) {
-          if (!mounted.current) return;
+          if (!mounted.current || seq !== statusSeq.current) return;
           const message = String(err.message || err);
           setStatusError(message);
           setError(message);
@@ -1619,10 +1719,11 @@
       }, [loadModels, syncDrafts]);
 
       useEffect(() => {
+        // /models 有进程内缓存与单飞；与 status 并行，别让桌面端账号扫描挡住模型首屏。
         loadStatus(false);
-        const timer = setInterval(() => { if (mounted.current) loadStatus(false); }, 25_000);
-        return () => clearInterval(timer);
-      }, [loadStatus]);
+        loadModels(false);
+      }, [loadStatus, loadModels]);
+      useVisibilityPoll(() => loadStatus(false), 25_000);
 
       const loadUsage = useCallback(async (days, silent = false) => {
         const seq = ++usageSeq.current;
@@ -1679,15 +1780,16 @@
       }, []);
 
       const loadCheckin = useCallback(async (silent = false) => {
+        const seq = ++checkinSeq.current;
         if (!silent) setCheckinBusy(true);
         if (!silent) setCheckinError('');
         try {
           const data = await getJson('/qoder/checkin');
-          if (mounted.current) setCheckin(data);
+          if (mounted.current && seq === checkinSeq.current) setCheckin(data);
         } catch (err) {
-          if (!silent && mounted.current) setCheckinError(String(err.message || err));
+          if (!silent && mounted.current && seq === checkinSeq.current) setCheckinError(String(err.message || err));
         } finally {
-          if (!silent && mounted.current) setCheckinBusy(false);
+          if (!silent && mounted.current && seq === checkinSeq.current) setCheckinBusy(false);
         }
       }, []);
 
@@ -1773,20 +1875,17 @@
         }
       }, [tab, usageDays, creditsRange, loadUsage, loadCredits]);
 
-      useEffect(() => {
-        if (tab !== 'usage') return undefined;
-        const timer = setInterval(() => { loadUsage(usageDays, true); }, 30_000);
-        return () => clearInterval(timer);
-      }, [tab, usageDays, loadUsage]);
+      useVisibilityPoll(() => loadUsage(usageDays, true), 30_000, tab === 'usage');
 
       const loadDiagnostics = useCallback(async () => {
+        const seq = ++diagnosticsSeq.current;
         setDiagnosticsError('');
         try {
           const data = await getJson('/qoder/diagnostics');
-          if (!mounted.current) return;
+          if (!mounted.current || seq !== diagnosticsSeq.current) return;
           setDiagnostics(data);
         } catch (err) {
-          if (!mounted.current) return;
+          if (!mounted.current || seq !== diagnosticsSeq.current) return;
           setDiagnosticsError(String(err.message || err));
         }
       }, []);
@@ -1796,17 +1895,25 @@
       }, [tab, diagnostics, diagnosticsError, loadDiagnostics]);
 
       useEffect(() => {
-        if (!status || !status.signedIn) return undefined;
-        if (tab !== 'account' && tab !== 'overview') return undefined;
+        if (!status || !status.signedIn) return;
+        if (tab !== 'account' && tab !== 'overview') return;
         if (!accountData) loadAccount();
-        const timer = setInterval(() => { if (mounted.current) loadAccount(); }, 120_000);
-        return () => clearInterval(timer);
       }, [tab, status && status.signedIn, accountData, loadAccount]);
+      useVisibilityPoll(loadAccount, 120_000, Boolean(status && status.signedIn) && (tab === 'account' || tab === 'overview'));
 
       useEffect(() => {
         const onAuth = () => {
           authKey.current = '';
+          statusSeq.current += 1;
+          modelsSeq.current += 1;
+          checkinSeq.current += 1;
+          diagnosticsSeq.current += 1;
+          usageSeq.current += 1;
+          creditsSeq.current += 1;
+          accountSeq.current += 1;
           setDevice(null);
+          setModels([]);
+          setTrialModel('');
           setUsage(null);
           setCredits(null);
           setAccountData(null);
@@ -1834,18 +1941,21 @@
           loadStatus(false);
           loadModels(false);
           loadCheckin(true);
+          if (tab === 'usage') {
+            loadUsage(14);
+            loadCredits(creditsRange);
+          }
         };
         window.addEventListener('qoder:auth-changed', onAuth);
         return () => window.removeEventListener('qoder:auth-changed', onAuth);
-      }, [loadStatus, loadModels, loadCheckin]);
+      }, [loadStatus, loadModels, loadCheckin, loadUsage, loadCredits, tab, creditsRange]);
 
       useEffect(() => {
-        if (tab !== 'checkin' && tab !== 'account' && !(tab === 'overview' && status && status.signedIn)) return undefined;
+        if (tab !== 'checkin' && tab !== 'account' && !(tab === 'overview' && status && status.signedIn)) return;
         loadCheckin(Boolean(checkin));
-        const timer = setInterval(() => { if (mounted.current) loadCheckin(true); }, 30_000);
-        return () => clearInterval(timer);
         // checkin 只决定首次是否静默，进入页签时仍会主动刷新。
       }, [tab, status && status.signedIn, loadCheckin]); // eslint-disable-line react-hooks/exhaustive-deps
+      useVisibilityPoll(() => loadCheckin(true), 30_000, tab === 'checkin' || tab === 'account' || (tab === 'overview' && Boolean(status && status.signedIn)));
 
       useEffect(() => {
         if (!switcherOpen) return undefined;
@@ -3272,18 +3382,26 @@
       const [quotaTried, setQuotaTried] = useState(false);
       const [authEpoch, setAuthEpoch] = useState(0);
       const alive = useRef(true);
+      const statusSeq = useRef(0);
+      const quotaSeq = useRef(0);
+      const loadStatus = useCallback(() => {
+        const seq = ++statusSeq.current;
+        getJson('/qoder/status').then((next) => {
+          if (alive.current && seq === statusSeq.current) setData(next);
+        }).catch(() => {});
+      }, []);
       useEffect(() => {
         alive.current = true;
-        const load = () => getJson('/qoder/status').then((next) => { if (alive.current) setData(next); }).catch(() => {});
-        load();
-        const timer = setInterval(load, 45_000);
+        loadStatus();
         const onAuth = () => {
           if (!alive.current) return;
+          statusSeq.current += 1;
+          quotaSeq.current += 1;
           setAccountExtras(null);
           setQuotaTried(false);
           setData((previous) => (previous ? { ...previous, extras: null } : previous));
           setAuthEpoch((value) => value + 1);
-          load();
+          loadStatus();
         };
         const onQuota = (event) => {
           if (!alive.current) return;
@@ -3293,27 +3411,26 @@
         window.addEventListener('qoder:quota-changed', onQuota);
         return () => {
           alive.current = false;
-          clearInterval(timer);
           window.removeEventListener('qoder:auth-changed', onAuth);
           window.removeEventListener('qoder:quota-changed', onQuota);
         };
-      }, []);
+      }, [loadStatus]);
+      useVisibilityPoll(loadStatus, 45_000);
       const signedIn = Boolean(data && data.signedIn);
+      const loadQuota = useCallback(async () => {
+        const seq = ++quotaSeq.current;
+        try {
+          const account = await getJson('/qoder/account');
+          if (alive.current && seq === quotaSeq.current) setAccountExtras(account.extras || null);
+        } catch { /* 额度读取失败不挡住对话页 */ } finally {
+          if (alive.current && seq === quotaSeq.current) setQuotaTried(true);
+        }
+      }, []);
       useEffect(() => {
-        if (!signedIn) return undefined;
-        let stopped = false;
-        const loadQuota = async () => {
-          try {
-            const account = await getJson('/qoder/account');
-            if (!stopped && alive.current) setAccountExtras(account.extras || null);
-          } catch { /* 额度读取失败不挡住对话页 */ } finally {
-            if (!stopped && alive.current) setQuotaTried(true);
-          }
-        };
+        if (!signedIn) return;
         loadQuota();
-        const timer = setInterval(loadQuota, 3 * 60_000);
-        return () => { stopped = true; clearInterval(timer); };
-      }, [signedIn, authEpoch]);
+      }, [signedIn, authEpoch, loadQuota]);
+      useVisibilityPoll(loadQuota, 3 * 60_000, signedIn);
       useEffect(() => {
         if (!pending) return undefined;
         let stopped = false;
@@ -3447,6 +3564,7 @@
     exports.QoderPanel = Panel;
     exports.getJson = getJson;
     exports.postJson = postJson;
+    exports.startVisibilityPoll = startVisibilityPoll;
     return module.exports;
   }
 

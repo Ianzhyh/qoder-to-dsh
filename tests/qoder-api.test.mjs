@@ -13,6 +13,34 @@ process.env.QODER_REGION = 'global';
 
 const { QoderClient } = await import('../lib/qoder-api.mjs');
 const { normalizeCatalog } = await import('../lib/qoder-api.mjs');
+const { QoderAdapter } = await import('../lib/adapter.mjs');
+const { PATHS } = await import('../lib/config.mjs');
+const { readEncryptedJson } = await import('../lib/secret-store.mjs');
+
+function deferred() {
+  let resolve;
+  let reject;
+  const promise = new Promise((res, rej) => {
+    resolve = res;
+    reject = rej;
+  });
+  return { promise, resolve, reject };
+}
+
+function catalogClient(options = {}) {
+  const client = new QoderClient({ region: 'global', log: () => {}, ...options });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-catalog-token',
+    user: { id: 'u-catalog', name: 'Catalog Tester' },
+    source: 'token',
+  }, { silent: true, persist: false });
+  // 前面的用例会往临时目录写 catalog.json；这里明确从“无缓存”开始。
+  client.catalogCache = { at: 0, models: [], error: '', staleMs: 0 };
+  client.rawById = new Map();
+  return client;
+}
 
 const json = (payload, status = 200) => new Response(JSON.stringify(payload), {
   status,
@@ -132,6 +160,7 @@ test('importPat exchanges identity and stores a token-sourced account', async ()
   assert.equal(client.auth.region, 'global');
   assert.equal(client.auth.user.email, 'tester@example.com');
   assert.equal(client.status().account.sourceLabel, '访问令牌');
+  assert.equal(readEncryptedJson(PATHS.auth).accessToken, 'dt-test-access-token', '登录成功前凭据已经异步落盘');
 });
 
 test('device authorization polls into a persisted account for the requested region', async () => {
@@ -238,8 +267,59 @@ test('refreshExtras exchanges a refresh-only credential before fetching quota', 
   assert.equal(client.status().token.needsRefresh, false);
 });
 
-test('trial times out when the upstream never returns response headers', async () => {
+test('an in-flight quota request from the previous account cannot overwrite the new account cache', async () => {
   const client = new QoderClient({ region: 'global', log: () => {} });
+  const rawSetAuth = client.setAuth.bind(client);
+  client.setAuth = (auth, options = {}) => rawSetAuth(auth, { ...options, persist: false });
+  const account = (id, token) => ({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: token,
+    user: { id, name: id },
+    source: 'token',
+  });
+  client.setAuth(account('u-old', 'dt-old'), { silent: true });
+  const releaseOld = deferred();
+  const seen = [];
+  await withFetch(async (url, options) => {
+    const target = String(url);
+    const auth = String(options?.headers?.authorization || '');
+    seen.push(auth);
+    if (target.endsWith('/api/v2/user/plan') || target.endsWith('/api/v2/quota/usage')) {
+      if (auth.includes('dt-old')) {
+        await releaseOld.promise;
+        return json({ account: 'old' });
+      }
+      return json({ account: 'new' });
+    }
+    throw new Error(`unexpected request ${target}`);
+  }, async () => {
+    const oldTask = client.refreshExtras();
+    await Promise.resolve();
+    client.setAuth(account('u-new', 'dt-new'), { silent: true });
+    const fresh = await client.refreshExtras();
+    assert.equal(fresh.plan.account, 'new');
+    releaseOld.resolve();
+    const old = await oldTask;
+    assert.equal(old.plan.account, 'old');
+    assert.equal(client.extras.plan.account, 'new', 'old account must not overwrite the new cache');
+    assert.equal(client.extras.quota.account, 'new');
+    assert.equal(seen.filter((auth) => auth.includes('dt-old')).length, 2);
+  });
+});
+
+test('trial times out when the upstream never returns response headers', async () => {
+  const client = new QoderClient({
+    region: 'global',
+    log: () => {},
+    transport: (_url, { signal }) => new Promise((_, reject) => {
+      if (signal.aborted) {
+        reject(signal.reason);
+        return;
+      }
+      signal.addEventListener('abort', () => reject(signal.reason), { once: true });
+    }),
+  });
   const rawSetAuth = client.setAuth.bind(client);
   client.setAuth = (auth, options = {}) => rawSetAuth(auth, { ...options, persist: false });
   client.setAuth({
@@ -254,20 +334,12 @@ test('trial times out when the upstream never returns response headers', async (
   // 目录请求走 https 模块，不能靠 mock fetch 拦截；这里直接让 rawModel 缺失时不做目录探测。
   client.listCatalog = async () => ({ models: [], at: Date.now(), staleMs: 0, error: '' });
 
-  await withFetch((_url, options) => new Promise((_, reject) => {
-    if (options.signal.aborted) {
-      reject(options.signal.reason);
-      return;
-    }
-    options.signal.addEventListener('abort', () => reject(options.signal.reason), { once: true });
-  }), async () => {
-    const started = Date.now();
-    await assert.rejects(
-      () => client.test({ model: 'auto', prompt: 'ping', firstByteTimeoutMs: 40 }),
-      /首包/,
-    );
-    assert.ok(Date.now() - started < 2000);
-  });
+  const started = Date.now();
+  await assert.rejects(
+    () => client.test({ model: 'auto', prompt: 'ping', firstByteTimeoutMs: 40 }),
+    /首包/,
+  );
+  assert.ok(Date.now() - started < 2000);
 });
 
 test('status surfaces plan, quota remaining and refresh-only token state', () => {
@@ -299,6 +371,125 @@ test('status surfaces plan, quota remaining and refresh-only token state', () =>
     source: 'desktop',
   }, { silent: true, persist: false });
   assert.equal(refreshOnly.status().token.needsRefresh, true);
+});
+
+test('catalog fetches are single-flight and stale cache returns immediately', async () => {
+  const client = catalogClient({ catalogTtlMs: 60_000 });
+  let calls = 0;
+  let gate = deferred();
+  client.fetchCatalog = async () => {
+    calls += 1;
+    await gate.promise;
+    return {
+      models: [{ id: 'auto', name: 'Auto' }],
+      rawById: new Map([['auto', { id: 'auto', name: 'Auto' }]]),
+    };
+  };
+
+  const first = client.listCatalog();
+  const second = client.listCatalog();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls, 1, '并发调用共享同一个目录请求');
+  gate.resolve();
+  const [a, b] = await Promise.all([first, second]);
+  assert.equal(a.models[0].id, 'auto');
+  assert.equal(b.models[0].id, 'auto');
+  assert.equal(calls, 1);
+  assert.equal(client.rawModel('auto').name, 'Auto');
+
+  client.catalogCache = {
+    at: Date.now() - 120_000,
+    models: [{ id: 'cached', name: 'Cached' }],
+    error: '',
+    staleMs: 0,
+  };
+  gate = deferred();
+  const started = Date.now();
+  const stale = await client.listCatalog();
+  assert.ok(Date.now() - started < 50, '过期目录直接返回缓存，不等待上游');
+  assert.equal(stale.models[0].id, 'cached');
+  assert.ok(stale.staleMs >= 100_000);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(calls, 2, '过期后触发一次后台刷新');
+  const duplicate = await client.listCatalog();
+  assert.equal(duplicate.models[0].id, 'cached');
+  assert.equal(calls, 2, '后台刷新在途时不重复请求');
+  gate.resolve();
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  const refreshed = await client.listCatalog();
+  assert.equal(refreshed.models[0].id, 'auto');
+  assert.equal(calls, 2);
+});
+
+test('catalog keeps stale models when refresh fails and throws only without cache', async () => {
+  const client = catalogClient({ catalogTtlMs: 60_000 });
+  client.catalogCache = {
+    at: Date.now() - 120_000,
+    models: [{ id: 'cached', name: 'Cached' }],
+    error: '',
+    staleMs: 0,
+  };
+  const gate = deferred();
+  client.fetchCatalog = async () => {
+    await gate.promise;
+    throw new Error('catalog down');
+  };
+  const stale = await client.listCatalog();
+  assert.equal(stale.models[0].id, 'cached');
+  const job = client.catalogInflight;
+  assert.ok(job, '后台刷新应已启动');
+  gate.reject(new Error('catalog down'));
+  const failed = await job;
+  assert.equal(failed.models[0].id, 'cached');
+  assert.match(failed.error, /catalog down/);
+  const next = await client.listCatalog();
+  assert.equal(next.models[0].id, 'cached');
+  assert.match(next.error, /catalog down/);
+  assert.ok(next.staleMs >= 100_000);
+
+  const empty = catalogClient();
+  empty.fetchCatalog = async () => { throw new Error('catalog down'); };
+  await assert.rejects(() => empty.listCatalog(), /catalog down/);
+});
+
+test('prepareCall resolves from stale cache without waiting for a refresh', async () => {
+  const client = catalogClient({ catalogTtlMs: 1000 });
+  client.catalogCache = {
+    at: Date.now() - 120_000,
+    models: [{ id: 'auto', name: 'Auto', context_window: 200_000, supports_reasoning: false }],
+    error: '',
+    staleMs: 0,
+  };
+  const gate = deferred();
+  client.fetchCatalog = async () => {
+    await gate.promise;
+    return {
+      models: [{ id: 'auto', name: 'Fresh Auto' }],
+      rawById: new Map([['auto', { id: 'auto', name: 'Fresh Auto' }]]),
+    };
+  };
+  const adapter = new QoderAdapter({ provider: 'qoder', client, log: () => {} });
+  const started = Date.now();
+  const prepared = await adapter.prepareCall('qoder', 'auto', new AbortController().signal);
+  assert.ok(Date.now() - started < 50, '目录过期不应挡住 prepareCall');
+  assert.equal(prepared.model.id, 'auto');
+  const job = client.catalogInflight;
+  assert.ok(job, '应已转入后台刷新');
+  gate.resolve();
+  await job;
+});
+
+test('status can skip the desktop credential scan', () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  const light = client.status({ desktop: false });
+  assert.equal(Object.prototype.hasOwnProperty.call(light, 'desktop'), false);
+  const full = client.status();
+  assert.ok(Array.isArray(full.desktop.candidates));
+});
+
+test('desktop key prewarm is a no-op without official clients', async () => {
+  const { prewarmDesktopKeysAsync } = await import('../lib/desktop-auth.mjs');
+  await prewarmDesktopKeysAsync();
 });
 
 test('cleanup', () => {
