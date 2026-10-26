@@ -26,6 +26,8 @@ function sseBody(frames) {
 function fakeClient(body) {
   return {
     auth: { source: 'desktop' },
+    authGeneration: 0,
+    accountStamp() { return { account: 'uid:test1234', generation: this.authGeneration }; },
     async chat() {
       return {
         ok: true,
@@ -48,6 +50,17 @@ function adapterFor(client, options = {}) {
     firstByteTimeoutMs: 1000,
     ...options,
   });
+}
+
+function errorClient({ status, text, headers = {} }) {
+  return {
+    auth: { source: 'desktop' },
+    authGeneration: 0,
+    accountStamp() { return { account: 'uid:test1234', generation: 0 }; },
+    async chat() {
+      return { ok: false, status, headers, body: null, text: async () => text };
+    },
+  };
 }
 
 async function collect(target) {
@@ -82,6 +95,62 @@ test('stream accepts reasoning deltas and records a successful request', async (
   assert.equal(record.status, 'ok');
   assert.equal(record.credits, 0.01);
   assert.equal(record.totalTokens, 13);
+  assert.equal(record.account, 'uid:test1234');
+});
+
+test('a consumer that stops early is recorded as aborted, not success', async () => {
+  const body = sseBody([
+    { choices: [{ delta: { content: 'partial answer' } }] },
+    { choices: [{ delta: {}, finish_reason: 'stop' }] },
+  ]);
+  const iterator = adapterFor(fakeClient(body)).stream({
+    model: 'auto',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    maxTokens: 32,
+  })[Symbol.asyncIterator]();
+  let first = await iterator.next();
+  while (!first.done && first.value.type !== 'text-delta') first = await iterator.next();
+  assert.equal(first.value.type, 'text-delta');
+  await iterator.return();
+
+  const record = lastUsage();
+  assert.equal(record.ok, false, '提前结束不能记成成功');
+  assert.equal(record.status, 'aborted');
+});
+
+test('account switch during a stream is visible as ABORTED and keeps the old account stamp', async () => {
+  const encoder = new TextEncoder();
+  let controllerRef = null;
+  const body = new ReadableStream({
+    start(controller) {
+      controllerRef = controller;
+      controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ delta: { content: 'partial' } }] })}\n\n`));
+    },
+  });
+  const client = fakeClient(body);
+  const iterator = adapterFor(client).stream({
+    model: 'auto',
+    messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
+    maxTokens: 32,
+  })[Symbol.asyncIterator]();
+  let first = await iterator.next();
+  while (!first.done && first.value.type !== 'text-delta') first = await iterator.next();
+  assert.equal(first.value.type, 'text-delta');
+  client.authGeneration = 1;
+  controllerRef.error(new Error('socket closed'));
+  const rest = [];
+  for (;;) {
+    const next = await iterator.next();
+    if (next.done) break;
+    rest.push(next.value);
+  }
+  const finish = rest.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.ABORTED);
+  const record = lastUsage();
+  assert.equal(record.status, 'aborted');
+  assert.equal(record.ok, false);
+  assert.equal(record.account, 'uid:test1234');
 });
 
 test('empty stop and content_filter both finish as errors and are not recorded as success', async () => {
@@ -206,6 +275,69 @@ test('[DONE] alone still counts as a clean completion', async () => {
   ))));
   assert.equal(chunks.find((chunk) => chunk.type === 'finish').reason.kind, 'stop');
   assert.equal(lastUsage().ok, true);
+});
+
+test('HTTP 403 queue uses Retry-After and does not become an auth error', async () => {
+  const chunks = await collect(adapterFor(errorClient({
+    status: 403,
+    headers: { 'retry-after': '45' },
+    text: JSON.stringify({ error: { message: 'queued', code: 10605 } }),
+  })));
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.failure.code, CODE.RATE_LIMIT);
+  assert.equal(finish.reason.failure.status, 403);
+  assert.equal(finish.reason.failure.providerRetryAfterMs, 45_000);
+});
+
+test('content audit and terminal session codes get actionable failures', async () => {
+  const audit = await collect(adapterFor(errorClient({
+    status: 400,
+    text: JSON.stringify({ error: { message: 'DataInspectionFailed' } }),
+  })));
+  const auditFinish = audit.find((chunk) => chunk.type === 'finish');
+  assert.equal(auditFinish.reason.failure.code, CODE.INVALID);
+  assert.match(auditFinish.reason.failure.message, /内容审核/);
+
+  const session = await collect(adapterFor(errorClient({
+    status: 401,
+    text: JSON.stringify({ error: { message: '12153', code: 12153 } }),
+  })));
+  const sessionFinish = session.find((chunk) => chunk.type === 'finish');
+  assert.equal(sessionFinish.reason.failure.code, CODE.AUTH);
+  assert.match(sessionFinish.reason.failure.message, /会话已失效/);
+});
+
+test('in-stream queue frames carry their retry delay', async () => {
+  const chunks = await collect(adapterFor(fakeClient(sseBody([
+    { error: { message: 'queued', code: 10605, retryAfterSeconds: 12 } },
+  ]))));
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.failure.code, CODE.RATE_LIMIT);
+  assert.equal(finish.reason.failure.providerRetryAfterMs, 12_000);
+});
+
+test('queue, daily cap and version errors include actionable hints', async () => {
+  const queue = await collect(adapterFor(errorClient({
+    status: 403,
+    text: JSON.stringify({ error: { message: 'queued', code: 10605, retryAfterSeconds: 4 } }),
+  })));
+  assert.match(queue.find((chunk) => chunk.type === 'finish').reason.failure.message, /排队/);
+
+  const daily = await collect(adapterFor(errorClient({
+    status: 403,
+    text: JSON.stringify({ error: { message: 'Billing daily count exceeded', code: 110 } }),
+  })));
+  const dailyFinish = daily.find((chunk) => chunk.type === 'finish');
+  assert.equal(dailyFinish.reason.failure.code, CODE.QUOTA);
+  assert.match(dailyFinish.reason.failure.message, /今日请求次数/);
+
+  const version = await collect(adapterFor(errorClient({
+    status: 430,
+    text: JSON.stringify({ error: { message: 'version too low', code: 430 } }),
+  })));
+  const versionFinish = version.find((chunk) => chunk.type === 'finish');
+  assert.equal(versionFinish.reason.failure.code, CODE.INVALID);
+  assert.match(versionFinish.reason.failure.message, /版本过低|升级/);
 });
 
 test('cleanup', () => {

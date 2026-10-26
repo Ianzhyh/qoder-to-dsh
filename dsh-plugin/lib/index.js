@@ -6,19 +6,22 @@
  *   - 不再监听第二个端口，也不会出现「桥在跑但插件连不上」的状态分裂；
  *   - 面板直接读插件内存态，数字与模型选择器同源。
  */
+import { readFileSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { VERSION, PROVIDER, DISPLAY_NAME, REGIONS, DEFAULTS, PATHS } from '../../lib/config.mjs';
+import { VERSION, PROVIDER, DISPLAY_NAME, REGIONS, DEFAULTS, PATHS, PACKAGE_ROOT } from '../../lib/config.mjs';
 import { QoderAdapter } from '../../lib/adapter.mjs';
 import { createTools } from '../../lib/tools.mjs';
 import { createRouteTable, mountRoutes } from './routes.mjs';
 import { QoderClient } from '../../lib/qoder-api.mjs';
 import { invalidateDesktopScan, prewarmDesktopKeysAsync, scanDesktopAuth } from '../../lib/desktop-auth.mjs';
+import { readCredentialScheme } from '../../lib/secret-store.mjs';
 import { disposeChatTransport } from '../../lib/chat-transport.mjs';
 import {
-  appendUsage, clearUsage as clearUsageFile, creditsReport, isWritableDir, log as writeLog,
-  localDayKey, readCheckin, readPrefs, readUsage, reconcileUsage, recentLogs, summarizeUsage, writeCheckin, writePrefs,
+  appendUsage, clearUsage as clearUsageFile, creditsReport, ensureUsageDaily, flushUsageSync,
+  isProbe, isWritableDir, log as writeLog, localDayKey, readCheckin, readPrefs, readUsage,
+  readUsageDaily, reconcileUsage, recentLogs, summarizeUsage, writeCheckin, writePrefs,
 } from '../../lib/state.mjs';
 import { beijingDateKey, beijingHour, buildCheckinAccounts, checkinCanClaim, claimCampaigns, summarizeCheckinAccounts } from '../../lib/checkin.mjs';
 import { deviceAvailability } from '../../lib/umid.mjs';
@@ -28,6 +31,52 @@ export const name = 'qoder';
 export const inject = ['llm'];
 
 const PLUGIN_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+
+/** 已加载代码的版本来自 config；磁盘版本用于识别“升级了但宿主没重启”。 */
+function installedVersion() {
+  try {
+    return String(JSON.parse(readFileSync(resolve(PACKAGE_ROOT, 'package.json'), 'utf8')).version || '');
+  } catch {
+    return '';
+  }
+}
+
+/** 每次快照都读磁盘版本：升级插件后无需重启就能发现“已在跑旧代码”。 */
+function versionState() {
+  const installed = installedVersion();
+  return { installed, mismatch: Boolean(installed && installed !== VERSION) };
+}
+
+/** 诊断页额度结论：无数据是 warn，不是 pass。 */
+export function quotaCheck(quota, extrasAt = 0, now = Date.now()) {
+  if (!quota || typeof quota !== 'object') {
+    const when = Number(extrasAt) > 0 ? `（上次成功：${new Date(Number(extrasAt)).toLocaleString('zh-CN')}）` : '';
+    return {
+      id: 'quota',
+      label: '账号额度',
+      status: 'warn',
+      detail: `上游未返回额度数据${when}，无法确认剩余额度。`,
+    };
+  }
+  const total = Number(quota.userQuota?.total || 0) + Number(quota.addOnQuota?.total || 0);
+  const left = Number(quota.userQuota?.remaining || 0) + Number(quota.addOnQuota?.remaining || 0);
+  const percent = Number(quota.totalUsagePercentage);
+  const unit = /^credits?$/i.test(String(quota.userQuota?.unit || '')) ? 'Credits' : (quota.userQuota?.unit || 'credits');
+  const stale = Number(extrasAt) > 0 && now - Number(extrasAt) > 5 * 60_000;
+  const empty = total <= 0 && left <= 0;
+  let detail;
+  if (total > 0) detail = `剩余 ${left} / ${total} ${unit}`;
+  else if (Number.isFinite(percent)) detail = `已用 ${Math.round(percent * 100)}%（上游未返回总量）`;
+  else detail = '上游返回了额度对象，但没有剩余/总量字段。';
+  if (quota.isQuotaExceeded) detail += ' · 已用尽';
+  if (stale) detail += ` · 数据更新于 ${new Date(Number(extrasAt)).toLocaleString('zh-CN')}`;
+  return {
+    id: 'quota',
+    label: '账号额度',
+    status: quota.isQuotaExceeded || empty || stale ? 'warn' : 'pass',
+    detail,
+  };
+}
 
 const asBool = (value, fallback) => {
   if (value === undefined || value === null || value === '') return fallback;
@@ -120,19 +169,25 @@ export function apply(ctx, rawConfig = {}) {
 
   const prefs = readPrefs();
   let notifyCatalogUpdated = () => {};
+  let authChangeTimer = null;
+  let checkinKickTimer = null;
+  let disposed = false;
   const client = new QoderClient({
     region: config.region,
     catalogTtlMs: config.catalogTtlMs,
     log,
     // 后台 stale-while-revalidate 拿到新目录后，让 DSH 的选择器跟着更新。
-    onCatalogUpdated: () => notifyCatalogUpdated(),
     onAuthChange: () => {
       state.pendingDevice = null;
       adapter.invalidate();
       adapter.warmup().then(() => notifyAdaptersUpdated(), () => notifyAdaptersUpdated());
-      setTimeout(() => {
+      if (authChangeTimer) clearTimeout(authChangeTimer);
+      authChangeTimer = setTimeout(() => {
+        authChangeTimer = null;
+        if (disposed) return;
         try { kickAutoCheckin(); } catch (error) { log('登录后触发自动签到失败', String(error?.message || error)); }
       }, 1500);
+      if (authChangeTimer.unref) authChangeTimer.unref();
     },
   });
 
@@ -164,6 +219,22 @@ export function apply(ctx, rawConfig = {}) {
       return `data:${mediaType};base64,${Buffer.from(bytes).toString('base64')}`;
     },
   });
+
+  // 后台刷新不一定有调用方在等：成功/失败都要同步到面板状态，不能只更新
+  // client 自己的缓存，否则状态页会一直显示“上次成功”的旧目录。
+  client.onCatalogUpdated = () => {
+    state.catalogError = '';
+    adapter.noteCatalogError('');
+    notifyCatalogUpdated();
+  };
+  client.onCatalogError = (message) => {
+    state.catalogError = String(message || '');
+    adapter.noteCatalogError(state.catalogError);
+  };
+
+  // 把历史明细补成每日汇总；没有历史时不会创建空文件。
+  // 传入已按当前目录校正的记录，避免旧免费模型的 Credits 在重建时被当成实扣。
+  ensureUsageDaily(PATHS.usage, usageRecords()).catch((error) => log('重建每日用量汇总失败', String(error?.message || error)));
 
   const useService = (serviceName, fn) => {
     if (typeof ctx.inject === 'function') {
@@ -211,7 +282,22 @@ export function apply(ctx, rawConfig = {}) {
     return reconcileUsage(readUsage(), freeIds);
   }
 
-  async function buildChecks({ deep = false } = {}) {
+  // 每日汇总覆盖被明细上限裁掉的历史；与 raw 明细按天二选一，避免重复计数。
+  // seedRecords 用已校正的明细，保证免费模型的旧 Credits 不会在重建时变成实扣。
+  const usageDaily = () => readUsageDaily(PATHS.usage, usageRecords());
+
+  // 状态页必须显示实际生效的方式：DPAPI 在受限环境里会回退 AES，
+  // 继续写死 “DPAPI” 会让用户误以为密钥没有落盘。
+  function credentialProtection() {
+    const scheme = readCredentialScheme(PATHS.auth);
+    if (scheme === 'dpapi') return 'DPAPI';
+    if (scheme === 'aes-256-gcm') return 'AES-256-GCM';
+    if (scheme === 'missing') return process.platform === 'win32' ? 'DPAPI（登录后生效）' : 'AES-256-GCM';
+    return '未知';
+  }
+
+  async function buildChecks({ deep = false, signal = null } = {}) {
+    if (signal?.aborted) throw signal.reason || new Error('诊断已取消');
     const checks = [];
     const status = client.status({ desktop: false });
     checks.push({
@@ -221,6 +307,37 @@ export function apply(ctx, rawConfig = {}) {
       detail: status.signedIn
         ? `${status.account?.name || status.account?.email || '已登录'} · ${status.regionLabel}`
         : '尚未登录。到「账号」页使用设备授权或 PAT 登录。',
+    });
+    const restore = status.authRestore;
+    if (restore && ['corrupt', 'invalid', 'import-failed'].includes(restore.state)) {
+      checks.push({
+        id: 'auth-restore',
+        label: '凭据恢复',
+        status: 'warn',
+        detail: restore.state === 'corrupt'
+          ? '本地凭据无法解密；不会自动切换账号，请到「账号」页重新授权。'
+          : `本地凭据不可用：${restore.error || restore.state}；请重新授权。`,
+      });
+    }
+    const scheme = readCredentialScheme(PATHS.auth);
+    checks.push({
+      id: 'credential',
+      label: '凭据加密',
+      status: scheme === 'unknown' || (process.platform === 'win32' && scheme === 'aes-256-gcm') ? 'warn' : 'pass',
+      detail: scheme === 'unknown'
+        ? '凭据文件无法解析，无法确认加密方式。'
+        : process.platform === 'win32' && scheme === 'aes-256-gcm'
+          ? 'DPAPI 不可用，已回退 AES-256-GCM（本机密钥与密文同目录）。功能可用，但建议确保数据目录仅本机用户可读。'
+          : credentialProtection(),
+    });
+    const version = versionState();
+    checks.push({
+      id: 'version',
+      label: '版本一致性',
+      status: version.mismatch ? 'warn' : 'pass',
+      detail: version.mismatch
+        ? `已加载 v${VERSION}，磁盘 v${version.installed}；完全退出 dsh 再打开才会加载新代码。`
+        : `v${VERSION}`,
     });
     if (status.signedIn) {
       const expired = status.token?.expiresAt && Number(status.token.expiresAt) <= Date.now();
@@ -236,7 +353,8 @@ export function apply(ctx, rawConfig = {}) {
     if (deep) {
       const started = Date.now();
       try {
-        const result = await client.listCatalog({ refresh: true });
+        const result = await client.listCatalog({ refresh: true, signal });
+        if (signal?.aborted) throw signal.reason || new Error('诊断已取消');
         checks.push({
           id: 'catalog',
           label: '模型目录',
@@ -244,6 +362,7 @@ export function apply(ctx, rawConfig = {}) {
           detail: `${result.models.length} 个模型 · ${Date.now() - started}ms${result.staleMs ? '（本次刷新失败，显示的是缓存）' : ''}${result.error ? ` · ${result.error}` : ''}`,
         });
       } catch (error) {
+        if (signal?.aborted) throw error;
         checks.push({ id: 'catalog', label: '模型目录', status: 'fail', detail: String(error?.message || error) });
       }
     }
@@ -282,23 +401,11 @@ export function apply(ctx, rawConfig = {}) {
     }
     if (deep && status.signedIn) {
       try {
-        const extras = await client.refreshExtras();
-        const quota = extras && extras.quota;
-        const total = Number(quota?.userQuota?.total || 0) + Number(quota?.addOnQuota?.total || 0);
-        const left = Number(quota?.userQuota?.remaining || 0) + Number(quota?.addOnQuota?.remaining || 0);
-        const percent = Number(quota?.totalUsagePercentage);
-        const unit = /^credits?$/i.test(String(quota?.userQuota?.unit || '')) ? 'Credits' : (quota?.userQuota?.unit || 'credits');
-        checks.push({
-          id: 'quota',
-          label: '账号额度',
-          status: quota?.isQuotaExceeded ? 'warn' : 'pass',
-          detail: total
-            ? `剩余 ${left} / ${total} ${unit}${quota?.isQuotaExceeded ? ' · 已用尽' : ''}`
-            : Number.isFinite(percent)
-              ? `已用 ${Math.round(percent * 100)}%${quota?.isQuotaExceeded ? ' · 已用尽' : ''}`
-              : '上游未返回额度数据',
-        });
+        const extras = await client.refreshExtras({ signal });
+        if (signal?.aborted) throw signal.reason || new Error('诊断已取消');
+        checks.push(quotaCheck(extras && extras.quota, extras?.at || client.extrasAt, Date.now()));
       } catch (error) {
+        if (signal?.aborted) throw error;
         checks.push({ id: 'quota', label: '账号额度', status: 'warn', detail: String(error?.message || error) });
       }
     }
@@ -311,7 +418,7 @@ export function apply(ctx, rawConfig = {}) {
   async function snapshot({ signal, deep = false, desktop = true } = {}) {
     const status = client.status({ desktop });
     const usageRecordsList = usageRecords();
-    const usage = summarizeUsage(usageRecordsList, 14);
+    const usage = summarizeUsage(usageRecordsList, 14, Date.now(), usageDaily());
     const directory = (() => {
       try {
         return toDirectory(adapter.catalogCache.models, {
@@ -321,9 +428,12 @@ export function apply(ctx, rawConfig = {}) {
         });
       } catch { return []; }
     })();
-    const checks = deep ? await buildChecks({ deep }) : [];
+    const checks = deep ? await buildChecks({ deep, signal }) : [];
+    const version = versionState();
     return {
       version: VERSION,
+      installedVersion: version.installed,
+      versionMismatch: version.mismatch,
       provider: config.provider,
       displayName: config.displayName,
       region: status.region,
@@ -331,6 +441,7 @@ export function apply(ctx, rawConfig = {}) {
       signedIn: status.signedIn,
       account: status.account,
       token: status.token,
+      authRestore: status.authRestore || null,
       extras: status.extras || null,
       extrasAt: status.extrasAt || 0,
       desktop: status.desktop || { available: false, candidates: [] },
@@ -351,7 +462,7 @@ export function apply(ctx, rawConfig = {}) {
       },
       customized: countOverrides(adapter.prefs),
       usage,
-      recentFailures: usageRecordsList.filter((record) => !record.ok).slice(-8).reverse(),
+      recentFailures: usageRecordsList.filter((record) => !record.ok && !isProbe(record)).slice(-8).reverse(),
       directory,
       checks,
       config: {
@@ -365,7 +476,7 @@ export function apply(ctx, rawConfig = {}) {
         dataDir: PATHS.prefs ? dirname(PATHS.prefs) : '',
         authPath: PATHS.auth,
         pluginDir: PLUGIN_DIR,
-        credentialProtection: process.platform === 'win32' ? 'DPAPI' : 'AES-256-GCM',
+        credentialProtection: credentialProtection(),
       },
       runtime: { node: process.version, pid: process.pid, uptimeMs: Date.now() - state.startedAt },
       lastError: state.lastError,
@@ -435,6 +546,7 @@ export function apply(ctx, rawConfig = {}) {
   // ── 每日签到（多账号） ────────────────────────────────────────────────
   let checkinState = readCheckin();
   const checkinRuns = new Map();
+  const checkinAbort = new AbortController();
   let autoCheckinTimer = null;
   let autoCheckinKick = null;
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -525,6 +637,7 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   async function runCheckinInternal({ key = '', auto = false } = {}) {
+    if (disposed || checkinAbort.signal.aborted) return { ...checkinSnapshot(), ok: false, error: '插件已卸载', results: [] };
     const runKey = key || '*';
     const running = checkinRuns.get(runKey);
     if (running) return running;
@@ -542,6 +655,8 @@ export function apply(ctx, rawConfig = {}) {
       const runAuthGeneration = client.authGeneration;
       const runAuthUid = String(client.auth?.user?.id || '');
       for (const account of targets) {
+        // 卸载/热重载后不再继续为剩余账号发请求；已发出的这一笔仍记录并落盘。
+        if (disposed || checkinAbort.signal.aborted) break;
         const saved = checkinState.results[account.key];
         const doneToday = saved
           && beijingDateKey(saved.checkedAt) === beijingDateKey(now)
@@ -554,6 +669,7 @@ export function apply(ctx, rawConfig = {}) {
             result = await claimCampaigns({
               region: account.region,
               now,
+              signal: checkinAbort.signal,
               getToken: async () => {
                 if (account.active) {
                   if (client.authGeneration !== runAuthGeneration
@@ -578,6 +694,7 @@ export function apply(ctx, rawConfig = {}) {
               },
             });
           } catch (error) {
+            if (disposed || checkinAbort.signal.aborted) break;
             result = {
               status: 'error',
               credits: 0,
@@ -602,6 +719,7 @@ export function apply(ctx, rawConfig = {}) {
         checkinState.results[account.key] = record;
         results.push(record);
         log(`签到 · ${REGIONS[account.region].label} · ${account.label}: ${record.status}${record.credits ? ` +${record.credits}` : ''}${record.message ? `（${record.message}）` : ''}`);
+        if (disposed || checkinAbort.signal.aborted) break;
         await wait(350);
       }
       checkinState.lastRunAt = Date.now();
@@ -609,7 +727,7 @@ export function apply(ctx, rawConfig = {}) {
       try { checkinState = writeCheckin(checkinState); } catch (error) {
         log('保存签到状态失败', String(error?.message || error));
       }
-      if (results.some((result) => result.status === 'claimed')) {
+      if (!disposed && !checkinAbort.signal.aborted && results.some((result) => result.status === 'claimed')) {
         client.refreshExtras().catch(() => {});
       }
       return { ...checkinSnapshot(), results };
@@ -641,7 +759,7 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   function kickAutoCheckin() {
-    if (!autoCheckinDue()) return;
+    if (disposed || !autoCheckinDue()) return;
     runCheckinInternal({ auto: true }).catch((error) => log('自动签到失败', String(error?.message || error)));
   }
 
@@ -663,7 +781,7 @@ export function apply(ctx, rawConfig = {}) {
       const records = usageRecords();
       const span = Math.min(30, Math.max(7, Number(days) || 14));
       const recent = Math.min(200, Math.max(20, Number(limit) || 80));
-      const summary = summarizeUsage(records, span);
+      const summary = summarizeUsage(records, span, Date.now(), usageDaily());
       const from = summary.range.from || '';
       // 记录列表与上方统计必须使用同一个本地日窗口，否则切 7/30 天只变总数。
       const windowed = from ? records.filter((record) => localDayKey(record.at) >= from) : records;
@@ -672,8 +790,8 @@ export function apply(ctx, rawConfig = {}) {
         recent: windowed.slice(-recent).reverse(),
       };
     },
-    credits: async ({ range = '7d' } = {}) => creditsReport(usageRecords(), { range }),
-    diagnostics: async () => ({ checks: await buildChecks({ deep: true }), logs: recentLogs(60) }),
+    credits: async ({ range = '7d' } = {}) => creditsReport(usageRecords(), { range, daily: usageDaily() }),
+    diagnostics: async ({ signal } = {}) => ({ checks: await buildChecks({ deep: true, signal }), logs: recentLogs(60) }),
     logs: async () => ({ lines: recentLogs(120) }),
     refreshCatalog: async () => {
       const result = await directory({ refresh: true });
@@ -701,7 +819,14 @@ export function apply(ctx, rawConfig = {}) {
       try { checkinState = writeCheckin(checkinState); } catch (error) {
         log('保存签到设置失败', String(error?.message || error));
       }
-      if (checkinState.auto) setTimeout(kickAutoCheckin, 100);
+      if (checkinState.auto) {
+        if (checkinKickTimer) clearTimeout(checkinKickTimer);
+        checkinKickTimer = setTimeout(() => {
+          checkinKickTimer = null;
+          if (!disposed) kickAutoCheckin();
+        }, 100);
+        if (checkinKickTimer.unref) checkinKickTimer.unref();
+      }
       return checkinSnapshot();
     },
     account: async () => {
@@ -784,6 +909,7 @@ export function apply(ctx, rawConfig = {}) {
           at: started,
           model,
           client: client.auth?.source || 'unknown',
+          account: client.accountStamp().account,
           promptTokens: usage?.prompt_tokens || 0,
           completionTokens: usage?.completion_tokens || 0,
           totalTokens: usage?.total_tokens || 0,
@@ -799,10 +925,10 @@ export function apply(ctx, rawConfig = {}) {
         if (!String(result.text || '').trim() && !String(result.reasoning || '').trim()) {
           const message = 'Qoder 返回了空回复（没有正文或思考内容）';
           state.lastError = message;
-          appendUsage({ ...record, ok: false, status: 'test-failed', error: message });
+          appendUsage({ ...record, ok: false, status: 'test-failed', error: message, probe: true });
           return { ok: false, error: message };
         }
-        appendUsage({ ...record, ok: true, status: 'test' });
+        appendUsage({ ...record, ok: true, status: 'test', probe: true });
         return {
           ok: true,
           model,
@@ -817,7 +943,8 @@ export function apply(ctx, rawConfig = {}) {
         state.lastError = String(error?.message || error);
         appendUsage({
           at: started, model, client: client.auth?.source || 'unknown',
-          ok: false, status: 'test-failed',
+          account: client.accountStamp().account,
+          ok: false, status: 'test-failed', probe: true,
           latencyMs: Date.now() - started, error: state.lastError,
         });
         return { ok: false, error: state.lastError };
@@ -983,7 +1110,17 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   ctx.effect(() => () => {
+    disposed = true;
+    try { checkinAbort.abort(new Error('插件已卸载')); } catch { /* ignore */ }
+    if (authChangeTimer) clearTimeout(authChangeTimer);
+    if (checkinKickTimer) clearTimeout(checkinKickTimer);
+    if (autoCheckinKick) clearTimeout(autoCheckinKick);
+    if (autoCheckinTimer) clearInterval(autoCheckinTimer);
+    try { client.dispose(); } catch { /* ignore */ }
+    try { adapter.dispose(); } catch { /* ignore */ }
     try { adapter.invalidate(); } catch { /* ignore */ }
+    // 卸载/热重载时把最后 20ms 去抖窗口里的用量同步落盘。
+    try { flushUsageSync(); } catch { /* ignore */ }
     try { disposeChatTransport(); } catch { /* ignore */ }
   }, 'qoder.dispose');
 }

@@ -154,8 +154,11 @@ const version = manifest?.version || null;
 check(Boolean(version), 'version 存在', version || '未读到');
 
 // 文件名里的版本必须与 manifest 一致，否则 release 资产名和实际内容会错位。
-if (version && tarballPath && !/^https?:/i.test(tarballPath)) {
-  const fromName = /qoder-to-dsh-(\d+\.\d+\.\d+)\.tgz$/.exec(basename(tarballPath))?.[1] || null;
+if (version && tarballPath) {
+  const fileName = /^https?:/i.test(tarballPath)
+    ? basename(new URL(tarballPath).pathname)
+    : basename(tarballPath);
+  const fromName = /qoder-to-dsh-(\d+\.\d+\.\d+)\.tgz$/.exec(fileName)?.[1] || null;
   check(fromName === version, '文件名版本与 manifest 一致', `file=${fromName || '不匹配'} · manifest=${version}`);
 }
 
@@ -182,6 +185,45 @@ check(
   '不一致时 dsh 会把该 Loader 行当作未知包静默跳过，插件不加载也不报错。',
 );
 
+// ── 2b. exports / 文档 / locale 契约 ────────────────────────────────────────
+const packageNames = entries ? [...entries.keys()] : [];
+const exportsMissing = [];
+for (const [key, target] of Object.entries(manifest?.exports || {})) {
+  const normalized = String(target).replace(/^\.\//, '');
+  if (normalized.includes('*')) {
+    const prefix = `package/${normalized.split('*')[0]}`;
+    const suffix = normalized.slice(normalized.indexOf('*') + 1);
+    const matches = packageNames.filter((name) => name.startsWith(prefix) && name.endsWith(suffix));
+    if (!matches.length) exportsMissing.push(`${key} → ${target}`);
+  } else if (!has(normalized)) {
+    exportsMissing.push(`${key} → ${target}`);
+  }
+}
+check(exportsMissing.length === 0, 'exports 目标都在包内', exportsMissing.length ? exportsMissing.join(', ') : 'ok',
+  'exports 指向不存在的文件时，宿主 import 会直接失败。');
+
+const readmeSource = file('README.md')?.toString('utf8') || '';
+const readmeVersion = /当前版本 \*\*(\d+\.\d+\.\d+)\*\*/.exec(readmeSource)?.[1] || null;
+check(readmeVersion === version, 'README 当前版本与 manifest 一致', `README=${readmeVersion || '未读到'} · package=${version || '未读到'}`);
+
+const changelogSource = file('CHANGELOG.md')?.toString('utf8') || '';
+const changelogVersion = /^## \[(\d+\.\d+\.\d+)\]/m.exec(changelogSource)?.[1] || null;
+check(changelogVersion === version, 'CHANGELOG 最新条目与 manifest 一致', `CHANGELOG=${changelogVersion || '未读到'} · package=${version || '未读到'}`);
+
+const flattenKeys = (value, prefix = '') => {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return [prefix];
+  return Object.entries(value).flatMap(([key, child]) => flattenKeys(child, prefix ? `${prefix}.${key}` : key));
+};
+try {
+  const zh = JSON.parse(file('locale/zh.json')?.toString('utf8') || '{}');
+  const en = JSON.parse(file('locale/en.json')?.toString('utf8') || '{}');
+  const zhKeys = flattenKeys(zh).sort();
+  const enKeys = flattenKeys(en).sort();
+  check(JSON.stringify(zhKeys) === JSON.stringify(enKeys), 'locale en/zh 键一致', `${zhKeys.length} 个键`);
+} catch (error) {
+  check(false, 'locale en/zh 键一致', String(error?.message || error));
+}
+
 // ── 3. 运行时文件齐全 ───────────────────────────────────────────────────────
 // 这里是硬清单，不从 `files` 推导：白名单写错时，包照样生成，启动才炸。
 const REQUIRED = [
@@ -201,6 +243,7 @@ const REQUIRED = [
   'lib/state.mjs',
   'lib/tools.mjs',
   'lib/umid.mjs',
+  'lib/upstream-error.mjs',
   'locale/en.json',
   'locale/zh.json',
   'icon.svg',

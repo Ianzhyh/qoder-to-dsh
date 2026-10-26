@@ -5,8 +5,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import {
-  appendUsage, clearUsage, creditsReport, flushUsage, normalizeCheckin, normalizePrefs,
-  normalizeUsageRecord, readUsage, reconcileUsage, redact, summarizeUsage,
+  appendUsage, clearUsage, creditsReport, ensureUsageDaily, flushUsage, isProbe, localDayKey,
+  normalizeCheckin, normalizePrefs, normalizeUsageRecord, readUsage, readUsageDaily,
+  reconcileUsage, redact, summarizeUsage, usageDailyPath,
 } from '../lib/state.mjs';
 
 test('normalizePrefs keeps the three visibility intents distinct', () => {
@@ -238,9 +239,152 @@ test('clearing usage during an in-flight flush does not resurrect the ledger', a
   }
 });
 
+test('daily rollup survives raw pruning, keeps probes out, and clears both files', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'qoder-daily-'));
+  const path = join(dir, 'usage.json');
+  const now = Date.now();
+  writeFileSync(path, `${JSON.stringify([
+    { at: now, model: 'old', totalTokens: 10, credits: 0.1, ok: true },
+  ])}\n`);
+  try {
+    appendUsage({ at: now, model: 'new', totalTokens: 20, credits: 0.2, ok: true }, path);
+    appendUsage({ at: now, model: 'probe', totalTokens: 999, credits: 9, ok: true, status: 'test' }, path);
+    await flushUsage(path);
+
+    const daily = readUsageDaily(path);
+    const key = localDayKey(now);
+    assert.equal(daily.days[key].requests, 2, '试跑不能进入每日统计');
+    assert.equal(daily.days[key].tokens, 30);
+    assert.ok(Math.abs(daily.days[key].credits - 0.3) < 1e-9);
+    assert.equal(isProbe({ status: 'test-failed' }), true);
+
+    const report = creditsReport(readUsage(path), { now, range: '1d', daily });
+    assert.equal(report.totals.requests, 2);
+    assert.equal(report.probe.requests, 1);
+    assert.equal(report.probe.tokens, 999);
+    assert.equal(report.seriesPartial, false, '明细还在时以明细为准');
+
+    clearUsage(path);
+    assert.equal(existsSync(path), false);
+    assert.equal(existsSync(usageDailyPath(path)), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('a day with pruned details uses the daily rollup instead of undercounting', () => {
+  const now = Date.now();
+  const key = localDayKey(now);
+  const daily = {
+    schema: 1,
+    updatedAt: now,
+    days: {
+      [key]: {
+        credits: 1, savedCredits: 0, promptTokens: 0, completionTokens: 0,
+        cachedTokens: 0, reasoningTokens: 0, tokens: 100, requests: 10, failures: 1,
+      },
+    },
+  };
+  const report = creditsReport([{ at: now, model: 'm', totalTokens: 10, credits: 0.1, ok: true }], {
+    now, range: '1d', daily,
+  });
+  assert.equal(report.totals.requests, 10);
+  assert.equal(report.totals.credits, 1);
+  assert.equal(report.totals.failures, 1);
+  assert.equal(report.seriesPartial, true);
+  assert.equal(report.days[0].source, 'daily');
+
+  const summary = summarizeUsage([{ at: now, model: 'm', totalTokens: 10, credits: 0.1, ok: true }], 1, now, daily);
+  assert.equal(summary.today.requests, 10);
+  assert.equal(summary.totals.credits, 1);
+  assert.equal(summary.seriesPartial, true);
+});
+
+test('ensureUsageDaily repairs a daily rollup that missed newer raw records', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'qoder-daily-repair-'));
+  const path = join(dir, 'usage.json');
+  const now = Date.now();
+  const key = localDayKey(now);
+  writeFileSync(path, `${JSON.stringify([
+    { at: now, model: 'a', totalTokens: 10, credits: 0.1, ok: true },
+    { at: now, model: 'b', totalTokens: 20, credits: 0.2, ok: true },
+  ])}\n`);
+  writeFileSync(usageDailyPath(path), JSON.stringify({
+    schema: 1,
+    updatedAt: now,
+    days: {
+      [key]: {
+        credits: 0.1, savedCredits: 0, promptTokens: 0, completionTokens: 0,
+        cachedTokens: 0, reasoningTokens: 0, tokens: 10, requests: 1, failures: 0,
+      },
+    },
+  }));
+  try {
+    const repaired = await ensureUsageDaily(path);
+    assert.equal(repaired.days[key].requests, 2);
+    assert.equal(repaired.days[key].tokens, 30);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('ensureUsageDaily can rebuild from reconciled free-model records', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'qoder-daily-reconcile-'));
+  const path = join(dir, 'usage.json');
+  const now = Date.now();
+  writeFileSync(path, `${JSON.stringify([
+    { at: now, model: 'free-model', totalTokens: 10, credits: 9, ok: true },
+  ])}\n`);
+  try {
+    const reconciled = [{
+      at: now, model: 'free-model', totalTokens: 10, credits: 0,
+      originalCredits: 9, savedCredits: 9, billable: false, ok: true,
+    }];
+    const daily = await ensureUsageDaily(path, reconciled);
+    assert.equal(daily.days[localDayKey(now)].credits, 0, '免费模型的旧 Credits 不能算成实扣');
+    assert.equal(daily.days[localDayKey(now)].savedCredits, 9);
+    assert.equal(daily.days[localDayKey(now)].requests, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('daily rollup drops entries older than its 430-day window', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'qoder-daily-prune-'));
+  const path = join(dir, 'usage.json');
+  const now = Date.now();
+  const old = now - 431 * 24 * 3600 * 1000;
+  try {
+    appendUsage({ at: old, model: 'old', totalTokens: 1, credits: 1, ok: true }, path);
+    appendUsage({ at: now, model: 'new', totalTokens: 2, credits: 0.2, ok: true }, path);
+    await flushUsage(path);
+    const daily = readUsageDaily(path);
+    assert.equal(daily.days[localDayKey(old)], undefined);
+    assert.equal(daily.days[localDayKey(now)].requests, 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('clearing usage during a daily flush does not resurrect either file', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'qoder-daily-clear-'));
+  const path = join(dir, 'usage.json');
+  try {
+    appendUsage({ at: Date.now(), model: 'race', totalTokens: 1, credits: 0.1, ok: true }, path);
+    const flushing = flushUsage(path);
+    clearUsage(path);
+    await flushing;
+    assert.equal(existsSync(path), false);
+    assert.equal(existsSync(usageDailyPath(path)), false);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('redact removes token prefixes and bearer values', () => {
-  const text = redact('Authorization: Bearer dt-abcdefghijklmnopqrstuvwxyz\nrt=drt-abcdefghijklmnopqrstuvwxyz');
+  const text = redact('Authorization: Bearer dt-abcdefghijklmnopqrstuvwxyz+/=\nrt=drt-abcdefghijklmnopqrstuvwxyz\naccess_token=abcdefghijklmnop');
   assert.ok(!text.includes('dt-abcdefghijklmnopqrstuvwxyz'));
   assert.ok(!text.includes('drt-abcdefghijklmnopqrstuvwxyz'));
+  assert.ok(!text.includes('abcdefghijklmnop'));
   assert.ok(text.includes('<token>'));
 });

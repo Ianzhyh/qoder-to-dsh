@@ -114,6 +114,29 @@ test('claimCampaigns refreshes the active token once on 401', async () => {
   }
 });
 
+test('claimCampaigns stops immediately when the caller cancels', async () => {
+  const originalFetch = globalThis.fetch;
+  let calls = 0;
+  globalThis.fetch = async () => { calls += 1; return new Response('{}'); };
+  const controller = new AbortController();
+  controller.abort(new Error('cancelled'));
+  try {
+    await assert.rejects(
+      claimCampaigns({
+        region: 'global',
+        getToken: async () => { throw new Error('getToken should not run'); },
+        now,
+        deviceProvider: async () => fakeDevice(),
+        signal: controller.signal,
+      }),
+      /cancelled/,
+    );
+    assert.equal(calls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('claimCampaigns does not call the network without a device identity', async () => {
   const originalFetch = globalThis.fetch;
   let calls = 0;

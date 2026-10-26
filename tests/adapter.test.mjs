@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import {
   CODE, QoderAdapter, StreamTranslator, classifyError, findInvalidTool, mapUsage, sanitizeWire, toWireMessage, toWireTools,
 } from '../lib/adapter.mjs';
+import { DEFAULTS } from '../lib/config.mjs';
 
 test('StreamTranslator maps reasoning, text, tool calls and usage', () => {
   const translator = new StreamTranslator();
@@ -42,6 +43,127 @@ test('stream error frames finish as errors instead of pretending success', () =>
   assert.equal(finish.reason.kind, 'error');
   assert.match(finish.reason.failure.message, /upstream exploded/);
   assert.match(finish.reason.failure.message, /E1/);
+});
+
+test('classifyError keeps 429 retryable when the body merely mentions credits', () => {
+  assert.equal(classifyError('rate limit reached; credits are low', 429), CODE.RATE_LIMIT);
+  assert.equal(classifyError('rate limit reached', 429), CODE.RATE_LIMIT);
+  assert.equal(classifyError('insufficient credits', 429), CODE.QUOTA);
+  assert.equal(classifyError('insufficient_quota', 429), CODE.QUOTA);
+  assert.equal(classifyError('payment required', 402), CODE.QUOTA);
+  assert.equal(classifyError('upstream request timeout', 408), CODE.TIMEOUT);
+});
+
+test('resolveModel always returns a positive context window even without catalog metadata', async () => {
+  const adapter = new QoderAdapter({
+    provider: 'qoder',
+    client: { listCatalog: async () => ({ at: 0, models: [] }) },
+    prefs: { visible: null, pinned: '', includeAll: true, contextWindowByModel: {}, paramsByModel: {} },
+    log: () => {},
+  });
+  assert.equal(adapter.contextWindowFor('unknown'), DEFAULTS.fallbackContextWindow);
+  const resolved = await adapter.resolveModel('qoder', 'unknown');
+  assert.equal(resolved.context.contextWindow, DEFAULTS.fallbackContextWindow);
+});
+
+test('queue error frames carry providerRetryAfterMs and stay retryable', () => {
+  const translator = new StreamTranslator();
+  translator.pushLine('data: {"error":{"message":"queued","code":10605,"retryAfterSeconds":30}}');
+  const finish = translator.finish().find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.failure.code, CODE.RATE_LIMIT);
+  assert.equal(finish.reason.failure.providerRetryAfterMs, 30_000);
+
+  const escaped = new StreamTranslator();
+  escaped.pushLine('data: {"error":{"message":"{\\"code\\":\\"10605\\",\\"isQueued\\":true}"}}');
+  const queued = escaped.finish().find((chunk) => chunk.type === 'finish');
+  assert.equal(queued.reason.failure.code, CODE.RATE_LIMIT);
+  assert.equal(queued.reason.failure.providerRetryAfterMs, 5000);
+});
+
+test('reasoning-only finishes are visible EMPTY_RESPONSE, not success', () => {
+  const stop = new StreamTranslator();
+  stop.pushLine('data: {"choices":[{"delta":{"reasoning":"think only"}}]}');
+  stop.pushLine('data: {"choices":[{"delta":{},"finish_reason":"stop"}]}');
+  const stopFinish = stop.finish().find((chunk) => chunk.type === 'finish');
+  assert.equal(stopFinish.reason.kind, 'error');
+  assert.equal(stopFinish.reason.failure.code, CODE.EMPTY);
+  assert.match(stopFinish.reason.failure.message, /思考内容/);
+
+  const length = new StreamTranslator();
+  length.pushLine('data: {"choices":[{"delta":{"reasoning":"think only"}}]}');
+  length.pushLine('data: {"choices":[{"delta":{},"finish_reason":"length"}]}');
+  const lengthFinish = length.finish().find((chunk) => chunk.type === 'finish');
+  assert.equal(lengthFinish.reason.failure.code, CODE.EMPTY);
+
+  const withText = new StreamTranslator();
+  withText.pushLine('data: {"choices":[{"delta":{"reasoning":"think","content":"answer"}}]}');
+  withText.pushLine('data: {"choices":[{"delta":{},"finish_reason":"length"}]}');
+  assert.equal(withText.finish().find((chunk) => chunk.type === 'finish').reason.kind, 'max-tokens');
+});
+
+test('invalid tool calls are blocked from the session with a visible error', () => {
+  const badName = new StreamTranslator();
+  badName.pushLine('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"bad.name","arguments":"{}"}}]}}]}');
+  badName.pushLine('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}');
+  const badNameChunks = badName.finish();
+  assert.equal(badNameChunks.some((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'tool-call'), false);
+  const nameFinish = badNameChunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(nameFinish.reason.failure.code, CODE.INVALID);
+  assert.match(nameFinish.reason.failure.message, /工具名/);
+
+  const badArgs = new StreamTranslator();
+  badArgs.pushLine('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_x","function":{"name":"read","arguments":"{\\"x\\":"}}]}}]}');
+  badArgs.pushLine('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}');
+  const argsFinish = badArgs.finish().find((chunk) => chunk.type === 'finish');
+  assert.equal(argsFinish.reason.failure.code, CODE.INVALID);
+  assert.match(argsFinish.reason.failure.message, /参数/);
+});
+
+test('synthesized tool ids include a per-translator prefix and are unique', () => {
+  const frame = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read","arguments":"{}"}}]}}]}';
+  const injected = new StreamTranslator({ idPrefix: 'call_test' });
+  injected.pushLine(frame);
+  injected.pushLine('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}');
+  const injectedBlock = injected.finish().find((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'tool-call');
+  assert.equal(injectedBlock.block.id, 'call_test_0');
+
+  const first = new StreamTranslator();
+  first.pushLine(frame);
+  first.pushLine('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}');
+  const firstBlock = first.finish().find((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'tool-call');
+  assert.match(firstBlock.block.id, /^call_[a-z0-9]+_0$/);
+
+  const second = new StreamTranslator();
+  second.pushLine(frame);
+  second.pushLine('data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}');
+  const secondBlock = second.finish().find((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'tool-call');
+  assert.notEqual(firstBlock.block.id, secondBlock.block.id);
+});
+
+test('adapter keeps the optional image contract methods dsh calls directly', () => {
+  const adapter = new QoderAdapter({ provider: 'qoder', client: {}, log: () => {} });
+  assert.equal(adapter.imageRequestPricing('qoder', 'auto'), undefined);
+  assert.deepEqual(adapter.imageRequestTarget('qoder', 'auto', { width: 10, height: 20, bytes: 30 }), {
+    width: 10, height: 20, maxBytes: 30,
+  });
+  assert.equal(adapter.providerRetryPolicy().maxDelayMs, 60_000);
+});
+
+test('dispose clears the image cache and in-flight references', () => {
+  const adapter = new QoderAdapter({
+    provider: 'qoder',
+    client: { listCatalog: async () => ({ at: 0, models: [] }) },
+    prefs: { visible: null, pinned: '', includeAll: true, contextWindowByModel: {}, paramsByModel: {} },
+    log: () => {},
+  });
+  adapter.imageCache.set('a', 'data:image/png;base64,xxx');
+  adapter.imageCacheChars = 30;
+  adapter.imageInflight.set('b', Promise.resolve());
+  adapter.dispose();
+  assert.equal(adapter.imageCache.size, 0);
+  assert.equal(adapter.imageInflight.size, 0);
+  assert.equal(adapter.imageCacheChars, 0);
+  assert.equal(adapter.disposed, true);
 });
 
 test('an in-stream error frame keeps its HTTP status so retry policy can act on it', () => {

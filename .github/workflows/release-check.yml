@@ -1,0 +1,30 @@
+name: release-check
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  check:
+    # Windows 是主平台（DPAPI、路径、cmd），Ubuntu 防止只在本机通过。
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+        node: [20, 22]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+      - name: 语法检查
+        run: npm run check
+      - name: 全部用例
+        run: npm test
+      - name: 打包
+        run: npm run pack:release
+      - name: 校验发布产物
+        run: npm run verify:release

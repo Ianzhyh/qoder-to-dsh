@@ -28,6 +28,7 @@ function loadClient(fetchImpl) {
   const sandbox = {
     console,
     AbortController,
+    URL,
     setTimeout,
     clearTimeout,
     setInterval,
@@ -108,6 +109,75 @@ test('GET outside /qoder/ is not retried', async () => {
   });
   await assert.rejects(exports.getJson('/other/status'), (error) => error.status === 404);
   assert.equal(calls, 1);
+});
+
+test('side-effect GETs carry the panel header, plain reads do not', async () => {
+  let headers = null;
+  const { exports } = loadClient(async (_path, init) => {
+    headers = init.headers;
+    return jsonResponse(200, { ok: true });
+  });
+  await exports.getJson('/qoder/status?rescan=1', { panel: true });
+  assert.equal(headers['x-qoder-panel'], '1');
+
+  await exports.getJson('/qoder/status');
+  assert.equal(headers['x-qoder-panel'], undefined);
+});
+
+test('safeHref only accepts absolute http(s) links', () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  assert.equal(exports.safeHref('https://qoder.com/usage'), 'https://qoder.com/usage');
+  assert.equal(exports.safeHref('http://qoder.com/usage'), 'http://qoder.com/usage');
+  assert.equal(exports.safeHref('javascript:alert(1)'), '');
+  assert.equal(exports.safeHref('data:text/html,<script>alert(1)</script>'), '');
+  assert.equal(exports.safeHref('//evil.example/x'), '', '协议相对链接不能被当成同源路径');
+  assert.equal(exports.safeHref('/qoder/usage'), '', '只允许绝对地址');
+  assert.equal(exports.safeHref(''), '');
+});
+
+test('experience helpers tell the truth about versions, settings and partial data', () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  assert.equal(exports.versionNotice('1.3.0', '1.3.0'), '');
+  assert.match(exports.versionNotice('1.3.0', '1.3.1'), /完全退出 dsh/);
+  assert.match(exports.settingsNotice(false, 'params'), /下一次请求生效/);
+  assert.doesNotMatch(exports.settingsNotice(false, 'params'), /重启 dsh 后生效/);
+  assert.match(exports.settingsNotice(false, 'display'), /选择器刷新需完全退出 dsh/);
+  assert.equal(exports.usageBadges({ probe: true, account: 'uid:12345678' }).join('|'), '试跑|账号 …12345678');
+  assert.match(exports.partialDataNote({ seriesPartial: true }), /每日汇总/);
+  assert.equal(exports.partialDataNote({}), '');
+
+  const outside = exports.accountIdentityNote({ uid: 'u1', name: 'A' }, [{ uid: 'u2' }]);
+  assert.match(outside.note, /PAT/);
+  const inside = exports.accountIdentityNote({ uid: 'u1', name: 'A' }, [{ uid: 'u1' }]);
+  assert.equal(inside.note, '');
+});
+
+test('checkin notices preserve partial failures and pending messages', () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  const partial = exports.checkinNotice({
+    results: [
+      { key: 'a', label: 'A', status: 'claimed', credits: 10 },
+      { key: 'b', label: 'B', status: 'error', message: 'boom' },
+    ],
+    summary: { credits: 10 },
+  }, '');
+  assert.equal(partial.tone, 'error');
+  assert.match(partial.text, /部分账号失败/);
+  assert.match(partial.text, /boom/);
+
+  const pending = exports.checkinNotice({
+    results: [{ key: 'a', label: 'A', status: 'pending', message: '等待下一次自动重试' }],
+    summary: { pending: 1 },
+  }, 'a');
+  assert.equal(pending.tone, 'ok');
+  assert.match(pending.text, /等待下一次自动重试/);
+
+  const unavailable = exports.checkinNotice({
+    results: [],
+    summary: { unavailable: 1 },
+  }, '');
+  assert.equal(unavailable.tone, 'ok');
+  assert.match(unavailable.text, /没有可领取/);
 });
 
 test('an exhausted 404 explains that dsh needs a restart', async () => {

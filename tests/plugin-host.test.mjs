@@ -16,7 +16,7 @@ process.env.QODER_REGION = 'global';
 process.env.APPDATA = join(home, 'appdata');
 process.env.USERPROFILE = join(home, 'user');
 
-const { apply, resolveConfig } = await import('../dsh-plugin/lib/index.js');
+const { apply, resolveConfig, quotaCheck } = await import('../dsh-plugin/lib/index.js');
 
 const routes = [];
 const tools = [];
@@ -140,7 +140,9 @@ test('status is readable without auth and never returns tokens', async () => {
   assert.deepEqual(json.prefs.paramsByModel, {});
   assert.ok(json.desktop && Array.isArray(json.desktop.candidates), '面板需要 desktop.candidates 才能列出多账号');
   assert.equal(json.catalog.count, 0);
-  assert.equal(json.config.firstByteTimeoutMs, 45000);
+  assert.equal(json.installedVersion, json.version);
+  assert.equal(json.versionMismatch, false);
+  assert.equal(json.config.firstByteTimeoutMs, 90000);
   assert.equal(json.config.streamIdleTimeoutMs, 120000);
   assert.equal(json.config.defaultMaxTokens, 0);
   assert.equal(json.config.defaultTemperature, null);
@@ -268,7 +270,9 @@ test('checkin route exposes auto state, can be toggled, and stays offline with n
 });
 
 test('diagnostics and test routes fail visibly instead of pretending success', async () => {
-  const diagnostics = await call('GET', '/qoder/diagnostics');
+  const denied = await call('GET', '/qoder/diagnostics');
+  assert.equal(denied.status, 403);
+  const diagnostics = await call('GET', '/qoder/diagnostics', { panel: true });
   assert.equal(diagnostics.status, 200);
   assert.ok(Array.isArray(diagnostics.json.checks));
   assert.ok(diagnostics.json.checks.some((check) => check.id === 'auth' && check.status === 'fail'));
@@ -282,6 +286,36 @@ test('diagnostics and test routes fail visibly instead of pretending success', a
   assert.equal(testRun.status, 200);
   assert.equal(testRun.json.ok, false);
   assert.match(String(testRun.json.error), /登录|凭据|Qoder/);
+});
+
+test('quotaCheck never reports missing quota data as green', () => {
+  assert.equal(quotaCheck(null, 0).status, 'warn');
+  assert.equal(quotaCheck({ userQuota: { remaining: 0, total: 0 } }).status, 'warn');
+  assert.equal(quotaCheck({ userQuota: { remaining: 5, total: 10, unit: 'credits' } }).status, 'pass');
+  assert.equal(quotaCheck({ isQuotaExceeded: true, userQuota: { remaining: 0, total: 10 } }).status, 'warn');
+  const stale = quotaCheck({ userQuota: { remaining: 5, total: 10 } }, Date.now() - 6 * 60_000);
+  assert.equal(stale.status, 'warn');
+  assert.match(stale.detail, /更新于/);
+});
+
+test('side-effect GETs require the panel header', async () => {
+  const rescanDenied = await call('GET', '/qoder/status?rescan=1');
+  assert.equal(rescanDenied.status, 403);
+  const rescan = await call('GET', '/qoder/status?rescan=1', { panel: true });
+  assert.equal(rescan.status, 200);
+
+  const modelsDenied = await call('GET', '/qoder/models?refresh=1');
+  assert.equal(modelsDenied.status, 403);
+
+  const deepDenied = await call('GET', '/qoder/status?deep=1');
+  assert.equal(deepDenied.status, 403);
+});
+
+test('qoder_diagnose stops when the host cancels the tool call', async () => {
+  const definition = tools.find((item) => item.name === 'qoder_diagnose');
+  const controller = new AbortController();
+  controller.abort(new Error('cancelled by host'));
+  await assert.rejects(definition.execute({}, { signal: controller.signal }), /cancelled by host/);
 });
 
 test('the bare /qoder command defaults to status instead of an unknown subcommand', async () => {
@@ -359,6 +393,7 @@ test('trial treats an empty upstream reply as a failure and records its usage', 
     const latest = usage.json.recent[0];
     assert.equal(latest.status, 'test-failed');
     assert.equal(latest.ok, false);
+    assert.equal(latest.probe, true, '试跑记录必须标记为 probe');
     assert.equal(latest.totalTokens, 5);
     assert.equal(latest.firstByteMs, 12);
   } finally {

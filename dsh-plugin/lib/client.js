@@ -25,8 +25,21 @@
 
     const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+    // 上游给的额度链接只允许绝对 http/https；否则 javascript:/data:
+    // 会直接变成可点击的注入点。
+    function safeHref(value) {
+      const raw = String(value || '').trim();
+      if (!raw) return '';
+      try {
+        const url = new URL(raw);
+        return url.protocol === 'http:' || url.protocol === 'https:' ? raw : '';
+      } catch {
+        return '';
+      }
+    }
+
     async function requestOnce(path, opts) {
-      const { timeoutMs = REQUEST_TIMEOUT_MS, ...init } = opts;
+      const { timeoutMs = REQUEST_TIMEOUT_MS, panel = false, ...init } = opts;
       const controller = init.signal ? null : new AbortController();
       const timer = controller ? setTimeout(() => controller.abort(), timeoutMs) : null;
       try {
@@ -35,7 +48,7 @@
           cache: 'no-store',
           ...init,
           signal: init.signal || controller.signal,
-          headers: { ...(init.headers), ...(init.body ? PANEL_HEADERS : READ_HEADERS) },
+          headers: { ...(init.headers), ...(panel || init.body ? PANEL_HEADERS : READ_HEADERS) },
         });
         let data = null;
         try { data = await res.json(); } catch { data = null; }
@@ -257,11 +270,83 @@
       if (account.status === 'already') return '今日已领';
       return checkinMeta(account.status).label;
     };
+    function versionNotice(loaded, installed) {
+      if (!loaded || !installed || loaded === installed) return '';
+      return `已加载 v${loaded}，磁盘 v${installed}；完全退出 dsh 再打开才会加载新代码。`;
+    }
+    function settingsNotice(notified, kind = 'params') {
+      if (kind === 'display') {
+        return notified
+          ? '显示设置已保存，模型选择器会立即更新。'
+          : '显示设置已保存；模型选择器刷新需完全退出 dsh，已保存的偏好不会丢失。';
+      }
+      return notified
+        ? '模型参数已保存，下一次请求生效。'
+        : '模型参数已保存，下一次请求生效；选择器元数据需完全退出 dsh 后刷新。';
+    }
+    function usageBadges(item) {
+      const badges = [];
+      if (item && item.probe === true) badges.push('试跑');
+      const account = String(item && item.account || '');
+      if (account && account !== 'unknown') badges.push(`账号 …${account.split(':').pop()}`);
+      return badges;
+    }
+    function partialDataNote(data) {
+      if (!data) return '';
+      return data.seriesPartial || (data.heatmap && data.heatmap.partial)
+        ? '部分历史来自每日汇总（明细已裁剪）'
+        : '';
+    }
+    function accountIdentityNote(active, candidates) {
+      const list = Array.isArray(candidates) ? candidates : [];
+      const uid = String(active && active.uid || '');
+      const name = (active && (active.name || active.email || active.uid)) || '当前账号';
+      const known = Boolean(uid) && list.some((candidate) => String(candidate && candidate.uid || '') === uid);
+      return {
+        text: `插件当前使用 ${name}；本机检测到 ${list.length} 个账号。`,
+        note: uid && !known ? '当前账号来自 PAT / 浏览器授权，不在本机桌面端登录列表中。' : '',
+      };
+    }
+    function checkinNotice(data, key = '') {
+      if (!data) return null;
+      if (data.ok === false) return { tone: 'error', text: data.error || '签到失败，请刷新后重试' };
+      const results = Array.isArray(data.results) ? data.results : [];
+      const target = key ? results.find((item) => item.key === key) : null;
+      const failures = results.filter((item) => !['claimed', 'already', 'unavailable', 'pending'].includes(item.status));
+      if (target) {
+        if (target.status === 'claimed') return { tone: 'ok', text: `${target.label} 签到成功 +${money(target.credits)} Credits` };
+        if (['already', 'pending', 'unavailable'].includes(target.status)) return { tone: 'ok', text: `${target.label}：${target.message}` };
+        return { tone: 'error', text: `${target.label}：${target.message || '签到失败'}` };
+      }
+      if (failures.length) {
+        const detail = failures.slice(0, 3)
+          .map((item) => `${item.label}${item.message ? `：${item.message}` : ''}`)
+          .join('；');
+        const prefix = data.summary && data.summary.credits
+          ? `已领 +${money(data.summary.credits)} Credits，部分账号失败：`
+          : '签到失败：';
+        return {
+          tone: 'error',
+          text: `${prefix}${detail}${failures.length > 3 ? `（共 ${failures.length} 个）` : ''}`,
+        };
+      }
+      if (data.summary && data.summary.credits) return { tone: 'ok', text: `签到完成，今日共 +${money(data.summary.credits)} Credits` };
+      if (data.summary && data.summary.pending) return { tone: 'ok', text: '还有账号未领取，正在等待下一次自动重试。' };
+      if (data.summary && data.summary.notOpen) return { tone: 'ok', text: '活动尚未下发，稍后会自动重试。' };
+      if (data.summary && data.summary.unavailable) return { tone: 'ok', text: '当前没有可领取的签到活动。' };
+      if (data.summary && data.summary.waiting) return { tone: 'ok', text: '活动每天 10:00（UTC+8）后开放。' };
+      return { tone: 'ok', text: '签到流程已结束。' };
+    }
     function quotaSummary(extras) {
       const quota = extras && extras.quota;
       if (!quota) return null;
       const user = quota.userQuota || null;
       const addOn = quota.addOnQuota || null;
+      const hasFields = Boolean(
+        (user && (user.total != null || user.remaining != null))
+        || (addOn && (addOn.total != null || addOn.remaining != null)),
+      );
+      if (!hasFields) return null;
       const total = num(user && user.total) + num(addOn && addOn.total);
       const used = num(user && user.used) + num(addOn && addOn.used);
       const remaining = num(user && user.remaining) + num(addOn && addOn.remaining);
@@ -277,8 +362,8 @@
         expiresAt: quota.expiresAt || (extras.plan && extras.plan.end_date) || 0,
         user,
         addOn,
-        detailUrl: quota.detailUrl || (addOn && addOn.detailUrl) || '',
-        upgradeUrl: quota.upgradeUrl || '',
+        detailUrl: safeHref(quota.detailUrl || (addOn && addOn.detailUrl) || ''),
+        upgradeUrl: safeHref(quota.upgradeUrl || ''),
         planName: (extras.plan && (extras.plan.plan_tier_name || extras.plan.planName)) || '',
         planPaid: extras.plan && extras.plan.is_paid_plan === true,
         planEnd: extras.plan && extras.plan.end_date,
@@ -597,8 +682,8 @@
             h('strong', null, `${money(info.used)} ${unitText}`))),
         (info.detailUrl || info.upgradeUrl || info.planEnd) ? h('div', { className: 'qdr-quota-links' },
           info.planEnd ? h('span', { className: 'qdr-hint' }, `套餐周期至 ${dateLabel(info.planEnd)}`) : null,
-          info.detailUrl ? h('a', { className: 'qdr-quota-link', href: info.detailUrl, target: '_blank', rel: 'noreferrer noopener' }, '用量明细', h(Icon, { name: 'external', size: 12 })) : null,
-          info.upgradeUrl ? h('a', { className: 'qdr-quota-link', href: info.upgradeUrl, target: '_blank', rel: 'noreferrer noopener' }, '升级套餐', h(Icon, { name: 'external', size: 12 })) : null) : null);
+          info.detailUrl ? h('a', { className: 'qdr-quota-link', href: safeHref(info.detailUrl), target: '_blank', rel: 'noreferrer noopener' }, '用量明细', h(Icon, { name: 'external', size: 12 })) : null,
+          info.upgradeUrl ? h('a', { className: 'qdr-quota-link', href: safeHref(info.upgradeUrl), target: '_blank', rel: 'noreferrer noopener' }, '升级套餐', h(Icon, { name: 'external', size: 12 })) : null) : null);
     }
 
     function useTabs(initial) {
@@ -790,7 +875,7 @@
           h('div', null,
             h('div', { className: 'qdr-editor-title' }, '模型参数'),
             h('div', { className: 'qdr-editor-sub' },
-              '「自动」输出使用 Qoder CLI 默认 32K（插件或模型有更高默认时以它们为准）；温度「自动」不传，由上游决定。')),
+              '「自动」输出使用 Qoder CLI 默认 32K（插件或模型有更高默认时以它们为准）；温度「自动」不传，由上游决定。保存后对下一次请求生效；已开始会话的占用率显示不会回填。')),
           h('div', { className: 'qdr-editor-head-actions' },
             h(Button, { size: 'sm', variant: 'ghost', icon: 'copy', onClick: () => onCopy(model.id, '模型 id') }, '复制 id'),
             h(Button, { size: 'sm', variant: 'ghost', icon: 'bolt', onClick: () => onTrial(model) }, '去试跑'))),
@@ -923,7 +1008,7 @@
           h('span', { className: 'qdr-live' },
             h(StatusDot, { tone: expired ? 'bad' : 'warn' }),
             expired ? '已过期' : `${Math.floor(left / 60)}:${String(left % 60).padStart(2, '0')}`)),
-        expired ? null : h('a', { className: 'qdr-link', href: state.verificationUri, target: '_blank', rel: 'noreferrer noopener' }, state.verificationUri),
+        expired ? null : h('a', { className: 'qdr-link', href: safeHref(state.verificationUri), target: '_blank', rel: 'noreferrer noopener' }, state.verificationUri),
         h('div', { className: 'qdr-device-foot' },
           h('span', { className: 'qdr-hint' }, expired
             ? '授权链接通常 10 分钟内有效。'
@@ -1348,7 +1433,8 @@
           data.totals.failures ? ` · ${data.totals.failures} 次失败` : '',
           data.totals.savedCredits ? ` · 免费/折扣已省 ${creditsText(data.totals.savedCredits)} Credits` : '',
           ' · 只计上游实际扣费',
-          data.updatedAt ? ` · 更新于 ${stamp(data.updatedAt)}` : ''));
+          data.updatedAt ? ` · 更新于 ${stamp(data.updatedAt)}` : '',
+          partialDataNote(data) ? ` · ${partialDataNote(data)}` : ''));
     }
 
     function CheckinSummaryCard({ data, busy, onOpen, onRun }) {
@@ -1407,7 +1493,9 @@
               waiting ? h('span', null, `未开放 ${waiting}`) : null,
               unavailable ? h('span', null, `无活动 ${unavailable}`) : null,
               h('span', null, `异常 ${summary.errors}`),
-              data.lastAutoAt ? h('span', null, `上次自动 ${stamp(data.lastAutoAt)}`) : h('span', null, '尚未自动运行'))));
+              data.auto
+                ? (data.lastAutoAt ? h('span', null, `上次自动 ${stamp(data.lastAutoAt)} · 下次约 ${stamp(data.lastAutoAt + 20 * 60_000)}`) : h('span', null, '尚未自动运行'))
+                : h('span', null, '自动签到已关闭'))));
     }
 
     function CheckinPanel({ data, busy, error, onRun, onToggleAuto, onRefresh, onAccount }) {
@@ -1551,6 +1639,7 @@
       const [creditsError, setCreditsError] = useState('');
       const [diagnosticsError, setDiagnosticsError] = useState('');
       const [notice, setNotice] = useState(null);
+      const [versionBannerClosed, setVersionBannerClosed] = useState(false);
       const [search, setSearch] = useState('');
       const [filter, setFilter] = useState('all');
       const [draftVisible, setDraftVisible] = useState(null);
@@ -1702,7 +1791,7 @@
       const loadModels = useCallback(async (refresh) => {
         const seq = ++modelsSeq.current;
         try {
-          const data = await getJson('/qoder/models' + (refresh ? '?refresh=1' : ''));
+          const data = await getJson('/qoder/models' + (refresh ? '?refresh=1' : ''), refresh ? { panel: true } : undefined);
           if (!mounted.current || seq !== modelsSeq.current) return;
           setModels(data.models || []);
           setModelsError('');
@@ -1724,7 +1813,7 @@
           if (rescan) params.push('rescan=1');
           const data = await getJson(
             '/qoder/status' + (params.length ? `?${params.join('&')}` : ''),
-            deep ? { timeoutMs: DEEP_TIMEOUT_MS } : undefined,
+            { ...(deep ? { timeoutMs: DEEP_TIMEOUT_MS } : {}), ...(deep || rescan ? { panel: true } : {}) },
           );
           if (!mounted.current || seq !== statusSeq.current) return;
           setStatus(data);
@@ -1835,37 +1924,14 @@
             await loadCheckin(true);
             return;
           }
-          const results = Array.isArray(data.results) ? data.results : [];
-          const target = key ? results.find((item) => item.key === key) : null;
-          const failures = results.filter((item) => !['claimed', 'already', 'unavailable', 'pending'].includes(item.status));
-          const notifyError = (text) => {
-            if (tab === 'checkin') setCheckinError(text);
-            else showNotice('error', text);
-          };
-          if (target) {
-            if (target.status === 'claimed') showNotice('ok', `${target.label} 签到成功 +${money(target.credits)} Credits`);
-            else if (['already', 'pending', 'unavailable'].includes(target.status)) showNotice('ok', `${target.label}：${target.message}`);
-            else notifyError(`${target.label}：${target.message || '签到失败'}`);
-          } else if (failures.length) {
-            const detail = failures.slice(0, 3)
-              .map((item) => `${item.label}${item.message ? `：${item.message}` : ''}`)
-              .join('；');
-            const prefix = data.summary && data.summary.credits
-              ? `已领 +${money(data.summary.credits)} Credits，部分账号失败：`
-              : '签到失败：';
-            notifyError(`${prefix}${detail}${failures.length > 3 ? `（共 ${failures.length} 个）` : ''}`);
-          } else if (data.summary && data.summary.credits) {
-            showNotice('ok', `签到完成，今日共 +${money(data.summary.credits)} Credits`);
-          } else if (data.summary && data.summary.pending) {
-            showNotice('ok', '还有账号未领取，正在等待下一次自动重试。');
-          } else if (data.summary && data.summary.notOpen) {
-            showNotice('ok', '活动尚未下发，稍后会自动重试。');
-          } else if (data.summary && data.summary.unavailable) {
-            showNotice('ok', '当前没有可领取的签到活动。');
-          } else if (data.summary && data.summary.waiting) {
-            showNotice('ok', '活动每天 10:00（UTC+8）后开放。');
-          } else {
-            showNotice('ok', '签到检查完成。');
+          const notice = checkinNotice(data, String(key || ''));
+          if (notice) {
+            if (notice.tone === 'error') {
+              if (tab === 'checkin') setCheckinError(notice.text);
+              else showNotice('error', notice.text);
+            } else {
+              showNotice('ok', notice.text);
+            }
           }
           await loadAccount();
           await loadStatus(false);
@@ -1911,7 +1977,7 @@
         const seq = ++diagnosticsSeq.current;
         setDiagnosticsError('');
         try {
-          const data = await getJson('/qoder/diagnostics', { timeoutMs: DEEP_TIMEOUT_MS });
+          const data = await getJson('/qoder/diagnostics', { timeoutMs: DEEP_TIMEOUT_MS, panel: true });
           if (!mounted.current || seq !== diagnosticsSeq.current) return;
           setDiagnostics(data);
         } catch (err) {
@@ -2119,7 +2185,7 @@
         setDraftPinned(prefs.pinned || '');
         setSavedContext(prefs.contextWindowByModel || savedContext);
         setSavedParams(prefs.paramsByModel || savedParams);
-        showNotice('ok', result.notified ? '显示设置已保存，模型选择器会立即更新。' : '显示设置已保存；重启 dsh 后生效。');
+        showNotice('ok', settingsNotice(result.notified, 'display'));
         await loadStatus(false);
       });
 
@@ -2140,9 +2206,7 @@
           setSavedParams(prefs.paramsByModel || {});
           await loadModels(false);
           await loadStatus(false);
-          showNotice('ok', result.notified
-            ? '模型参数已保存，dsh 下一次请求就会使用新值。'
-            : '模型参数已保存；重启 dsh 后生效。');
+          showNotice('ok', settingsNotice(result.notified, 'params'));
         } catch (err) {
           if (mounted.current) setModelError({ id: model.id, message: String(err.message || err) });
         } finally {
@@ -2276,6 +2340,7 @@
       }, [models, search, filter, effectivelyVisible, customizedIds, expanded]);
 
       const signedIn = Boolean(status && status.signedIn);
+      const versionText = status ? versionNotice(status.version, status.installedVersion) : '';
       const credentialProtection = (status && status.config && status.config.credentialProtection) || '本机密钥';
       const today = (status && status.usage && status.usage.today) || {};
       const usageSummary = usage && usage.summary;
@@ -2324,6 +2389,7 @@
       const quotaText = quotaInfo && quotaInfo.total
         ? `${money(quotaInfo.remaining)} / ${money(quotaInfo.total)}`
         : '';
+      const identity = accountIdentityNote(status && status.account, localAccounts);
 
       const accountRows = useMemo(() => {
         const rows = [];
@@ -2420,6 +2486,10 @@
             h('button', { type: 'button', className: 'qdr-icon-btn', title: '刷新状态', onClick: () => run('status', () => loadStatus(true)), disabled: busy === 'status' }, h(Icon, { name: 'refresh', size: 15 })))),
         pageError,
         pageNotice,
+        versionText && !versionBannerClosed ? h('div', { className: 'qdr-banner qdr-banner-warn', role: 'status' },
+          h(Icon, { name: 'alert', size: 15 }),
+          h('span', null, versionText),
+          h('button', { type: 'button', className: 'qdr-banner-x', onClick: () => setVersionBannerClosed(true), 'aria-label': '关闭版本提示' }, h(Icon, { name: 'close', size: 13 }))) : null,
 
         !status ? (statusError
           ? h(Empty, {
@@ -2710,6 +2780,7 @@
           usageError ? h('div', { className: 'qdr-inline-warn' },
             `${usageError} `,
             h('button', { type: 'button', className: 'qdr-text-btn', onClick: () => loadUsage(usageDays) }, '重试')) : null,
+          partialDataNote(usageSummary) ? h('div', { className: 'qdr-inline-warn' }, partialDataNote(usageSummary)) : null,
           usageError && !usage ? h(Empty, {
             icon: 'chart', title: '用量记录读取失败', detail: '统计接口暂时不可用；可重试或稍后再看。',
             action: h(Button, { size: 'sm', icon: 'refresh', onClick: () => loadUsage(usageDays) }, '重试'),
@@ -2782,6 +2853,7 @@
                       h('span', { className: 'qdr-usage-id' }, item.model || '—'),
                       h('span', { className: `qdr-usage-status qdr-usage-status-${item.ok ? 'ok' : 'bad'}` },
                         item.ok ? (item.status === 'test' ? '试跑' : '成功') : statusLabel(item.status)),
+                      usageBadges(item).map((label, badgeIndex) => h('span', { className: 'qdr-usage-badge', key: badgeIndex }, label)),
                       h('span', { className: 'qdr-usage-time' }, stamp(item.at))),
                     h('div', { className: 'qdr-usage-meta' },
                       h('span', null, `${compact(item.promptTokens)} 入 / ${compact(item.completionTokens)} 出`),
@@ -2808,12 +2880,13 @@
                   accountRows.length ? h(Badge, { tone: 'neutral' }, `${accountRows.length} 个`) : null),
                 h('div', { className: 'qdr-card-sub' },
                   signedIn
-                    ? '本机已登录的 Qoder 账号；点「切换」立即更换插件当前使用的账号。'
+                    ? `${identity.text} 点「切换」立即更换插件当前使用的账号。`
                     : '本机检测到的 Qoder 账号；切换会完成插件登录。')),
               h(Button, {
                 size: 'sm', icon: 'refresh', disabled: busy === 'desktop-scan',
                 onClick: () => run('desktop-scan', async () => { await loadStatus(true, true); await loadCheckin(false); }),
               }, '重新扫描')),
+            signedIn && identity.note ? h('div', { className: 'qdr-inline-warn' }, identity.note) : null,
             accountRows.length ? h('div', { className: 'qdr-account-list' }, accountRows.map((row) => {
               const checkinInfo = checkinForAccount(row.region, row.uid);
               const checkinInfoMeta = checkinInfo ? checkinMeta(checkinInfo.status) : null;
@@ -2981,6 +3054,7 @@
 .qdr-banner{display:flex;align-items:flex-start;gap:8px;padding:10px 12px;border-radius:12px;font-size:12px;line-height:1.45;border:1px solid transparent;min-width:0;animation:qdr-drop .22s cubic-bezier(.2,.7,.2,1) both}
 .qdr-banner span{flex:1;min-width:0;overflow-wrap:anywhere}
 .qdr-banner-ok{background:var(--qdr-ok-weak);color:var(--qdr-ok)}
+.qdr-banner-warn{background:var(--qdr-warn-weak);color:var(--qdr-warn)}
 .qdr-banner-error{background:var(--qdr-bad-weak);color:var(--qdr-bad)}
 .qdr-banner-x{border:none;background:transparent;color:inherit;cursor:pointer;padding:0;display:flex;flex:none}
 .qdr-signin{display:flex;gap:14px;padding:17px;border:1px solid var(--qdr-accent-border);border-radius:18px;background:var(--qdr-hero-bg);box-shadow:var(--qdr-shadow);align-items:flex-start}
@@ -3232,6 +3306,7 @@
 .qdr-usage-status{font-size:9.5px;font-weight:650;padding:1px 6px;border-radius:4px;white-space:nowrap}
 .qdr-usage-status-ok{background:var(--qdr-ok-weak);color:var(--qdr-ok)}
 .qdr-usage-status-bad{background:var(--qdr-bad-weak);color:var(--qdr-bad)}
+.qdr-usage-badge{font-size:9.5px;font-weight:600;padding:1px 6px;border-radius:999px;background:var(--qdr-soft-2);color:var(--qdr-muted);white-space:nowrap}
 .qdr-usage-time{margin-left:auto;font-size:10px;color:var(--qdr-faint);font-variant-numeric:tabular-nums;white-space:nowrap;padding-left:6px}
 .qdr-usage-meta{display:flex;flex-wrap:wrap;gap:2px 10px;margin-top:4px;font-size:10px;color:var(--qdr-muted);font-variant-numeric:tabular-nums}
 .qdr-usage-error{display:flex;align-items:flex-start;gap:8px;margin-top:5px;padding:6px 8px;border-radius:6px;background:var(--qdr-bad-weak);color:var(--qdr-bad);font-size:10px;line-height:1.45;overflow-wrap:anywhere}
@@ -3543,7 +3618,7 @@
           h(StatusDot, { tone: error ? 'bad' : pending ? 'warn' : 'neutral' }),
           h('span', null, pending ? '等待授权…' : busy ? '打开授权页…' : error ? '重新连接 Qoder' : '连接 Qoder')),
           pending ? h('a', {
-            className: 'qdr-chat-login-link', href: pending.uri, target: '_blank', rel: 'noreferrer noopener',
+            className: 'qdr-chat-login-link', href: safeHref(pending.uri), target: '_blank', rel: 'noreferrer noopener',
             title: '重新打开授权页',
           }, '打开授权页') : null,
           error ? h('span', { className: 'qdr-chat-login-error', title: error }, error) : null);
@@ -3608,6 +3683,13 @@
     exports.QoderPanel = Panel;
     exports.getJson = getJson;
     exports.postJson = postJson;
+    exports.safeHref = safeHref;
+    exports.versionNotice = versionNotice;
+    exports.settingsNotice = settingsNotice;
+    exports.usageBadges = usageBadges;
+    exports.partialDataNote = partialDataNote;
+    exports.accountIdentityNote = accountIdentityNote;
+    exports.checkinNotice = checkinNotice;
     exports.startVisibilityPoll = startVisibilityPoll;
     exports.toEpochMs = toEpochMs;
     exports.autoOutputTokens = autoOutputTokens;

@@ -43,6 +43,14 @@ async function readJsonBody(req, limit = 256 * 1024) {
 
 const guard = (req) => req.headers['x-qoder-panel'] === '1';
 
+// GET 也可能触发本机扫描或上游刷新；跨站 <img>/<script> 能发 GET 但带不上
+// 自定义头，所以副作用请求必须和写接口用同一道门。
+function requireSideEffectGuard(req, res) {
+  if (guard(req)) return true;
+  sendJson(res, 403, { ok: false, error: 'missing x-qoder-panel header' });
+  return false;
+}
+
 function allowRead(req, res) {
   if (req.method === 'GET' || req.method === 'HEAD') return true;
   sendJson(res, 405, { ok: false, error: 'method not allowed' });
@@ -55,6 +63,8 @@ export function createRouteTable({ controller, log = () => {} }) {
       await fn(req, res);
     } catch (error) {
       log('panel route failed', error?.message || error);
+      // 客户端已经断开时不要再写响应；诊断取消走的就是这条路径。
+      if (res.writableEnded || res.destroyed) return;
       const status = Number(error?.statusCode) || 500;
       if (!res.headersSent) sendJson(res, status, { ok: false, error: String(error?.message || error) });
       else try { res.end(); } catch { /* ignore */ }
@@ -70,6 +80,7 @@ export function createRouteTable({ controller, log = () => {} }) {
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         const deep = url.searchParams.get('deep') === '1';
         const rescan = url.searchParams.get('rescan') === '1';
+        if ((deep || rescan) && !requireSideEffectGuard(req, res)) return;
         sendJson(res, 200, { ok: true, ...(await controller.status({ deep, rescan })) });
       }),
     },
@@ -80,6 +91,7 @@ export function createRouteTable({ controller, log = () => {} }) {
         if (!allowRead(req, res)) return;
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         const refresh = url.searchParams.get('refresh') === '1';
+        if (refresh && !requireSideEffectGuard(req, res)) return;
         sendJson(res, 200, { ok: true, ...(await controller.directory({ refresh })) });
       }),
     },
@@ -108,7 +120,15 @@ export function createRouteTable({ controller, log = () => {} }) {
       path: '/qoder/diagnostics',
       handler: wrap(async (req, res) => {
         if (!allowRead(req, res)) return;
-        sendJson(res, 200, { ok: true, ...(await controller.diagnostics()) });
+        if (!requireSideEffectGuard(req, res)) return;
+        const abort = new AbortController();
+        const onClose = () => { if (!res.writableEnded) abort.abort(new Error('诊断已取消')); };
+        res.on?.('close', onClose);
+        try {
+          sendJson(res, 200, { ok: true, ...(await controller.diagnostics({ signal: abort.signal })) });
+        } finally {
+          res.off?.('close', onClose);
+        }
       }),
     },
     {

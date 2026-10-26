@@ -1,6 +1,6 @@
 # qoder-to-dsh
 
-把 **Qoder** 的模型额度原生接进 **DeepSeek Harness (DSH)**。当前版本 **1.1.4**。
+把 **Qoder** 的模型额度原生接进 **DeepSeek Harness (DSH)**。当前版本 **1.3.0**。
 
 这是一个纯 DSH 插件：没有本地桥进程，没有第二个端口，没有独立控制台。凭据读取、COSY 签名、模型目录、流式转发和设置面板都在 DSH 插件进程内完成。
 
@@ -71,13 +71,13 @@
 从 [Releases](https://github.com/Ianzhyh/qoder-to-dsh/releases) 下载 `qoder-to-dsh-<version>.tgz`，在下载目录执行：
 
 ```bash
-dsh plugin --profile desktop add ./qoder-to-dsh-1.1.3.tgz
+dsh plugin --profile desktop add ./qoder-to-dsh-1.3.0.tgz
 ```
 
 正文里带该资产的 SHA-256，可以先核对再装。也可以在 DSH 里让 agent 直接按 URL 装：
 
 ```text
-plugin_manager { action: "install_bundle", target: "https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.1.3/qoder-to-dsh-1.1.3.tgz" }
+plugin_manager { action: "install_bundle", target: "https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.3.0/qoder-to-dsh-1.3.0.tgz" }
 ```
 
 **B. GitHub 直装（不落地文件）**
@@ -120,6 +120,14 @@ npm run verify -- --offline # 只看文件和 profile 配置
 
 最后**完全退出 DSH 再打开**（托盘退出；插件在宿主启动时加载，只重开面板不会换掉已加载的代码）。
 
+> 基线：dsh ≥ 0.2.1-rc.3（本项目实测与发版验证使用的版本）。更老的宿主可能没有 `registerAdapter` 或面板 `webServer.register`。
+
+### 升级 / 回滚 / 卸载
+
+- **升级**：安装新版本 tgz（或更新 GitHub / link 依赖）后完全退出 dsh 再打开。凭据、偏好、用量与目录都在 `<DSH_HOME>/qoder`，升级不会清空。
+- **回滚**：重新安装上一版 tgz 并完全重启。数据文件保持向后兼容；降级前建议复制一份 `<DSH_HOME>/qoder` 作为备份。
+- **卸载**：在 dsh 设置 → 插件中移除 `qoder-to-dsh`（或从 profile 的 `dependencies` / `dsh.profile.bundles` 删掉），然后完全退出 dsh。删除 `<DSH_HOME>/qoder` 会同时清除本机凭据、偏好、签到与用量记录。
+
 ### 2. 登录
 
 打开 **设置 → Qoder**。首次使用会自动只读扫描本机 Qoder 桌面端 / CLI 的登录态：
@@ -152,7 +160,7 @@ npm run verify -- --offline # 只看文件和 profile 配置
 ## 功能
 
 - **原生 provider**：不写 `settings.yaml`，不改 DSH 的模型路由配置。
-- **流式对话**：思考内容、正文、工具调用、usage、AbortSignal 全链路透传；首包 45 秒 / 块间空闲 120 秒超时，超时以可见的 `TIMEOUT` 结束，不会无限挂起。
+- **流式对话**：思考内容、正文、工具调用、usage、AbortSignal 全链路透传；首包 90 秒 / 块间空闲 120 秒超时，超时以可见的 `TIMEOUT` 结束，不会无限挂起。
 - **工具调用**：DSH 声明的 function tools 原样进入 Qoder 请求；工具结果回灌时剔除孤儿消息与空助手轮。
 - **图片**：通过 DSH `attachments.readImage` 转 data URL，交给支持视觉的模型。
 - **模型目录**：动态读取 `/algo/api/v2/model/list`；有缓存先展示、过期后台刷新，显式刷新仍等待上游；解析 `context_config`、`thinking_config`、`price_factor` 与谷时折扣；面板显示 200K / 400K / 1M 上下文档位、输出默认值、促销与官方标记。
@@ -183,9 +191,10 @@ npm run verify -- --offline # 只看文件和 profile 配置
 | `<DSH_HOME>/qoder/auth.json` | 加密凭据（DPAPI / AES-GCM）；面板永远不返回令牌 |
 | `<DSH_HOME>/qoder/prefs.json` | 模型显示 / 默认 / 上下文 / 参数偏好 |
 | `<DSH_HOME>/qoder/checkin.json` | 自动签到开关、各账号最近一次签到结果（不含令牌） |
-| `<DSH_HOME>/qoder/usage.json` | 最多 5000 条请求元数据，保留近一年（不含 prompt / 回复；含实扣与已省 Credits） |
+| `<DSH_HOME>/qoder/usage.json` | 最多 5000 条请求明细（不含 prompt / 回复；含实扣与已省 Credits、账号尾号） |
+| `<DSH_HOME>/qoder/usage.daily.json` | 每日用量汇总，覆盖近 12 个月热力图；只有计数与 Credits，不存模型名、prompt 或回复 |
 | `<DSH_HOME>/qoder/catalog.json` | 模型目录缓存 |
-| `<DSH_HOME>/qoder/qoder.log` | 脱敏运行日志 |
+| `<DSH_HOME>/qoder/qoder.log` | 脱敏运行日志；超过 2MB 轮转为 `qoder.log.1`，只保留一份旧日志 |
 
 安全约束：
 
@@ -193,7 +202,9 @@ npm run verify -- --offline # 只看文件和 profile 配置
 - 不把 access token / refresh token / machineToken 写进日志、面板响应或错误消息；
 - 签到结果只保存账号标签、区域、状态和 Credits 数字，不保存任何令牌；
 - 桌面端导入的凭据临近过期时，优先只读重读官方存储；只有读不到新令牌时才用 refresh token，避免同一个 `drt-` 的轮换影响官方客户端；
-- 写接口要求 `x-qoder-panel: 1`（自定义头触发 CORS 预检，挡掉跨站简单请求）；
+- 写接口与有副作用的 GET（`?rescan=1` / `?refresh=1` / 诊断刷新）要求 `x-qoder-panel: 1`（自定义头触发 CORS 预检，挡掉跨站简单请求）；这只防跨站与误触，不替代 dsh 自身的访问控制；
+- 额度明细 / 升级链接只接受绝对 `http(s)` 地址，`javascript:` / `data:` / 协议相对链接会被丢弃；
+- Windows 上优先用 DPAPI；受限环境回退 AES-256-GCM 时，诊断页会如实显示「本机密钥回退」，不会继续标成 DPAPI；
 - 不新增监听端口；所有面板数据走 DSH 自己的 loopback Web 载体；
 - 不内置任何密钥、账号或额度；COSY 公钥来自 Qoder 公开客户端协议，仅用于互操作。
 
@@ -201,25 +212,42 @@ npm run verify -- --offline # 只看文件和 profile 配置
 
 - **非官方路径**：Qoder 可能修改签名、模型 key 或上游 schema；失效时先看「诊断」页。
 - **单激活账号**：模型请求始终使用当前激活的一个账号；支持在本机已登录的国际版 / 国内版账号之间切换，并会对所有本机账号执行每日签到；不做多账号池化、负载均衡、代他人调用、转售或托管。
-- **试跑会花额度**：面板的试跑和 `/qoder test` 都是真实上游请求，会计入用量与 Credits；只是验证链路时用最小 prompt。取消会把中断传到上游并停止等待，但已经产生的 token 仍可能被上游计入。
+- **试跑会花额度**：面板的试跑和 `/qoder test` 都是真实上游请求，会计入上游 Credits；本地账本把它标成 `probe` 并排除在常规请求 / 热力图统计之外，但记录仍保留在明细里。只是验证链路时用最小 prompt。取消会把中断传到上游并停止等待，但已经产生的 token 仍可能被上游计入。
 - **Credits 按上游实扣统计**：以 `usage.billable` 为准。Qoder 对免费模型也会返回原价 `credits`（`billable: false`），这部分显示为“已省”，不计入消耗；折扣请求同样只记实扣。旧版本留下的免费模型记录会按当前目录的免费标记只读修正统计，不改写原始 usage 文件。
 - **上下文档位以 Qoder 的 `context_config` 为准**：DeepSeek-V4-Flash / Pro、Qwen3.8-Max 等模型提供 200K / 400K / 1M。旧版本误用 `max_input_tokens` 把档位砍成 180K / 96K，已修正；选择 1M 会写回请求的 `model_config.max_input_tokens`。上游仍可能按账号或网关策略截断，超长上下文请以诊断页和实际响应为准。
 - **工具调用历史**：assistant 的 `tool_calls` 统一带空字符串 `content`（Qoder 网关不接受 `null`，否则会误报 `Messages with role 'tool'...`）；带工具调用的历史也能继续复用。
 - **模型参数是本地偏好**：上下文窗口 / 思考档位 / 温度 / 最大输出只影响本插件发给上游的请求与 DSH 选择器，不会修改 Qoder 官方客户端设置；上游仍可能按自己的模型上限拒绝或截断。输出「自动」是 32K（Qoder 官方 CLI 默认），可手动调高；温度没有公开的聊天默认值，插件不猜。
 - **签到也是非官方接口**：使用本机 Qoder 客户端 `runtime-info` 生成的设备身份，活动每天 10:00（UTC+8）后开放；平台可能调整活动或风控。自动签到默认开启，可在「签到」页关闭，或用 `QODER_CHECKIN=0` 禁用；DSH 没运行时不会签到。没有活动时会明确显示「无活动」或「未开放」，不会混进待领取或异常；缺设备 / 需登录的账号当天不自动重试。
-- **超时是本地判定**：首包默认 45 秒、块间空闲默认 120 秒；可通过插件配置 `firstByteTimeoutMs` / `streamIdleTimeoutMs` 调整（0 表示不限）。超时只会停止本地等待，已经发出的上游请求仍可能产生少量 Credits。
-- **用量写入是合并异步的**：正常退出会同步补写；进程被强制结束时，最后一条记录可能还没落盘。只影响本地统计，对话内容仍然从不记录。
+- **错误码与重试**：10605 排队会按 `retryAfter` 自动等待（上限 60 秒）；110 日限、112 额度、430 版本门、12153 / TOKEN_EXPIRE 会话失效、内容审核和 114 试用受限不会被盲目重试；普通 401 / 403 仍会刷新一次令牌。
+- **完成度**：只有思考内容、没有正文或工具调用时以 `EMPTY_RESPONSE` 结束；工具名为空/不合法或参数不是完整 JSON 时会拒绝写入会话并给出可见错误。
+- **面板数据口径**：额度为 0 或字段缺失会显示 0 / `—`，诊断里缺失额度是 warn；目录、额度和用量都带更新时间，用量明细会标出试跑、账号尾号与“部分历史来自每日汇总”。版本漂移会在顶部提示，需完全退出 dsh 才能换代码。
+- **超时是本地判定**：首包默认 90 秒、块间空闲默认 120 秒；可通过插件配置 `firstByteTimeoutMs` / `streamIdleTimeoutMs` 调整（0 表示不限）。超时只会停止本地等待，已经发出的上游请求仍可能产生少量 Credits。
+- **用量写入是合并异步的**：正常退出与插件卸载会同步补写；进程被强制结束时，最后一条记录可能还没落盘。明细上限 5000 条，每日汇总独立保留 430 天并用它绘制 12 个月热力图；同一天只选明细或汇总其中一个来源，不会重复计数。多个 dsh 进程同时写同一数据目录时，汇总按最大值合并，可能少算而不是多算。只影响本地统计，对话内容仍然从不记录。
 - **多账号只切换插件**：账号来自本机官方客户端的只读扫描；切换只改插件当前使用的账号，不会写入或退出官方客户端。
 - **协议**：当前使用已实测的 COSY + `agent_chat_generation` 路径；更新版 Bearer 端点存在但模型 id 体系不同，未作为默认路径。
 - **设备授权 / PAT**：协议流程已实现，离线回归覆盖 PAT、设备授权与过期令牌重试；本次实机验证主要走桌面端导入，欢迎用真实 PAT 补一次实机回归。
 - **图片 / 工具调用**：取决于上游模型与账号能力；失败会以可见错误结束，不会伪造成功。
-- **Windows 凭据导入**依赖 PowerShell DPAPI；无 PowerShell 的精简环境会退回 AES 本地密钥模式（仍不落明文 token）。
+- **Windows 凭据导入**依赖 PowerShell DPAPI；无 PowerShell 的精简环境会退回 AES 本地密钥模式（仍不落明文 token），诊断页会显示实际的「本机密钥回退」。
+
+## 故障排查
+
+| 现象 | 先做什么 |
+|---|---|
+| 设置页一直 404 / 插件像没装 | 确认 profile 的 `dsh.profile.bundles` 里有 `qoder-to-dsh`，再**完全退出 dsh** 重开；只重开面板不会重新加载代码 |
+| 升级后行为没变 | 旧代码仍在宿主进程里。托盘退出 dsh 再启动；热重载不会替换已注册的 provider |
+| 模型选择器为空 | 设置 → Qoder → 账号确认已登录；点「刷新目录」；仍为空就看诊断页的目录错误 |
+| 诊断显示「凭据恢复：corrupt」 | 本地 `auth.json` 无法解密。不会自动切到别的账号，请重新授权；必要时删除该文件再登录 |
+| 凭据加密显示「本机密钥回退」 | 当前环境的 PowerShell / DPAPI 不可用，已退回 AES-256-GCM；功能不受影响，但请确保数据目录只有本机用户可读 |
+| 回复半截 / 连接中断 | 检查网络或代理；诊断页看「最近错误」；`TRANSPORT` / `TIMEOUT` 可重试，换号导致的取消需要确认当前账号后重试 |
+| 额度明细 / 升级链接不可点 | 上游返回的不是绝对 `http(s)` 地址，已被安全过滤；这不影响额度读取 |
+| 热力图与最近列表对不上 | 明细只保留 5000 条，热力图优先用每日汇总；重度使用时热力图比“最近请求”列表更完整，属于预期行为 |
+| 日志太大 | 超过 2MB 自动轮转为 `qoder.log.1`，只保留一份；可在诊断页查看最近日志 |
 
 ## 更新记录
 
 每个版本的完整变更见 **[CHANGELOG.md](CHANGELOG.md)**；发布说明（含升级步骤与资产 SHA-256）见 [Releases](https://github.com/Ianzhyh/qoder-to-dsh/releases)。
 
-当前版本 `1.1.4` 修「设置看起来生效、实际没生效」与账号切换竞态：温度现在真的写进上游参数、换号会清空模型目录、官方客户端的旧令牌不再覆盖插件刚刷新的令牌、目录响应中断不再变成未捕获异常、诊断不再被 20 秒客户端超时截断。`1.1.3` 修流结束、令牌刷新、换号与本地账本之间的竞态：截断的信封流不再被补成成功、并发刷新合并并隔离账号、无效 PAT 回滚、试跑取消会中止上游、目录缓存按账号隔离、清除用量不再被在途写盘复活。`1.1.2` 补齐面板在宿主刚启动、标签页在后台、账号刚切换时的行为。`1.1.1` 修掉三个「留到线上才暴露」的问题：断流被当成正常结束、不合法工具名导致整轮失败且不点名、面板请求没有超时。`1.1.0` 的要点是聊天 SSE 走持久连接、模型目录先返回后刷新、启动不再扫本机账号、凭据与用量异步落盘。详见 [v1.1.4 发布说明](docs/releases/v1.1.4.md)、[v1.1.3 发布说明](docs/releases/v1.1.3.md)、[v1.1.2 发布说明](docs/releases/v1.1.2.md)、[v1.1.1 发布说明](docs/releases/v1.1.1.md) 与 [v1.1.0 发布说明](docs/releases/v1.1.0.md)。
+当前版本 `1.3.0` 把上游错误与完成度做成可信语义：10605 模型排队会按 retryAfter 自动等待，110 日限/430 版本门/12153 会话失效不再盲重试；只有思考内容、没有正文或工具调用时以 EMPTY_RESPONSE 结束；空工具名/非法参数会被拦下；额度为 0 或缺失时不再假绿；面板会提示版本漂移、说明参数生效范围，并给用量明细加试跑/账号/汇总标签。`1.2.1` 收口「静默失败与取消传播」：后台目录刷新失败会同步到面板，不再只写日志；`qoder_diagnose` 与诊断面板会响应宿主取消，签到在插件卸载/热重载后停止继续账号并取消在途请求。`1.2.0` 修「看起来成功、实际失败」与账号/用量边界：提前取消的流不再记成功、429 响应体含 credits 仍按可重试限流处理；换号/退出会取消在途请求，损坏的本地凭据不再静默切换账号；用量新增 12 个月每日汇总并把试跑单独标记，插件卸载会同步落盘；有副作用的面板 GET 需要面板头，额度链接只允许 http(s)。`1.1.4` 修「设置看起来生效、实际没生效」与账号切换竞态：温度现在真的写进上游参数、换号会清空模型目录、官方客户端的旧令牌不再覆盖插件刚刷新的令牌、目录响应中断不再变成未捕获异常、诊断不再被 20 秒客户端超时截断。`1.1.3` 修流结束、令牌刷新、换号与本地账本之间的竞态：截断的信封流不再被补成成功、并发刷新合并并隔离账号、无效 PAT 回滚、试跑取消会中止上游、目录缓存按账号隔离、清除用量不再被在途写盘复活。`1.1.2` 补齐面板在宿主刚启动、标签页在后台、账号刚切换时的行为。`1.1.1` 修掉三个「留到线上才暴露」的问题：断流被当成正常结束、不合法工具名导致整轮失败且不点名、面板请求没有超时。`1.1.0` 的要点是聊天 SSE 走持久连接、模型目录先返回后刷新、启动不再扫本机账号、凭据与用量异步落盘。详见 [v1.3.0 发布说明](docs/releases/v1.3.0.md)、[v1.2.1 发布说明](docs/releases/v1.2.1.md)、[v1.2.0 发布说明](docs/releases/v1.2.0.md)、[v1.1.4 发布说明](docs/releases/v1.1.4.md)、[v1.1.3 发布说明](docs/releases/v1.1.3.md)、[v1.1.2 发布说明](docs/releases/v1.1.2.md)、[v1.1.1 发布说明](docs/releases/v1.1.1.md) 与 [v1.1.0 发布说明](docs/releases/v1.1.0.md)。
 
 ## 开发
 
@@ -235,13 +263,13 @@ npm run test:live        # 实机回归：会真实调用一次 Qoder（消耗�
 ```bash
 npm run release:check    # 发版门禁：语法 + 全部用例 + 安装自检（--offline）
 npm run pack:release     # 生成 qoder-to-dsh-<version>.tgz
-npm run verify:release   # 校验 tgz：产物新鲜度 / 文件清单 / 双份版本号 / patch 名 / sha256
+npm run verify:release   # 校验 tgz：产物新鲜度 / 文件清单 / 双份版本号 / patch 名 / exports / locale / 文档版本 / sha256
 ```
 
 `verify:release` 也可以传 Release 资产 URL，直接校验**已发布**的那一份（只在内存里解包，不写磁盘）：
 
 ```bash
-npm run verify:release -- https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.1.3/qoder-to-dsh-1.1.3.tgz
+npm run verify:release -- https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.3.0/qoder-to-dsh-1.3.0.tgz
 ```
 
 第三方许可与归属信息见 [NOTICE.md](NOTICE.md)。

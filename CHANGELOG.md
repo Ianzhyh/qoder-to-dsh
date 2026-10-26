@@ -10,14 +10,137 @@
    `verify --offline`（文件与 profile 配置）。
 2. 把本次变化写成下面的新版本条目（`## [X.Y.Z] - YYYY-MM-DD`，分类用
    `### Added / Changed / Fixed / Docs / Tests`，条目以 `- **短语**：` 开头）。
-3. 版本号必须同步两处：`package.json` 的 `version` 与 `lib/config.mjs` 的
-   `VERSION`。`npm run verify:release` 会校验两者与 tgz 内一致。
+3. 版本号必须同步 `package.json`、`lib/config.mjs`、README 顶部、CHANGELOG 与
+   `docs/releases/vX.Y.Z.md`。`tests/install-contract.test.mjs` 与
+   `npm run verify:release` 会校验这些位置。
 4. `npm run pack:release` 生成 tgz → `npm run verify:release [tgz]` 校验产物、
    核对文件清单并取 SHA-256。
 5. `git tag vX.Y.Z` 推送；`gh release create vX.Y.Z ./qoder-to-dsh-X.Y.Z.tgz`
    附上资产，正文取 `docs/releases/vX.Y.Z.md`。
 6. 可选：`npm publish`，让 `dsh plugin add qoder-to-dsh` 这条最短路径可用
    （registry 上目前未占用该包名）。
+
+## [1.3.0] - 2026-10-26
+
+这一轮参考了 `qoder2api-hub`、`pi-provider-qoder`、`masknull/dsh-qoder-connect`、
+`workbuddy-to-dsh` 等项目的 issue：高频故障不是缺功能，而是错误码被误读、
+空白回复被当成功、界面显示与真实状态不一致。
+
+### Added
+
+- **Qoder 错误语义层**：新增 `lib/upstream-error.mjs`，解析 10605 排队（含转义 JSON）、
+  110 日限、112 额度、105/12153 会话问题、430 版本门、内容审核与 114 试用受限；
+  `providerRetryAfterMs` 从 body/header 透传给 dsh 重试器（上限 60 秒）。
+- **完成度校验**：只有 reasoning、没有正文/工具调用时以 `EMPTY_RESPONSE` 结束；
+  `length` 且无可见内容同样报错；空工具名、非法工具名、参数不是完整 JSON 时
+  阻止写入会话并报 `INVALID_REQUEST`。
+- **工具 id 防撞**：上游缺 `tool_call.id` 时使用每个 translator 唯一的前缀，不再固定
+  `call_0`；上游真实 id 优先。
+- **版本漂移提示**：面板对比已加载 `VERSION` 与磁盘 `package.json`，不一致时顶部
+  banner 与诊断项提示“完全退出 dsh 再打开”。
+- **体验标签**：用量明细显示试跑/账号尾号；额度/用量页脚标出“部分历史来自每日
+  汇总”；账号页显示“插件当前使用 X；本机检测到 N 个账号”，PAT/浏览器授权账号
+  会说明不在桌面端列表。
+
+### Changed
+
+- 首包默认超时 45 秒 → **90 秒**（Qoder 首 token 实测可达 40–70 秒）。
+- 额度诊断：无额度数据从 pass 改为 warn；`remaining: 0` 现在会如实写入 0，
+  不再保留旧 Credits。
+- 设置保存提示改为“下一次请求生效”；仅在选择器元数据无法广播时提示需完全退出
+  dsh，不再把请求参数误说成必须重启。
+- 面板额度为 0/缺失时显示 `0` / `—`，不再把 0/0 当成有效额度。
+
+### Fixed
+
+- **10605 被当普通限流快速重试**：现在识别为模型排队，优先使用 `retryAfterSeconds`
+  / `Retry-After`，401/403 时不再刷新令牌。
+- **110 日限被当未知错误**：归为不可重试的额度错误，并提示“今日请求次数已用完”。
+- **430 / 12153 / 数据审核 / 试用受限**：给出可行动文案，不再落入通用参数错误。
+- **签到结论被 summary 覆盖**：通知统一由 `checkinNotice` 生成，部分失败、pending、
+  unavailable 原样呈现，不再只显示“签到完成”。
+
+### Tests
+
+- 184 个用例通过；新增 upstream-error、错误分类、reasoning-only、工具参数/名称/
+  id、`Retry-After`、额度 0、版本/设置/用量/账号/签到文案回归。
+- `release:check`、`verify:release` 全绿。
+
+## [1.2.1] - 2026-10-26
+
+第二轮收口「静默失败与取消传播」：后台目录刷新失败不再只写日志；诊断工具与
+面板诊断会响应宿主取消；签到在插件卸载后不会继续为剩余账号发请求。
+
+### Fixed
+
+- **后台目录刷新失败不可见**：`QoderClient` 新增 `onCatalogError`，失败时同步
+  `state.catalogError` 与 adapter 缓存；成功刷新会同时清除两处错误。此前面板
+  会一直显示旧目录，用户不知道后台刷新已经失败。
+- **诊断不能取消**：`qoder_diagnose` 与 `/qoder/diagnostics` 现在把宿主的
+  `AbortSignal` 传到目录刷新和额度读取；客户端断开时服务端停止继续等待。
+  `client.refreshExtras({ signal })` 也支持调用方取消。
+- **签到卸载后继续跑**：插件 dispose 会 abort 签到信号，账号循环在下一个账号前
+  停止；已完成的领取仍会记录并落盘，未发出的请求不再继续。
+- **签到请求无法取消**：`claimCampaigns` 接受 `signal`，查询、领取与刷新令牌都
+  使用合成信号 + 20 秒超时，取消后不再进入 500ms 重试。
+
+### Tests
+
+- 162 个用例通过；新增后台目录失败通知、签到取消、额度读取取消与
+  `qoder_diagnose` 宿主取消的回归。
+
+## [1.2.0] - 2026-10-26
+
+这一版按「失败不能伪装成成功、数据不能跨账号」来收口：提前取消不再记成功，
+换号/退出会取消在途请求，损坏的凭据不会静默换成另一个账号；用量历史与试跑
+统计也分开保存，避免 12 个月热力图被明细上限截断。
+
+### Added
+
+- **每日用量汇总**：新增 `usage.daily.json`，按天保存 Credits / tokens / 请求与失败数，
+  独立保留 430 天；明细仍只保留 5000 条。报表按天在明细与汇总之间二选一，不重复计数。
+- **试跑单独分桶**：面板试跑与 `/qoder test` 写入 `probe: true`，不计入常规请求、
+  失败与热力图统计，但保留在明细里；`creditsReport` 返回独立的 probe 汇总。
+- **凭据恢复可见**：本地 `auth.json` 缺失、损坏、无令牌、导入失败分别记录到
+  `status.authRestore`，诊断页新增「凭据恢复」检查；损坏时不会自动切换账号。
+- **真实加密方式**：诊断与状态页读取凭据信封，DPAPI 失败回退 AES 时状态页显示
+  AES-256-GCM、诊断页明确提示「本机密钥回退」，不再固定写成 DPAPI。
+- **安装契约测试与 CI**：校验包名 = patch name = client 注册 id、exports 目标、
+  locale 键、版本号与 README/CHANGELOG/发布说明一致；新增 Windows + Ubuntu 工作流。
+- **README 排障手册**：补齐升级 / 回滚 / 卸载、故障排查、最低 dsh 基线、数据文件说明。
+
+### Changed
+
+- `resolveModel` 始终返回正整数的 `context.contextWindow`；目录缺元数据时统一回退
+  到 `DEFAULTS.fallbackContextWindow`（131072），请求体的 `max_input_tokens` 不再用
+  临时写死的 180000。
+- `npm test` 改为 `node --test` 默认发现模式，避开 Windows cmd 不展开 glob、以及目录参数在部分 Node 版本被当成模块的问题。
+- usage 记录新增 `account`（uid / 邮箱尾号）与 `probe` 字段。
+
+### Fixed
+
+- **提前取消被记成成功**：消费方在 `finish` 之前结束生成器时，用量现在记
+  `aborted`、`ok:false`，不再污染成功率。
+- **429 被误判为额度不足**：`classifyError` 先处理 402、408 与硬额度短语，再处理
+  429；429 响应体里只是出现 “credits” 时仍按可重试的限流处理。
+- **换号/退出不取消在途流**：`QoderClient` 登记在途请求，身份变化或登出时用
+  `ACCOUNT_SWITCHED` 取消；适配器以 ABORTED 结束并保留旧账号用量戳，避免继续用
+  旧账号计费却记到新账号。
+- **损坏凭据静默换号**：`auth.json` 存在但无法解密时不再自动导入桌面端账号。
+- **副作用 GET 无防护**：`?rescan=1`、`?refresh=1`、`?deep=1` 与诊断刷新必须带
+  `x-qoder-panel: 1`；面板对应用户操作会自带该头。
+- **额度链接协议注入**：`detailUrl` / `upgradeUrl` 只接受绝对 http(s)，渲染前再次过滤。
+- **日志无限增长与脱敏缺口**：日志超过 2MB 轮转为 `qoder.log.1`；Bearer 令牌的
+  `+/=` 与 `token=` 形式不再残留片段。
+- **卸载残留**：插件卸载时取消在途聊天、清理图片缓存与定时器，并同步刷写
+  usage 明细与每日汇总。
+
+### Tests
+
+- 新增 `request-guard`、`tools`、`install-contract`、`secret-store` 四组测试；覆盖提前取消、
+  换号取消、损坏凭据、每日汇总迁移/修复/清除竞态、probe 排除、副作用 GET、
+  `safeHref`、上下文回退与工具输出。
+- 全部用例与发版门禁通过（以 `npm test` / `npm run release:check` 输出为准）。
 
 ## [1.1.4] - 2026-10-25
 

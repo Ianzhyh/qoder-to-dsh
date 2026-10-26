@@ -16,7 +16,7 @@ process.env.QODER_REGION = 'global';
 const { QoderClient, shouldAdoptDesktopAuth } = await import('../lib/qoder-api.mjs');
 const { normalizeCatalog } = await import('../lib/qoder-api.mjs');
 const { QoderAdapter, StreamTranslator, CODE } = await import('../lib/adapter.mjs');
-const { PATHS } = await import('../lib/config.mjs');
+const { PATHS, DEFAULTS } = await import('../lib/config.mjs');
 const { readEncryptedJson } = await import('../lib/secret-store.mjs');
 
 function deferred() {
@@ -237,6 +237,16 @@ test('a finish_reason without an outer [DONE] still closes cleanly', async () =>
   const wire = await new Response(res.body).text();
   assert.ok(wire.includes('data: [DONE]'));
   assert.equal(translated(wire).find((chunk) => chunk.type === 'finish').reason.kind, 'stop');
+});
+
+test('HTTP 200 inner queue envelopes become visible queue errors', async () => {
+  const client = streamClient([envelope({ error: { message: 'queued', code: 10605, retryAfterSeconds: 9 } })]);
+  const res = await client.chat({ model: 'auto', messages: [{ role: 'user', content: 'hi' }], stream: true });
+  const wire = await new Response(res.body).text();
+  assert.match(wire, /10605/);
+  const finish = translated(wire).find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.failure.code, CODE.RATE_LIMIT);
+  assert.equal(finish.reason.failure.providerRetryAfterMs, 9000);
 });
 
 test('trial rejects a translated stream that closes before finish_reason', async () => {
@@ -689,7 +699,8 @@ test('catalog fetches are single-flight and stale cache returns immediately', as
 });
 
 test('catalog keeps stale models when refresh fails and throws only without cache', async () => {
-  const client = catalogClient({ catalogTtlMs: 60_000 });
+  const errors = [];
+  const client = catalogClient({ catalogTtlMs: 60_000, onCatalogError: (message) => errors.push(message) });
   client.catalogCache = {
     at: Date.now() - 120_000,
     models: [{ id: 'cached', name: 'Cached' }],
@@ -709,6 +720,8 @@ test('catalog keeps stale models when refresh fails and throws only without cach
   const failed = await job;
   assert.equal(failed.models[0].id, 'cached');
   assert.match(failed.error, /catalog down/);
+  assert.equal(errors.length, 1, '后台刷新失败必须通知宿主');
+  assert.match(errors[0], /catalog down/);
   const next = await client.listCatalog();
   assert.equal(next.models[0].id, 'cached');
   assert.match(next.error, /catalog down/);
@@ -897,6 +910,144 @@ test('switching accounts clears the model catalog and discards in-flight models'
   }, { silent: true, sameIdentity: true, persist: false });
   assert.equal(client.catalogCache.models[0].id, 'keep');
   assert.equal(client.catalogGeneration, keptGeneration);
+});
+
+test('corrupt local credentials do not silently switch to a desktop account', () => {
+  mkdirSync(process.env.QODER_TO_DSH_HOME, { recursive: true });
+  writeFileSync(PATHS.auth, '{not valid json');
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  assert.equal(client.auth, null);
+  assert.equal(client.authLoad.state, 'corrupt');
+  assert.match(client.status({ desktop: false }).authRestore.error, /JSON|Unexpected|解析/i);
+  rmSync(PATHS.auth, { force: true });
+});
+
+test('account switch aborts an in-flight chat, while same-identity refresh does not', async () => {
+  const auth = {
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-inflight',
+    expiresAt: Date.now() + 3600_000,
+    user: { id: 'u-inflight', name: 'Inflight' },
+    source: 'token',
+  };
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth(auth, { silent: true, persist: false });
+  client.listCatalog = async () => ({ models: [], at: Date.now(), staleMs: 0, error: '' });
+  let captured = null;
+  client.transport = (_url, options) => new Promise((_resolve, reject) => {
+    captured = options.signal;
+    options.signal.addEventListener('abort', () => reject(options.signal.reason || new Error('aborted')), { once: true });
+  });
+
+  const caller = new AbortController();
+  const pending = client.chat({ model: 'auto', messages: [] }, { signal: caller.signal });
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  assert.equal(client.inflight.size, 1);
+  assert.equal(captured.aborted, false);
+
+  // 令牌刷新沿用同一个身份：不能打断正在生成的回复。
+  client.setAuth({ ...auth, accessToken: 'dt-inflight-next' }, { silent: true, sameIdentity: true, persist: false });
+  assert.equal(captured.aborted, false);
+  assert.equal(client.inflight.size, 1);
+
+  caller.abort(new Error('caller cancelled'));
+  await assert.rejects(pending, /caller cancelled/);
+  assert.equal(client.inflight.size, 0);
+
+  const switchClient = new QoderClient({ region: 'global', log: () => {} });
+  switchClient.setAuth(auth, { silent: true, persist: false });
+  switchClient.listCatalog = async () => ({ models: [], at: Date.now(), staleMs: 0, error: '' });
+  let switchedSignal = null;
+  switchClient.transport = (_url, options) => new Promise((_resolve, reject) => {
+    switchedSignal = options.signal;
+    options.signal.addEventListener('abort', () => reject(options.signal.reason || new Error('aborted')), { once: true });
+  });
+  const switchedPending = switchClient.chat({ model: 'auto', messages: [] }, { signal: new AbortController().signal });
+  const rejection = assert.rejects(switchedPending, (error) => error.code === 'ACCOUNT_SWITCHED');
+  await new Promise((resolve) => setTimeout(resolve, 10));
+  switchClient.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-other',
+    user: { id: 'u-other', name: 'Other' },
+    source: 'token',
+  }, { silent: true, persist: false });
+  assert.equal(switchedSignal.aborted, true);
+  await rejection;
+  assert.equal(switchClient.inflight.size, 0);
+});
+
+test('buildChatBody uses the shared context fallback instead of an ad-hoc 180K', () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  const body = client.buildChatBody({ model: 'auto', messages: [] }, null);
+  assert.equal(body.model_config.max_input_tokens, DEFAULTS.fallbackContextWindow);
+});
+
+test('refreshExtras rejects a cancelled caller without starting a second request', async () => {
+  const client = catalogClient();
+  client.extrasPromise = { generation: client.extrasGeneration, promise: new Promise(() => {}) };
+  const controller = new AbortController();
+  controller.abort(new Error('extras cancelled'));
+  await assert.rejects(client.refreshExtras({ signal: controller.signal }), /extras cancelled/);
+});
+
+test('status reports a zero remaining balance instead of stale credits', () => {
+  const client = catalogClient();
+  client.auth.credits = 42;
+  client.extras = {
+    quota: {
+      userQuota: { remaining: 0, total: 10, unit: 'credits' },
+      addOnQuota: { remaining: 0, total: 0, unit: 'credits' },
+    },
+  };
+  assert.equal(client.status({ desktop: false }).account.credits, 0);
+
+  client.extras = { quota: { userQuota: { total: 10, unit: 'credits' } } };
+  client.auth.credits = 42;
+  assert.equal(client.status({ desktop: false }).account.credits, 42, '字段缺失时才保留旧值');
+});
+
+test('non-auth 401/403 responses are returned without refreshing the token', async () => {
+  const auth = {
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-inflight',
+    expiresAt: Date.now() + 3600_000,
+    user: { id: 'u-queue', name: 'Queue' },
+    source: 'token',
+  };
+  for (const [status, body] of [
+    [403, { error: { message: 'queued', code: 10605 } }],
+    [401, { error: { message: '12153', code: 12153 } }],
+    [403, { error: { message: 'Billing daily count exceeded', code: 110 } }],
+    [403, { error: { message: 'quota exceeded', code: 112 } }],
+    [430, { error: { message: 'version too low', code: 430 } }],
+  ]) {
+    const client = new QoderClient({ region: 'global', log: () => {} });
+    client.setAuth(auth, { silent: true, persist: false });
+    client.listCatalog = async () => ({ models: [], at: Date.now(), staleMs: 0, error: '' });
+    let calls = 0;
+    let refreshed = 0;
+    client.transport = async () => {
+      calls += 1;
+      return {
+        ok: false,
+        status,
+        headers: { 'retry-after': '7' },
+        body: null,
+        text: async () => JSON.stringify(body),
+        drain() {},
+      };
+    };
+    client.refreshAuth = async () => { refreshed += 1; };
+    const res = await client.chat({ model: 'auto', messages: [] });
+    assert.equal(res.ok, false);
+    assert.equal(res.status, status);
+    assert.equal(res.headers['retry-after'], '7');
+    assert.equal(calls, 1, '不能为排队/日限/会话失效再打一次网关');
+    assert.equal(refreshed, 0, '不能刷新令牌');
+  }
 });
 
 test('cleanup', () => {
