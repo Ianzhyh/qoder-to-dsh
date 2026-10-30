@@ -1839,7 +1839,8 @@
         loadStatus(false);
         loadModels(false);
       }, [loadStatus, loadModels]);
-      useVisibilityPoll(() => loadStatus(false), 25_000);
+      // 深度刷新期间暂停浅轮询：后者会递增 statusSeq，把更完整的深刷新结果直接作废。
+      useVisibilityPoll(() => { if (busy !== 'status') loadStatus(false); }, 25_000);
 
       const loadUsage = useCallback(async (days, silent = false) => {
         const seq = ++usageSeq.current;
@@ -1914,7 +1915,7 @@
         setCheckinBusy(true);
         setCheckinError('');
         try {
-          const data = await postJson('/qoder/checkin/run', { key: String(key || '') });
+          const data = await postJson('/qoder/checkin/run', { key: String(key || '') }, { timeoutMs: DEEP_TIMEOUT_MS });
           if (!mounted.current) return;
           setCheckin(data);
           if (data.ok === false) {
@@ -2080,32 +2081,41 @@
 
       useEffect(() => {
         if (!device || !device.id) return undefined;
+        let settled = false;
+        let polling = false;
         const timer = setInterval(async () => {
+          if (polling || settled) return;
+          polling = true;
           try {
             const result = await postJson('/qoder/auth/poll', { id: device.id });
-            if (!mounted.current) return;
+            if (!mounted.current || settled) return;
             if (result.status === 'ready') {
+              settled = true;
               setDevice(null);
               showNotice('ok', '登录成功，模型目录已刷新。');
               notifyAuth();
             } else if (result.status === 'expired' || result.status === 'error' || result.ok === false) {
+              settled = true;
               setDevice(null);
               setError(result.error || result.message || '授权失败，请重试');
             } else {
               setDevice((prev) => (prev ? { ...prev, message: result.message || '等待浏览器完成授权' } : prev));
             }
           } catch (err) {
-            if (!mounted.current) return;
+            if (!mounted.current || settled) return;
             // 网络抖动或网关 5xx 不代表授权失效，保留会话继续轮询。
             if (!err.status || err.status >= 500) {
               setDevice((prev) => (prev ? { ...prev, message: '网络波动，正在重试授权状态…' } : prev));
               return;
             }
+            settled = true;
             setDevice(null);
             setError(String(err.message || err));
+          } finally {
+            polling = false;
           }
         }, 2200);
-        return () => clearInterval(timer);
+        return () => { settled = true; clearInterval(timer); };
       }, [device && device.id, notifyAuth, showNotice]);
 
       const run = async (label, action) => {
@@ -2186,6 +2196,8 @@
         setSavedContext(prefs.contextWindowByModel || savedContext);
         setSavedParams(prefs.paramsByModel || savedParams);
         showNotice('ok', settingsNotice(result.notified, 'display'));
+        // 选择器里的“默认/可见”来自 /qoder/models，只刷新 status 会让旧标记留到下次打开页面。
+        await loadModels(false);
         await loadStatus(false);
       });
 
@@ -2953,9 +2965,9 @@
 
           h('div', { className: 'qdr-foot-note' },
             h(Icon, { name: 'lock', size: 14 }),
-            h('span', null, '凭据文件：' + ((status.config && status.config.authPath) || '本机 dsh 数据目录') + ` · ${credentialProtection} 加密`))) : null,
+            h('span', null, '凭据文件：' + ((status && status.config && status.config.authPath) || '本机 dsh 数据目录') + ` · ${credentialProtection} 加密`))) : null,
 
-        tab === 'diagnose' ? h('div', { className: 'qdr-panel', role: 'tabpanel' },
+        tab === 'diagnose' && status ? h('div', { className: 'qdr-panel', role: 'tabpanel' },
           h('div', { className: 'qdr-card' },
             h('div', { className: 'qdr-card-head' },
               h('div', null,
@@ -3512,6 +3524,10 @@
           setAccountExtras(null);
           setQuotaTried(false);
           setData(null);
+          // 登录状态已经变了：旧的设备授权会话不再有意义，继续轮询只会拿到“已过期”。
+          setPending(null);
+          setBusy(false);
+          setError('');
           setAuthEpoch((value) => value + 1);
           loadStatus();
         };
@@ -3546,34 +3562,44 @@
       useEffect(() => {
         if (!pending) return undefined;
         let stopped = false;
+        let settled = false;
+        let polling = false;
         const timer = setInterval(async () => {
+          if (polling || settled) return;
+          polling = true;
           try {
             const result = await postJson('/qoder/auth/poll', { id: pending.id });
-            if (stopped || !alive.current) return;
+            if (stopped || settled || !alive.current) return;
             if (result.status === 'ready') {
+              settled = true;
               setPending(null);
               setBusy(false);
               setError('');
               try { window.dispatchEvent(new CustomEvent('qoder:auth-changed')); } catch { /* ignore */ }
             } else if (result.status === 'expired' || result.status === 'error' || result.ok === false) {
+              settled = true;
               setPending(null);
               setBusy(false);
               setError(result.error || '授权超时，请重试');
             }
           } catch (err) {
-            if (!stopped && alive.current) {
+            if (!stopped && !settled && alive.current) {
               // 5xx / 断网只提示，不丢弃授权会话；明确的 4xx 才结束。
               if (!err.status || err.status >= 500) setError('网络波动，正在重试授权状态…');
               else {
+                settled = true;
                 setPending(null);
                 setBusy(false);
                 setError(String(err.message || err));
               }
             }
+          } finally {
+            polling = false;
           }
         }, 2400);
         const expire = setTimeout(() => {
-          if (stopped || !alive.current) return;
+          if (stopped || settled || !alive.current) return;
+          settled = true;
           setPending(null);
           setBusy(false);
           setError('授权超时，请重试');

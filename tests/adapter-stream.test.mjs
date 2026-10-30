@@ -340,6 +340,61 @@ test('queue, daily cap and version errors include actionable hints', async () =>
   assert.match(versionFinish.reason.failure.message, /版本过低|升级/);
 });
 
+test('an error frame with an empty choices array is still an upstream error', async () => {
+  const chunks = await collect(adapterFor(fakeClient(rawBody(
+    'data: {"code":10605,"message":"queued","choices":[],"retryAfterSeconds":3}\n\ndata: [DONE]\n\n',
+  ))));
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.RATE_LIMIT);
+  assert.equal(finish.reason.failure.providerRetryAfterMs, 3000);
+  assert.match(finish.reason.failure.message, /排队/);
+});
+
+test('an interrupted tool call is never emitted as a block-end', async () => {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\\"path\\":"}}]}}]}\n\n',
+      ));
+      setTimeout(() => controller.error(new Error('socket closed')), 5);
+    },
+  });
+  const chunks = await collect(adapterFor(fakeClient(body)));
+  assert.equal(chunks.filter((chunk) => chunk.type === 'block-end' && chunk.block?.type === 'tool-call').length, 0,
+    '半截 JSON 的工具调用不能写成完整块');
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.TRANSPORT);
+});
+
+test('first-byte timeout after headers is still a TIMEOUT, not a transport drop', async () => {
+  const client = {
+    auth: { source: 'desktop' },
+    authGeneration: 0,
+    accountStamp() { return { account: 'uid:test1234' }; },
+    async chat(_payload, { signal }) {
+      // 真实客户端在守卫触发后会关闭转译流；适配器看到的是“正常结束”。
+      const body = new ReadableStream({
+        start(controller) {
+          signal.addEventListener('abort', () => {
+            try { controller.close(); } catch { /* already closed */ }
+          }, { once: true });
+        },
+      });
+      return { ok: true, status: 200, headers: {}, body, text: async () => '' };
+    },
+  };
+  const started = Date.now();
+  const chunks = await collect(adapterFor(client, { firstByteTimeoutMs: 40 }));
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.TIMEOUT);
+  assert.match(finish.reason.failure.message, /首包/);
+  assert.ok(Date.now() - started < 2000);
+  assert.equal(lastUsage().status, 'stream-error');
+});
+
 test('cleanup', () => {
   rmSync(home, { recursive: true, force: true });
 });

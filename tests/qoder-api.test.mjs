@@ -267,6 +267,32 @@ test('trial accepts a finish_reason without an outer [DONE]', async () => {
   assert.equal(result.usage.total_tokens, 3);
 });
 
+test('trial surfaces upstream error frames instead of reporting an empty reply', async () => {
+  for (const frame of [
+    { error: { message: 'Invalid JSON payload' } },
+    { code: 10605, message: 'queued', choices: [] },
+  ]) {
+    const client = new QoderClient({ region: 'global', log: () => {} });
+    const encoder = new TextEncoder();
+    client.chat = async () => ({
+      ok: true,
+      text: async () => '',
+      body: new ReadableStream({
+        start(controller) {
+          controller.enqueue(encoder.encode(`data: ${JSON.stringify(frame)}\n\n`));
+          controller.enqueue(encoder.encode('data: [DONE]\n\n'));
+          controller.close();
+        },
+      }),
+    });
+    await assert.rejects(
+      client.test({ model: 'auto', prompt: 'ping', firstByteTimeoutMs: 2000, idleTimeoutMs: 2000 }),
+      /Invalid JSON payload|queued/,
+      '上游错误不能被当成空回复',
+    );
+  }
+});
+
 test('importPat exchanges identity and stores a token-sourced account', async () => {
   const client = new QoderClient({ region: 'global', log: () => {} });
   let authChanges = 0;
@@ -1048,6 +1074,37 @@ test('non-auth 401/403 responses are returned without refreshing the token', asy
     assert.equal(calls, 1, '不能为排队/日限/会话失效再打一次网关');
     assert.equal(refreshed, 0, '不能刷新令牌');
   }
+});
+
+test('the last gateway 5xx body survives failover for diagnostics', async () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-failover',
+    expiresAt: Date.now() + 3600_000,
+    user: { id: 'u-failover', name: 'Failover' },
+    source: 'token',
+  }, { silent: true, persist: false });
+  client.listCatalog = async () => ({ models: [], at: Date.now(), staleMs: 0, error: '' });
+  let calls = 0;
+  client.transport = async () => {
+    calls += 1;
+    let drained = false;
+    return {
+      ok: false,
+      status: 503,
+      headers: {},
+      body: null,
+      drain() { drained = true; },
+      // 与 requestStream.drain() 一致：读空后 text() 只剩空串。
+      text: async () => (drained ? '' : '{"error":{"message":"upstream overloaded","code":503}}'),
+    };
+  };
+  const res = await client.chat({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] });
+  assert.equal(calls, 3, '三个候选网关都要试过');
+  assert.equal(res.status, 503);
+  assert.match(await res.text(), /upstream overloaded/, '最后一个网关的 5xx 原因不能被 drain 掉');
 });
 
 test('cleanup', () => {
