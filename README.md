@@ -1,6 +1,6 @@
 # qoder-to-dsh
 
-把 **Qoder** 的模型额度原生接进 **DeepSeek Harness (DSH)**。当前版本 **1.3.0**。
+把 **Qoder** 的模型额度原生接进 **DeepSeek Harness (DSH)**。当前版本 **1.3.1**。
 
 这是一个纯 DSH 插件：没有本地桥进程，没有第二个端口，没有独立控制台。凭据读取、COSY 签名、模型目录、流式转发和设置面板都在 DSH 插件进程内完成。
 
@@ -71,13 +71,13 @@
 从 [Releases](https://github.com/Ianzhyh/qoder-to-dsh/releases) 下载 `qoder-to-dsh-<version>.tgz`，在下载目录执行：
 
 ```bash
-dsh plugin --profile desktop add ./qoder-to-dsh-1.3.0.tgz
+dsh plugin --profile desktop add ./qoder-to-dsh-1.3.1.tgz
 ```
 
 正文里带该资产的 SHA-256，可以先核对再装。也可以在 DSH 里让 agent 直接按 URL 装：
 
 ```text
-plugin_manager { action: "install_bundle", target: "https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.3.0/qoder-to-dsh-1.3.0.tgz" }
+plugin_manager { action: "install_bundle", target: "https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.3.1/qoder-to-dsh-1.3.1.tgz" }
 ```
 
 **B. GitHub 直装（不落地文件）**
@@ -202,7 +202,7 @@ npm run verify -- --offline # 只看文件和 profile 配置
 - 不把 access token / refresh token / machineToken 写进日志、面板响应或错误消息；
 - 签到结果只保存账号标签、区域、状态和 Credits 数字，不保存任何令牌；
 - 桌面端导入的凭据临近过期时，优先只读重读官方存储；只有读不到新令牌时才用 refresh token，避免同一个 `drt-` 的轮换影响官方客户端；
-- 写接口与有副作用的 GET（`?rescan=1` / `?refresh=1` / 诊断刷新）要求 `x-qoder-panel: 1`（自定义头触发 CORS 预检，挡掉跨站简单请求）；这只防跨站与误触，不替代 dsh 自身的访问控制；
+- 写接口与有副作用的 GET（`?rescan=1` / `?refresh=1` / 诊断刷新 / 账号与模型目录读取）要求 `x-qoder-panel: 1`（自定义头触发 CORS 预检，挡掉跨站简单请求）；这只防跨站与误触，不替代 dsh 自身的访问控制；
 - 额度明细 / 升级链接只接受绝对 `http(s)` 地址，`javascript:` / `data:` / 协议相对链接会被丢弃；
 - Windows 上优先用 DPAPI；受限环境回退 AES-256-GCM 时，诊断页会如实显示「本机密钥回退」，不会继续标成 DPAPI；
 - 不新增监听端口；所有面板数据走 DSH 自己的 loopback Web 载体；
@@ -247,7 +247,7 @@ npm run verify -- --offline # 只看文件和 profile 配置
 
 每个版本的完整变更见 **[CHANGELOG.md](CHANGELOG.md)**；发布说明（含升级步骤与资产 SHA-256）见 [Releases](https://github.com/Ianzhyh/qoder-to-dsh/releases)。
 
-当前版本 `1.3.0` 把上游错误与完成度做成可信语义：10605 模型排队会按 retryAfter 自动等待，110 日限/430 版本门/12153 会话失效不再盲重试；只有思考内容、没有正文或工具调用时以 EMPTY_RESPONSE 结束；空工具名/非法参数会被拦下；额度为 0 或缺失时不再假绿；面板会提示版本漂移、说明参数生效范围，并给用量明细加试跑/账号/汇总标签。`1.2.1` 收口「静默失败与取消传播」：后台目录刷新失败会同步到面板，不再只写日志；`qoder_diagnose` 与诊断面板会响应宿主取消，签到在插件卸载/热重载后停止继续账号并取消在途请求。`1.2.0` 修「看起来成功、实际失败」与账号/用量边界：提前取消的流不再记成功、429 响应体含 credits 仍按可重试限流处理；换号/退出会取消在途请求，损坏的本地凭据不再静默切换账号；用量新增 12 个月每日汇总并把试跑单独标记，插件卸载会同步落盘；有副作用的面板 GET 需要面板头，额度链接只允许 http(s)。`1.1.4` 修「设置看起来生效、实际没生效」与账号切换竞态：温度现在真的写进上游参数、换号会清空模型目录、官方客户端的旧令牌不再覆盖插件刚刷新的令牌、目录响应中断不再变成未捕获异常、诊断不再被 20 秒客户端超时截断。`1.1.3` 修流结束、令牌刷新、换号与本地账本之间的竞态：截断的信封流不再被补成成功、并发刷新合并并隔离账号、无效 PAT 回滚、试跑取消会中止上游、目录缓存按账号隔离、清除用量不再被在途写盘复活。`1.1.2` 补齐面板在宿主刚启动、标签页在后台、账号刚切换时的行为。`1.1.1` 修掉三个「留到线上才暴露」的问题：断流被当成正常结束、不合法工具名导致整轮失败且不点名、面板请求没有超时。`1.1.0` 的要点是聊天 SSE 走持久连接、模型目录先返回后刷新、启动不再扫本机账号、凭据与用量异步落盘。详见 [v1.3.0 发布说明](docs/releases/v1.3.0.md)、[v1.2.1 发布说明](docs/releases/v1.2.1.md)、[v1.2.0 发布说明](docs/releases/v1.2.0.md)、[v1.1.4 发布说明](docs/releases/v1.1.4.md)、[v1.1.3 发布说明](docs/releases/v1.1.3.md)、[v1.1.2 发布说明](docs/releases/v1.1.2.md)、[v1.1.1 发布说明](docs/releases/v1.1.1.md) 与 [v1.1.0 发布说明](docs/releases/v1.1.0.md)。
+当前版本 `1.3.1` 收口网关切换、取消语义与面板读接口的跨站保护：网关 5xx 切换不再挂死，取消/换号不再被当成可重试的传输错误，PAT 验证失败与凭据落盘失败都会如实报错；`/qoder/account` 与 `/qoder/models` 重新要求面板头。面板同时完成动效、材质与 rem 字阶打磨，图表切区间失败会标注仍在展示旧数据。`1.3.0` 把上游错误与完成度做成可信语义：10605 模型排队会按 retryAfter 自动等待，110 日限/430 版本门/12153 会话失效不再盲重试；只有思考内容、没有正文或工具调用时以 EMPTY_RESPONSE 结束；空工具名/非法参数会被拦下；额度为 0 或缺失时不再假绿；面板会提示版本漂移、说明参数生效范围，并给用量明细加试跑/账号/汇总标签。`1.2.1` 收口「静默失败与取消传播」：后台目录刷新失败会同步到面板，不再只写日志；`qoder_diagnose` 与诊断面板会响应宿主取消，签到在插件卸载/热重载后停止继续账号并取消在途请求。`1.2.0` 修「看起来成功、实际失败」与账号/用量边界：提前取消的流不再记成功、429 响应体含 credits 仍按可重试限流处理；换号/退出会取消在途请求，损坏的本地凭据不再静默切换账号；用量新增 12 个月每日汇总并把试跑单独标记，插件卸载会同步落盘；有副作用的面板 GET 需要面板头，额度链接只允许 http(s)。`1.1.4` 修「设置看起来生效、实际没生效」与账号切换竞态：温度现在真的写进上游参数、换号会清空模型目录、官方客户端的旧令牌不再覆盖插件刚刷新的令牌、目录响应中断不再变成未捕获异常、诊断不再被 20 秒客户端超时截断。`1.1.3` 修流结束、令牌刷新、换号与本地账本之间的竞态：截断的信封流不再被补成成功、并发刷新合并并隔离账号、无效 PAT 回滚、试跑取消会中止上游、目录缓存按账号隔离、清除用量不再被在途写盘复活。`1.1.2` 补齐面板在宿主刚启动、标签页在后台、账号刚切换时的行为。`1.1.1` 修掉三个「留到线上才暴露」的问题：断流被当成正常结束、不合法工具名导致整轮失败且不点名、面板请求没有超时。`1.1.0` 的要点是聊天 SSE 走持久连接、模型目录先返回后刷新、启动不再扫本机账号、凭据与用量异步落盘。详见 [v1.3.1 发布说明](docs/releases/v1.3.1.md)、[v1.3.0 发布说明](docs/releases/v1.3.0.md)、[v1.2.1 发布说明](docs/releases/v1.2.1.md)、[v1.2.0 发布说明](docs/releases/v1.2.0.md)、[v1.1.4 发布说明](docs/releases/v1.1.4.md)、[v1.1.3 发布说明](docs/releases/v1.1.3.md)、[v1.1.2 发布说明](docs/releases/v1.1.2.md)、[v1.1.1 发布说明](docs/releases/v1.1.1.md) 与 [v1.1.0 发布说明](docs/releases/v1.1.0.md)。
 
 ## 开发
 
@@ -269,7 +269,7 @@ npm run verify:release   # 校验 tgz：产物新鲜度 / 文件清单 / 双份�
 `verify:release` 也可以传 Release 资产 URL，直接校验**已发布**的那一份（只在内存里解包，不写磁盘）：
 
 ```bash
-npm run verify:release -- https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.3.0/qoder-to-dsh-1.3.0.tgz
+npm run verify:release -- https://github.com/Ianzhyh/qoder-to-dsh/releases/download/v1.3.1/qoder-to-dsh-1.3.1.tgz
 ```
 
 第三方许可与归属信息见 [NOTICE.md](NOTICE.md)。
