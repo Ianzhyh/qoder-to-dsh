@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import https from 'node:https';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -197,6 +197,13 @@ test('catalog uses the effective price factor, not the crossed-out original pric
   assert.equal(byId['paid-model'].free, false);
 });
 
+test('a 200 error envelope is not mistaken for an empty catalog', () => {
+  assert.throws(
+    () => normalizeCatalog({ code: 105, message: 'session expired' }),
+    /模型目录响应异常/,
+  );
+});
+
 test('trial ignores literal null SSE frames instead of throwing', async () => {
   const client = new QoderClient({ region: 'global', log: () => {} });
   const encoder = new TextEncoder();
@@ -291,6 +298,15 @@ test('trial surfaces upstream error frames instead of reporting an empty reply',
       '上游错误不能被当成空回复',
     );
   }
+});
+
+test('a transient userinfo failure never reports a PAT login as ready', async () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  await withFetch(async () => { throw new Error('network down'); }, async () => {
+    await assert.rejects(client.importPat('dt-transient-token', 'global'), /令牌验证失败/);
+  });
+  assert.equal(client.auth, null);
+  assert.equal(existsSync(PATHS.auth), false, '没有验证成功的凭据不能留下半写状态');
 });
 
 test('importPat exchanges identity and stores a token-sourced account', async () => {
@@ -1074,6 +1090,44 @@ test('non-auth 401/403 responses are returned without refreshing the token', asy
     assert.equal(calls, 1, '不能为排队/日限/会话失效再打一次网关');
     assert.equal(refreshed, 0, '不能刷新令牌');
   }
+});
+
+test('gateway failover never awaits a response that was already drained', { timeout: 2500 }, async () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-failover-hang',
+    expiresAt: Date.now() + 3600_000,
+    user: { id: 'u-failover-hang', name: 'Failover Hang' },
+    source: 'token',
+  }, { silent: true, persist: false });
+  client.rawModel = () => ({ key: 'auto', display_name: 'Auto' });
+  let calls = 0;
+  let drained = false;
+  client.transport = async () => {
+    calls += 1;
+    if (calls === 1) {
+      return {
+        ok: false,
+        status: 503,
+        headers: {},
+        body: null,
+        drain() { drained = true; },
+        text() { return drained ? new Promise(() => {}) : Promise.resolve('gateway down'); },
+      };
+    }
+    const error = new Error('connect ETIMEDOUT');
+    error.code = 'ETIMEDOUT';
+    throw error;
+  };
+  const started = Date.now();
+  await assert.rejects(
+    client.chat({ model: 'auto', messages: [{ role: 'user', content: 'hi' }] }),
+    /ETIMEDOUT|连接 Qoder 失败/,
+  );
+  assert.ok(Date.now() - started < 1000, '不能在已经 drain 的旧响应上等待 text()');
+  assert.equal(calls, 3, '后续网关仍要尝试');
 });
 
 test('the last gateway 5xx body survives failover for diagnostics', async () => {

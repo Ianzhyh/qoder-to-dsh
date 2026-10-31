@@ -84,6 +84,33 @@ test('claimCampaigns claims a claimable benefit with device headers', async () =
   }
 });
 
+test('a claimed benefit with no advertised amount still counts as claimed', async () => {
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = async (url, options) => {
+    if (String(url).includes('/campaigns/') && options.method === 'POST') {
+      return new Response(JSON.stringify({ status: 'CLAIMED' }), {
+        status: 200, headers: { 'content-type': 'application/json' },
+      });
+    }
+    return new Response(JSON.stringify({ campaigns: [benefit({ benefit: {} })] }), {
+      status: 200, headers: { 'content-type': 'application/json' },
+    });
+  };
+  try {
+    const result = await claimCampaigns({
+      region: 'global',
+      getToken: async () => 'token-fixture',
+      now,
+      deviceProvider: async () => fakeDevice(),
+    });
+    assert.equal(result.status, 'claimed', '上游确认已领取，不能因为金额为 0 就报错重试');
+    assert.equal(result.credits, 0);
+    assert.match(result.message, /已领取/);
+  } finally {
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('claimCampaigns refreshes the active token once on 401', async () => {
   const originalFetch = globalThis.fetch;
   let getCount = 0;

@@ -90,3 +90,19 @@ test('retryAfterFrom prefers body milliseconds over seconds and header', () => {
 test('normalizeErrorText folds escaped quotes for matching', () => {
   assert.equal(normalizeErrorText('{\\"code\\":\\"10605\\"}'), '{"code":"10605"}');
 });
+
+test('retry hints never downgrade an exhausted daily cap to a retryable rate limit', () => {
+  assert.equal(
+    classifyError('{"code":110,"message":"daily request count limit","retryAfterSeconds":60}', 403),
+    CODE.QUOTA,
+  );
+  assert.equal(
+    classifyError('{"code":110,"message":"daily request count limit","retryAfterMs":60000}', 403),
+    CODE.QUOTA,
+  );
+});
+
+test('parameter names and RPC timeouts are not hijacked by bare keywords', () => {
+  assert.equal(classifyError('rpc error: desc = context deadline exceeded', 500), CODE.TIMEOUT);
+  assert.equal(classifyError('invalid parameter frequency_penalty', 400), CODE.INVALID);
+});

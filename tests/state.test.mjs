@@ -388,3 +388,12 @@ test('redact removes token prefixes and bearer values', () => {
   assert.ok(!text.includes('abcdefghijklmnop'));
   assert.ok(text.includes('<token>'));
 });
+
+test('creditsReport falls back to the default range for prototype keys', () => {
+  const report = creditsReport([], { range: 'constructor', now: Date.parse('2026-10-25T12:00:00+08:00') });
+  assert.equal(report.range.key, '7d');
+  assert.equal(report.range.days, 7);
+  assert.equal(report.range.label, '最近 7 天');
+  assert.match(report.range.from, /^\d{4}-\d{2}-\d{2}$/);
+  assert.match(report.range.to, /^\d{4}-\d{2}-\d{2}$/);
+});

@@ -839,7 +839,9 @@ export function apply(ctx, rawConfig = {}) {
       const result = await client.pollDeviceAuth(id);
       if (result.status === 'ready') {
         state.pendingDevice = null;
-        await directory({ refresh: true }).catch(() => {});
+        // 目录刷新可能横跨三个网关；不能让它拖住授权轮询，否则客户端先超时，
+        // 会把已经成功的登录误报成“授权超时”。
+        directory({ refresh: true }).catch(() => {});
         notifyAdaptersUpdated();
       } else if (result.status === 'expired' || result.status === 'error' || result.ok === false) {
         if (!state.pendingDevice || state.pendingDevice.id === id) state.pendingDevice = null;
@@ -877,11 +879,12 @@ export function apply(ctx, rawConfig = {}) {
         reasoningEffort = requestedEffort;
       }
       const cap = Number(raw?.max_output_tokens ?? 0) || 0;
-      const requested = Number(maxTokens) > 0
-        ? Number(maxTokens)
+      const requestedMax = Number(maxTokens);
+      const requested = Number.isFinite(requestedMax) && requestedMax > 0
+        ? Math.floor(requestedMax)
         : (Number(perModel.maxTokens) > 0
-          ? Number(perModel.maxTokens)
-          : (Number(fallback.maxTokens) > 0 ? Number(fallback.maxTokens) : DEFAULTS.providerMaxOutputTokens));
+          ? Math.floor(Number(perModel.maxTokens))
+          : (Number(fallback.maxTokens) > 0 ? Math.floor(Number(fallback.maxTokens)) : DEFAULTS.providerMaxOutputTokens));
       // 试跑与真实对话使用同一份已保存参数：只按模型上限收敛，不再额外截断。
       const budget = Math.max(16, cap ? Math.min(requested, cap) : requested);
       const temperature = typeof perModel.temperature === 'number' ? perModel.temperature : fallback.temperature;

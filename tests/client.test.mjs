@@ -124,6 +124,16 @@ test('side-effect GETs carry the panel header, plain reads do not', async () => 
   assert.equal(headers['x-qoder-panel'], undefined);
 });
 
+test('account and model reads opt into the panel header', () => {
+  const accountCalls = source.match(/getJson\('\/qoder\/account', \{ panel: true \}\)/g) || [];
+  assert.equal(accountCalls.length, 2, '面板与对话页胶囊都必须带面板头');
+  assert.match(
+    source,
+    /getJson\('\/qoder\/models' \+ \(refresh \? '\?refresh=1' : ''\), \{ panel: true \}\)/,
+    '目录读取会触发后台刷新，也必须带面板头',
+  );
+});
+
 test('safeHref only accepts absolute http(s) links', () => {
   const { exports } = loadClient(async () => jsonResponse(200, {}));
   assert.equal(exports.safeHref('https://qoder.com/usage'), 'https://qoder.com/usage');

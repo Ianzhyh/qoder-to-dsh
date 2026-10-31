@@ -89,9 +89,10 @@ export function createRouteTable({ controller, log = () => {} }) {
       path: '/qoder/models',
       handler: wrap(async (req, res) => {
         if (!allowRead(req, res)) return;
+        // 缓存过期时这条 GET 会后台拉目录并写盘；没有面板头就不触发。
+        if (!requireSideEffectGuard(req, res)) return;
         const url = new URL(req.url || '/', 'http://127.0.0.1');
         const refresh = url.searchParams.get('refresh') === '1';
-        if (refresh && !requireSideEffectGuard(req, res)) return;
         sendJson(res, 200, { ok: true, ...(await controller.directory({ refresh })) });
       }),
     },
@@ -136,6 +137,8 @@ export function createRouteTable({ controller, log = () => {} }) {
       path: '/qoder/account',
       handler: wrap(async (req, res) => {
         if (!allowRead(req, res)) return;
+        // 每次都会读上游 plan/quota，并可能在 401 时刷新令牌、落盘凭据。
+        if (!requireSideEffectGuard(req, res)) return;
         sendJson(res, 200, { ok: true, ...(await controller.account()) });
       }),
     },
@@ -251,6 +254,7 @@ export function createRouteTable({ controller, log = () => {} }) {
         if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
         if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-qoder-panel header' });
         const body = await readJsonBody(req);
+        const requestedMax = Number(body?.maxTokens);
         const abort = new AbortController();
         const onClose = () => { if (!res.writableEnded) abort.abort(new Error('试跑已取消')); };
         res.on?.('close', onClose);
@@ -260,7 +264,8 @@ export function createRouteTable({ controller, log = () => {} }) {
             ...(await controller.test({
               model: String(body?.model || ''),
               prompt: String(body?.prompt || ''),
-              maxTokens: Number(body?.maxTokens) || 0,
+              // JSON 里的 1e999 会解析成 Infinity；不能把它透传给上游。
+              maxTokens: Number.isFinite(requestedMax) && requestedMax > 0 ? Math.floor(requestedMax) : 0,
               reasoningEffort: String(body?.reasoningEffort || ''),
               signal: abort.signal,
             })),

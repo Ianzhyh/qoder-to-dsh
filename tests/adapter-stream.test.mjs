@@ -63,12 +63,13 @@ function errorClient({ status, text, headers = {} }) {
   };
 }
 
-async function collect(target) {
+async function collect(target, options = {}) {
   const chunks = [];
   for await (const chunk of target.stream({
     model: 'auto',
     messages: [{ role: 'user', content: [{ type: 'text', text: 'hi' }] }],
     maxTokens: 32,
+    ...options,
   })) chunks.push(chunk);
   return chunks;
 }
@@ -366,6 +367,74 @@ test('an interrupted tool call is never emitted as a block-end', async () => {
   const finish = chunks.find((chunk) => chunk.type === 'finish');
   assert.equal(finish.reason.kind, 'error');
   assert.equal(finish.reason.failure.code, CODE.TRANSPORT);
+});
+
+test('a clean EOF with half-built tool arguments is a retryable transport drop', async () => {
+  const body = new ReadableStream({
+    start(controller) {
+      controller.enqueue(encoder.encode(
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read_file","arguments":"{\\"path\\":"}}]}}]}\n\n',
+      ));
+      controller.close();
+    },
+  });
+  const chunks = await collect(adapterFor(fakeClient(body)));
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.TRANSPORT, 'clean EOF 没有 finish_reason，属中断而不是参数错误');
+  assert.match(finish.reason.failure.message, /中断/);
+});
+
+test('a caller abort ends as ABORTED, not a retryable TRANSPORT drop', async () => {
+  const controller = new AbortController();
+  const client = {
+    auth: { source: 'desktop' },
+    authGeneration: 0,
+    accountStamp() { return { account: 'uid:test1234', generation: 0 }; },
+    async chat(_payload, { signal }) {
+      const body = new ReadableStream({
+        start(streamController) {
+          streamController.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+          signal.addEventListener('abort', () => {
+            try { streamController.close(); } catch { /* already closed */ }
+          }, { once: true });
+        },
+      });
+      return { ok: true, status: 200, headers: {}, body, text: async () => '' };
+    },
+  };
+  const chunksPromise = collect(adapterFor(client), { signal: controller.signal });
+  setTimeout(() => controller.abort(), 10);
+  const chunks = await chunksPromise;
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'aborted');
+  assert.equal(finish.reason.failure.code, CODE.ABORTED);
+  assert.equal(lastUsage().status, 'aborted');
+});
+
+test('a clean EOF after an account switch is ABORTED, not TRANSPORT', async () => {
+  const client = {
+    auth: { source: 'desktop' },
+    authGeneration: 0,
+    accountStamp() { return { account: 'uid:test1234', generation: this.authGeneration }; },
+    async chat() {
+      const body = new ReadableStream({
+        start(streamController) {
+          streamController.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"partial"}}]}\n\n'));
+          setTimeout(() => {
+            client.authGeneration = 1;
+            try { streamController.close(); } catch { /* already closed */ }
+          }, 10);
+        },
+      });
+      return { ok: true, status: 200, headers: {}, body, text: async () => '' };
+    },
+  };
+  const chunks = await collect(adapterFor(client));
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.ABORTED);
+  assert.equal(lastUsage().status, 'aborted');
 });
 
 test('first-byte timeout after headers is still a TIMEOUT, not a transport drop', async () => {
