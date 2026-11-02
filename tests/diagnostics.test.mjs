@@ -94,7 +94,7 @@ test('diagnostic bundle masks account ids and redacts token-shaped strings', () 
         extras: { quota: { userId: '01a1544b-75db-7ec6-acbc-f80e857d525c', userQuota: { total: 10, remaining: 5, used: 5, unit: 'credits' } } },
         extrasAt: Date.now(),
       },
-      checks: [{ id: 'x', label: 'X', status: 'warn', detail: 'token dt-abcdefghijkl and Bearer eyJhbGciOiJIUzI1NiJ9abcdefghijklmnop', hint: '' }],
+      checks: [{ id: 'x', label: 'X', status: 'warn', detail: 'token dt-abcdefghijkl and Bearer eyJhbGciOiJIUzI1NiJ9abcdefghijklmnop · alice@example.com · 01a1544b-75db-7ec6-acbc-f80e857d525c', hint: '' }],
       protocol: { appVersion: '0.5.1', cliVersion: '1.1.79-hotfix.7', cosyVersion: '1.1.79-hotfix.7', oauthUa: 'Qoder/1.1.79-hotfix.7', source: {} },
       info,
     });

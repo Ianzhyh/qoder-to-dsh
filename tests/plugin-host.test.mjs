@@ -326,6 +326,9 @@ test('quotaCheck never reports missing quota data as green', () => {
   const stale = quotaCheck({ userQuota: { remaining: 5, total: 10 } }, Date.now() - 6 * 60_000);
   assert.equal(stale.status, 'warn');
   assert.match(stale.detail, /更新于/);
+  const oldBuild = quotaCheck(null, 0, Date.now(), { quota: 404 });
+  assert.equal(oldBuild.status, 'warn');
+  assert.match(oldBuild.detail, /404/);
 });
 
 test('accounts routes expose display prefs and guard writes', async () => {

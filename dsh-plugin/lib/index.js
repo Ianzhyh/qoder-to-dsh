@@ -58,17 +58,19 @@ function versionState() {
 }
 
 /** 诊断页额度结论：无数据是 warn，不是 pass。 */
-export function quotaCheck(quota, extrasAt = 0, now = Date.now()) {
+export function quotaCheck(quota, extrasAt = 0, now = Date.now(), http = null) {
   const view = quota && Array.isArray(quota.groups) && quota.totals
     ? quota
-    : normalizeQuota(quota, { at: extrasAt, now });
+    : normalizeQuota(quota, { at: extrasAt, now, http: http || {} });
   if (!view || !view.packages?.length) {
     const when = Number(extrasAt) > 0 ? `（上次成功：${new Date(Number(extrasAt)).toLocaleString('zh-CN')}）` : '';
+    const quotaHttp = Number(http?.quota) || 0;
+    const oldBuild = quotaHttp === 404 || quotaHttp === 405 ? `；额度接口返回 ${quotaHttp}，宿主可能是旧构建` : '';
     return {
       id: 'quota',
       label: '账号额度',
       status: 'warn',
-      detail: `上游未返回额度数据${when}，无法确认剩余额度。`,
+      detail: `上游未返回额度数据${when}，无法确认剩余额度${oldBuild}。`,
     };
   }
   const unit = view.packages[0]?.unit || 'credits';
@@ -78,15 +80,16 @@ export function quotaCheck(quota, extrasAt = 0, now = Date.now()) {
   const emptyWarning = (view.warnings || []).some((warning) => warning.code === 'empty');
   const oldBuild = (view.warnings || []).some((warning) => warning.code === 'oldBuild');
   let detail = quotaSummaryText(view);
+  const unknownRemaining = view.packages.some((item) => !item.unlimited && item.remainingKnown === false);
   if (view.unlimited) detail = `不限量${view.totals.used ? ` · 已用 ${view.totals.used} ${unitText}` : ''}`;
-  else if (view.totals.total > 0) detail = `剩余 ${view.totals.remaining} / ${view.totals.total} ${unitText}`;
+  else if (view.totals.total > 0 && !unknownRemaining) detail = `剩余 ${view.totals.remaining} / ${view.totals.total} ${unitText}`;
   if (view.exceeded) detail += ' · 已用尽';
   if (oldBuild) detail += ' · 额度接口返回 404/405，宿主可能是旧构建';
   if (stale) detail += ` · 数据更新于 ${new Date(Number(extrasAt)).toLocaleString('zh-CN')}`;
   return {
     id: 'quota',
     label: '账号额度',
-    status: view.exceeded || empty || emptyWarning || stale || oldBuild ? 'warn' : 'pass',
+    status: view.exceeded || empty || emptyWarning || stale || oldBuild || unknownRemaining ? 'warn' : 'pass',
     detail,
   };
 }
@@ -469,7 +472,7 @@ export function apply(ctx, rawConfig = {}) {
       try {
         const extras = await client.refreshExtras({ signal });
         if (signal?.aborted) throw signal.reason || new Error('诊断已取消');
-        checks.push(quotaCheck(extras?.quotaView || extras?.quota, extras?.at || client.extrasAt, Date.now()));
+        checks.push(quotaCheck(extras?.quotaView || extras?.quota, extras?.at || client.extrasAt, Date.now(), extras?.http));
       } catch (error) {
         if (signal?.aborted) throw error;
         checks.push({ id: 'quota', label: '账号额度', status: 'warn', detail: String(error?.message || error) });
@@ -1034,10 +1037,17 @@ export function apply(ctx, rawConfig = {}) {
         kind: target.kind,
         file: target.file,
       });
-      accountState = writeAccounts({ ...accountState, current: wanted });
+      let warning = '';
+      try {
+        accountState = writeAccounts({ ...accountState, current: wanted });
+      } catch (error) {
+        // 切换已经成功；记住当前账号失败只影响下次启动的记忆，不能报成切换失败。
+        warning = `当前账号未写入 accounts.json：${String(error?.message || error)}`;
+        log('保存当前账号失败', String(error?.message || error));
+      }
       await directory({ refresh: true }).catch(() => {});
       notifyAdaptersUpdated();
-      return { ...accountRows(), result };
+      return { ...accountRows(), result, ...(warning ? { warning } : {}) };
     },
     pats: async () => patSnapshot(),
     switchPat: async ({ id } = {}) => {
@@ -1047,10 +1057,17 @@ export function apply(ctx, rawConfig = {}) {
       if (!entry) throw badRequest('PAT 不存在；刷新列表后重试');
       const result = await client.importPat(entry.pat, entry.region);
       const next = upsertPat(store, { ...entry, lastUsedAt: Date.now() });
-      await writePatStore(next);
+      let warning = '';
+      try {
+        await writePatStore(next);
+      } catch (error) {
+        // 切换已经成功；凭据库只影响下次能否免粘贴，不能把登录结果报成失败。
+        warning = `上次使用时间未写入凭据库：${String(error?.message || error)}`;
+        log('更新 PAT 上次使用时间失败', String(error?.message || error));
+      }
       await directory({ refresh: true }).catch(() => {});
       notifyAdaptersUpdated();
-      return { ...patSnapshot(next), result };
+      return { ...patSnapshot(next), result, ...(warning ? { warning } : {}) };
     },
     deletePat: async ({ id } = {}) => {
       const store = readPatStore();
@@ -1101,6 +1118,7 @@ export function apply(ctx, rawConfig = {}) {
             organizationId: auth.organizationId || '',
             organizationName: auth.organizationName || '',
             label: auth.user?.name || auth.user?.email || '',
+            lastUsedAt: Date.now(),
           });
           await writePatStore(next);
           savedPat = true;
@@ -1115,6 +1133,9 @@ export function apply(ctx, rawConfig = {}) {
     },
     logout: async () => {
       const result = await client.logout();
+      try { accountState = writeAccounts({ ...accountState, current: '' }); } catch (error) {
+        log('清除当前账号记录失败', String(error?.message || error));
+      }
       adapter.invalidate();
       adapter.catalogCache = { at: 0, models: [], error: '', staleMs: 0 };
       notifyAdaptersUpdated();

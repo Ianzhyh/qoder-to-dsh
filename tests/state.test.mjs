@@ -56,7 +56,7 @@ test('summarizeUsage produces 14 buckets and today totals', () => {
 test('summarizeUsage aggregates a window and per-model breakdown', () => {
   const now = Date.parse('2026-10-25T12:00:00+08:00');
   const summary = summarizeUsage([
-    { at: now, model: 'alpha', promptTokens: 100, completionTokens: 50, totalTokens: 150, credits: 0.2, cachedTokens: 20, reasoningTokens: 10, latencyMs: 1000, firstByteMs: 100, ok: true },
+    { at: now, model: 'alpha', promptTokens: 100, completionTokens: 50, totalTokens: 150, credits: 0.2, savedCredits: 0.02, cachedTokens: 20, reasoningTokens: 10, latencyMs: 1000, firstByteMs: 100, ok: true },
     { at: now - 2000, model: 'alpha', totalTokens: 50, credits: 0.1, latencyMs: 500, firstByteMs: 50, ok: false },
     { at: now - 86400000, model: 'beta', promptTokens: 80, completionTokens: 20, totalTokens: 100, credits: 0.05, latencyMs: 700, firstByteMs: 70, ok: true },
     { at: now - 40 * 86400000, model: 'old', totalTokens: 999, credits: 9, ok: true },
@@ -80,6 +80,7 @@ test('summarizeUsage aggregates a window and per-model breakdown', () => {
   assert.equal(alpha.share, 200 / 300);
   assert.equal(summary.byModel[1].share, 100 / 300);
   assert.equal(summary.days[summary.days.length - 1].credits, 0.3);
+  assert.equal(summary.days[summary.days.length - 1].savedCredits, 0.02);
 });
 
 test('creditsReport builds range series and a 12-month heatmap', () => {

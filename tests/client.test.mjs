@@ -311,3 +311,21 @@ test('CSV cells guard formula injection, quotes and newlines', async () => {
   assert.match(csv, /"'=HYPERLINK\(""http:\/\/x""\)"/);
   assert.match(csv, /\r\n/);
 });
+
+test('account reorder skips hidden rows and stops at visible edges', async () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  // 可见 A/B/C，隐藏 H 插在 A/B 之间：B 上移应与 A 交换，而不是和 H 空转。
+  assert.deepEqual(exports.moveAccountKey(['A', 'B', 'C'], ['A', 'H', 'B', 'C'], 'B', -1), ['B', 'H', 'A', 'C']);
+  // C 下移时已经没有下一个可见行，不能被隐藏行吞掉。
+  assert.equal(exports.moveAccountKey(['A', 'B', 'C'], ['A', 'H', 'B', 'C'], 'C', 1), null);
+  assert.equal(exports.moveAccountKey(['A'], ['A'], 'A', -1), null);
+  assert.equal(exports.moveAccountKey([], [], 'A', 1), null);
+});
+
+test('unlimited quota pill never renders -1', async () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  assert.equal(exports.quotaPillText({ unlimited: true, remaining: -1, total: -1 }), '∞ / 不限量');
+  assert.equal(exports.quotaPillText({ unlimited: false, remaining: 5, total: 10 }), '5 / 10');
+  assert.equal(exports.quotaPillText({ unlimited: false, remaining: 0, total: 10, remainingKnown: false }), '— / 10');
+  assert.equal(exports.quotaPillText(null), '');
+});

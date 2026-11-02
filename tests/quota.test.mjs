@@ -112,10 +112,21 @@ test('quota expiry marks the 7-day window and expired packs', () => {
   assert.equal(expired.expired, true);
   assert.equal(expired.expiringSoon, false);
   assert.equal(expired.daysToExpiry, -2);
+
+  const justExpired = normalizeQuota({
+    userQuota: { total: 10, remaining: 0, used: 10, unit: 'credits' },
+    expiresAt: now - 3600000,
+  }, { now });
+  assert.equal(justExpired.expired, true, '过期不足一天也必须标 expired');
+  assert.equal(justExpired.expiringSoon, false);
+  assert.equal(justExpired.daysToExpiry, -1);
 });
 
 test('missing payload stays missing instead of a fake zero', () => {
   assert.equal(normalizeQuota(null), null);
+  const unknownRemaining = normalizeQuota({ userQuota: { total: 10, used: 0 } });
+  assert.equal(unknownRemaining.packages[0].remainingKnown, false, '只有 total 没有 remaining 时不能当成 0');
+  assert.match(quotaSummaryText(unknownRemaining), /剩余未知/);
   const empty = normalizeQuota({ userQuota: null, addOnQuota: null });
   assert.equal(empty.packages.length, 0);
   assert.ok(empty.warnings.some((warning) => warning.code === 'empty'));

@@ -38,6 +38,21 @@
       }
     }
 
+    // 账号排序只在可见行之间移动；隐藏账号保留在原相对位置，不会出现
+    // 「点下移没反应，因为下一个槽位是隐藏账号」。
+    function moveAccountKey(visibleKeys, allKeys, key, delta) {
+      const visible = Array.isArray(visibleKeys) ? visibleKeys : [];
+      const index = visible.indexOf(key);
+      const target = index + (Number(delta) || 0);
+      if (index < 0 || target < 0 || target >= visible.length) return null;
+      const all = Array.isArray(allKeys) && allKeys.length ? allKeys.slice() : visible.slice();
+      const from = all.indexOf(key);
+      const to = all.indexOf(visible[target]);
+      if (from < 0 || to < 0) return null;
+      [all[from], all[to]] = [all[to], all[from]];
+      return all;
+    }
+
     // CSV 单元格：公式注入（= + - @ 制表/回车开头）前置单引号，引号双写。
     function csvCell(value) {
       const text = value === null || value === undefined ? '' : String(value);
@@ -364,13 +379,15 @@
     function quotaSummary(extras) {
       const view = extras && extras.quotaView;
       if (view) {
-        const user = view.packages.find((item) => item.source === 'userQuota') || view.packages[0] || null;
+        if (!Array.isArray(view.packages) || view.packages.length === 0 || !view.totals) return null;
+        const user = view.packages.find((item) => item.source === 'userQuota') || null;
         const addOn = view.packages.find((item) => item.source === 'addOnQuota') || null;
         const at = Number(view.at) || Number(extras.at) || 0;
         return {
           total: view.unlimited ? -1 : view.totals.total,
           used: view.totals.used,
           remaining: view.unlimited ? -1 : view.totals.remaining,
+          remainingKnown: (view.packages || []).every((item) => item.unlimited || item.remainingKnown),
           ratio: view.ratio,
           unit: (user && user.unit) || (addOn && addOn.unit) || 'credits',
           exceeded: view.exceeded,
@@ -412,6 +429,7 @@
         total,
         used,
         remaining,
+        remainingKnown: true,
         ratio,
         unit: (user && user.unit) || (addOn && addOn.unit) || 'credits',
         exceeded: quota.isQuotaExceeded === true,
@@ -426,6 +444,13 @@
         at,
         stale: Boolean(at && Date.now() - at > 5 * 60_000),
       };
+    }
+
+    function quotaPillText(quota) {
+      if (!quota) return '';
+      if (quota.unlimited) return '∞ / 不限量';
+      if (quota.remainingKnown === false) return `— / ${money(quota.total)}`;
+      return `${money(quota.remaining)} / ${money(quota.total)}`;
     }
 
     function Icon({ name, size = 16, strokeWidth = 1.7 }) {
@@ -710,11 +735,15 @@
           h('div', { className: 'qdr-quota-empty' }, '尚未连接 Qoder'));
       }
       if (!info) {
+        const oldBuild = extras && extras.http && (Number(extras.http.quota) === 404 || Number(extras.http.quota) === 405);
         return h('div', { className: `qdr-card qdr-quota${wide ? ' qdr-quota-wide' : ''}` },
           h('div', { className: 'qdr-card-head' },
             h('div', null,
               h('div', { className: 'qdr-card-title' }, '额度'),
-              h('div', { className: 'qdr-card-sub' }, busy ? '正在读取账号额度…' : '上游额度还没读到。刷新账号信息即可获取。')),
+              h('div', { className: 'qdr-card-sub' },
+                busy ? '正在读取账号额度…'
+                  : oldBuild ? '额度接口返回 404/405：宿主可能是旧构建，完全退出 dsh 再打开。'
+                    : '上游额度还没读到。刷新账号信息即可获取。')),
             h(Button, { size: 'sm', icon: 'refresh', disabled: Boolean(busy), onClick: onRefresh }, busy ? '读取中…' : '刷新')),
           busy
             ? h('div', { className: 'qdr-skeleton', style: { marginTop: '12px' } },
@@ -729,10 +758,13 @@
       const mismatch = (info.warnings || []).some((warning) => warning.code === 'accountMismatch');
       const oldBuild = (info.warnings || []).some((warning) => warning.code === 'oldBuild');
       const groupRows = Array.isArray(info.groups) ? info.groups : [];
-      const showGroups = groupRows.length > 2 || groupRows.some((group) => group.packages.length > 1);
+      const showGroups = (info.packages || []).some((item) => item.source !== 'userQuota' && item.source !== 'addOnQuota')
+        || groupRows.length > 2
+        || groupRows.some((group) => Array.isArray(group.packages) && group.packages.length > 1);
       const packValue = (pack) => {
         if (!pack) return '—';
         if (pack.unlimited) return '∞';
+        if (!pack.remainingKnown) return '—';
         if (!pack.total && !pack.remaining) return '0 / 0';
         return `${money(pack.remaining)} / ${money(pack.total)}`;
       };
@@ -758,7 +790,7 @@
             h(Button, { size: 'sm', icon: 'refresh', disabled: Boolean(busy), onClick: onRefresh }, busy ? '读取中…' : '刷新'),
             onAccount ? h(Button, { size: 'sm', variant: 'ghost', onClick: onAccount }, '账号') : null)),
         h('div', { className: 'qdr-quota-big' },
-          h('strong', null, unlimited ? '∞' : money(info.remaining)),
+          h('strong', null, unlimited ? '∞' : info.remainingKnown === false ? '—' : money(info.remaining)),
           h('span', { className: 'qdr-quota-total' }, unlimited ? ' 不限量' : ` / ${money(info.total)} ${unitText}`),
           unlimited ? null : h('span', { className: `qdr-quota-pct qdr-quota-pct-${tone}` }, `${percent}% 已用`)),
         unlimited ? null : h(Meter, { value: info.ratio, tone, label: '账号额度使用进度' }),
@@ -2033,6 +2065,9 @@
           if (!mounted.current || seq !== requestSeq.current) return;
           setRequests(data);
           setRequestsError('');
+          // 切时间窗口后，筛选的模型可能已经不在窗口里；不重置的话下拉会显示
+          // “全部模型”但状态仍按旧模型过滤，结果一直是空的。
+          if (model && Array.isArray(data.models) && !data.models.includes(model)) setRequestModel('');
         } catch (err) {
           if (!mounted.current || seq !== requestSeq.current) return;
           const message = String(err.message || err);
@@ -2124,8 +2159,15 @@
             if (!mounted.current) return;
             if (data.ok === false) throw new Error(data.error || '切换失败');
             applyAccountPayload(data);
+            setPats((previous) => (previous ? {
+              ...previous,
+              entries: previous.entries.map((entry) => ({ ...entry, active: false })),
+            } : previous));
+            setPatStoreError('');
             setSwitcherOpen(false);
-            showNotice('ok', `已切换到 ${row.name || row.alias || '本机账号'}`);
+            showNotice('ok', data.warning
+              ? `已切换到 ${row.name || row.alias || '本机账号'}；${data.warning}`
+              : `已切换到 ${row.name || row.alias || '本机账号'}`);
             notifyAuth();
           })
           .catch((err) => {
@@ -2157,7 +2199,7 @@
           if (data.ok === false) throw new Error(data.error || '切换失败');
           setPats(data);
           setShowPat(false);
-          showNotice('ok', '已切换 PAT 账号');
+          showNotice('ok', data.warning ? `已切换 PAT 账号；${data.warning}` : '已切换 PAT 账号');
           notifyAuth();
         } catch (err) {
           if (mounted.current) setPatStoreError(String(err.message || err));
@@ -2350,6 +2392,7 @@
           setExpanded('');
           setEditorDirty(false);
           setPatError('');
+          setPatStoreError('');
           setModelError(null);
           setSearch('');
           setFilter('all');
@@ -2363,6 +2406,7 @@
           loadStatus(false);
           loadModels(false);
           loadCheckin(true);
+          if (tab === 'account') loadPats();
           if (tab === 'usage') {
             loadUsage(14);
             loadCredits(creditsRange);
@@ -2370,7 +2414,7 @@
         };
         window.addEventListener('qoder:auth-changed', onAuth);
         return () => window.removeEventListener('qoder:auth-changed', onAuth);
-      }, [loadStatus, loadModels, loadCheckin, loadUsage, loadCredits, tab, creditsRange]);
+      }, [loadStatus, loadModels, loadCheckin, loadPats, loadUsage, loadCredits, tab, creditsRange]);
 
       useEffect(() => {
         if (tab !== 'checkin' && tab !== 'account' && !(tab === 'overview' && status && status.signedIn)) return;
@@ -2482,7 +2526,12 @@
           if (!result.ok) throw new Error(result.error || 'PAT 登录失败');
           setPat('');
           setShowPat(false);
-          showNotice('ok', result.savedPat ? '登录成功，PAT 已保存到凭据库。' : '登录成功，模型目录已刷新。');
+          const isPat = pat.trim().startsWith('pt-');
+          showNotice('ok', result.savedPat
+            ? '登录成功，PAT 已保存到凭据库。'
+            : isPat
+              ? '登录成功，但 PAT 未保存到凭据库；诊断页可查看原因。'
+              : '登录成功，模型目录已刷新。');
           notifyAuth();
           await loadPats();
         } catch (err) {
@@ -2703,11 +2752,18 @@
       const signedIn = Boolean(status && status.signedIn);
       const versionText = status ? versionNotice(status.version, status.installedVersion) : '';
       const clientUpgrade = status && status.client ? status.client.upgrade : null;
+      const clientFrom = clientUpgrade
+        ? (clientUpgrade.from !== clientUpgrade.to ? clientUpgrade.from : (clientUpgrade.fromCli || clientUpgrade.from))
+        : '';
+      const clientTo = clientUpgrade
+        ? (clientUpgrade.from !== clientUpgrade.to ? clientUpgrade.to : (clientUpgrade.toCli || clientUpgrade.to))
+        : '';
       const credentialProtection = (status && status.config && status.config.credentialProtection) || '本机密钥';
       const today = (status && status.usage && status.usage.today) || {};
       const usageSummary = usage && usage.summary;
       const usageTotals = (usageSummary && usageSummary.totals) || null;
       const usageByModel = (usageSummary && usageSummary.byModel) || [];
+      const usageByAccount = (usageSummary && usageSummary.byAccount) || [];
       const usageDayBuckets = (usageSummary && usageSummary.days) || [];
       const recentAll = (usage && usage.recent) || [];
       const recent = usageFilter === 'all' ? recentAll
@@ -2833,12 +2889,11 @@
       const switchRows = useMemo(() => accountRows.filter((row) => !row.hidden), [accountRows]);
 
       const moveAccount = (row, delta) => {
-        const keys = [...accountRows, ...hiddenAccountRows].map((item) => item.key);
-        const index = keys.indexOf(row.key);
-        const next = index + delta;
-        if (index < 0 || next < 0 || next >= keys.length) return;
-        [keys[index], keys[next]] = [keys[next], keys[index]];
-        saveAccountPrefs({ order: keys }, '账号顺序已保存');
+        const visibleKeys = accountRows.map((item) => item.key);
+        const allKeys = [...accountRows, ...hiddenAccountRows].map((item) => item.key);
+        const next = moveAccountKey(visibleKeys, allKeys, row.key, delta);
+        if (!next) return;
+        saveAccountPrefs({ order: next }, '账号顺序已保存');
       };
 
       const toggleAccountHidden = (row, hidden) => {
@@ -2920,7 +2975,7 @@
 
         clientUpgrade && !clientBannerClosed ? h('div', { className: 'qdr-banner qdr-banner-warn', role: 'status' },
           h(Icon, { name: 'alert', size: 15 }),
-          h('span', null, `Qoder 客户端已从 ${clientUpgrade.from || '旧版本'} 升级到 ${clientUpgrade.to || '新版本'}。若出现 401 或额度异常，请先在官方客户端重新登录，再完全退出并重启 dsh。`),
+          h('span', null, `Qoder 客户端已从 ${clientFrom || '旧版本'} 升级到 ${clientTo || '新版本'}。若出现 401 或额度异常，请先在官方客户端重新登录，再完全退出并重启 dsh。`),
           h('button', { type: 'button', className: 'qdr-banner-x', onClick: () => setClientBannerClosed(true), 'aria-label': '关闭客户端升级提示' }, h(Icon, { name: 'close', size: 13 }))) : null,
 
         !status ? (statusError
@@ -3271,6 +3326,27 @@
               h('div', { className: 'qdr-card' },
                 h('div', { className: 'qdr-card-head' },
                   h('div', null,
+                    h('div', { className: 'qdr-card-title' }, '按账号'),
+                    h('div', { className: 'qdr-card-sub' }, '窗口内 tokens 占比；用于判断额度花在哪个账号。')),
+                  h('span', { className: 'qdr-chart-peak' }, `${usageByAccount.length} 个账号${usageByAccount.length > 8 ? ' · 显示前 8' : ''}`)),
+                usageByAccount.length ? h('div', { className: 'qdr-model-stats' },
+                  usageByAccount.slice(0, 8).map((item) => h('div', { className: 'qdr-model-stat', key: item.account || item.label },
+                    h('div', { className: 'qdr-model-stat-head' },
+                      h('div', { className: 'qdr-model-stat-name' },
+                        h('strong', null, item.label || (String(item.account || '').startsWith('uid:') ? `uid …${String(item.account).slice(-8)}` : (item.account || '未知账号')))),
+                      h('div', { className: 'qdr-model-stat-nums' },
+                        h('strong', null, pct(item.share)),
+                        h('span', null, `${item.requests} 次`))),
+                    h(Meter, { value: item.share, label: `${item.label || item.account} tokens 占比` }),
+                    h('div', { className: 'qdr-model-stat-meta' },
+                      h('span', null, `${compact(item.tokens)} tokens`),
+                      item.credits ? h('span', null, `${money(item.credits)} Credits`) : h('span', null, '0 Credits'),
+                      item.cachedTokens ? h('span', null, `缓存 ${compact(item.cachedTokens)}`) : null,
+                      h('span', null, `成功率 ${pct(item.successRate)}`)))))
+                  : h('div', { className: 'qdr-quiet' }, '窗口内还没有账号用量。')),
+              h('div', { className: 'qdr-card' },
+                h('div', { className: 'qdr-card-head' },
+                  h('div', null,
                     h('div', { className: 'qdr-card-title' }, '请求明细'),
                     h('div', { className: 'qdr-card-sub' },
                       `显示最近 ${recentShown.length} 条${recent.length > recentShown.length ? `（匹配 ${recent.length} 条）` : ''} · 只记录元数据，不含对话内容`)),
@@ -3423,6 +3499,7 @@
                     }) : h('strong', null, row.name),
                     row.alias ? h(Badge, { tone: 'accent' }, '别名') : null,
                     row.current ? h(Badge, { tone: 'green' }, '当前') : null,
+                    row.hidden ? h(Badge, { tone: 'amber' }, '已隐藏') : null,
                     row.planLabel ? h(Badge, { tone: 'accent' }, row.planLabel) : null,
                     checkinInfoMeta ? h(Badge, { tone: checkinInfoMeta.tone }, checkinAccountStatus(checkinInfo)) : null),
                   h('div', { className: 'qdr-account-meta' }, meta),
@@ -3443,10 +3520,16 @@
                     type: 'button', className: 'qdr-text-btn',
                     onClick: () => setAccountEditing(editing ? '' : row.key),
                   }, editing ? '取消' : '改名'),
-                  h('button', {
-                    type: 'button', className: 'qdr-text-btn', disabled: Boolean(accountActionBusy),
-                    onClick: () => toggleAccountHidden(row, true),
-                  }, '隐藏'),
+                  row.hidden
+                    ? h('button', {
+                      type: 'button', className: 'qdr-text-btn', disabled: Boolean(accountActionBusy),
+                      title: '当前账号被隐藏；恢复后仍保持当前账号',
+                      onClick: () => toggleAccountHidden(row, false),
+                    }, '恢复')
+                    : h('button', {
+                      type: 'button', className: 'qdr-text-btn', disabled: Boolean(accountActionBusy),
+                      onClick: () => toggleAccountHidden(row, true),
+                    }, '隐藏'),
                   row.current
                     ? h(Badge, { tone: 'green' }, '当前账号')
                     : h(Button, {
@@ -3499,7 +3582,7 @@
                 h('div', { className: 'qdr-card-title' }, 'PAT 凭据',
                   pats && pats.count ? h(Badge, { tone: 'neutral' }, `${pats.count} 个`) : null),
                 h('div', { className: 'qdr-card-sub' }, '加密保存在本机；切换会重新换取短期令牌，面板不返回 PAT。')),
-              h(Button, { size: 'sm', icon: 'refresh', disabled: !pats && Boolean(patBusy), onClick: loadPats }, '刷新')),
+              h(Button, { size: 'sm', icon: 'refresh', disabled: Boolean(patBusy), onClick: loadPats }, '刷新')),
             patStoreError ? h('div', { className: 'qdr-inline-warn', role: 'alert' }, h('span', null, `PAT 凭据库：${patStoreError}`)) : null,
             pats && pats.entries && pats.entries.length ? h('div', { className: 'qdr-pat-list' }, pats.entries.map((entry) => h('div', { className: 'qdr-pat-row', key: entry.id },
               h('div', { className: 'qdr-account-mark' }, 'P'),
@@ -3963,7 +4046,7 @@
 .qdr-usage-error>span{flex:1;min-width:0}
 .qdr-usage-error .qdr-text-btn{color:inherit;flex:none}
 .qdr-req-scroll{overflow-x:auto;margin-top:10px;border:1px solid var(--qdr-line);border-radius:9px}
-.qdr-req-table{width:100%;border-collapse:collapse;font-size:0.65625rem;min-width:760px}
+.qdr-req-table{width:100%;border-collapse:collapse;font-size:0.65625rem;min-width:860px}
 .qdr-req-table th{text-align:left;font-weight:600;color:var(--qdr-faint);padding:7px 9px;border-bottom:1px solid var(--qdr-line);background:var(--qdr-soft);white-space:nowrap}
 .qdr-req-table td{padding:7px 9px;border-bottom:1px solid var(--qdr-line);vertical-align:top;white-space:nowrap}
 .qdr-req-table tr:last-child td{border-bottom:none}
@@ -4177,7 +4260,7 @@
 .qdr-panel-overview>*:not(.qdr-account-menu):not(.qdr-savebar):nth-child(6){animation-delay:.22s}
 @media (prefers-reduced-transparency:reduce){.qdr-account-menu,.qdr-select-menu{background:var(--qdr-card);backdrop-filter:none;-webkit-backdrop-filter:none}}
 @container qdr (max-width:720px){.qdr-stats{grid-template-columns:repeat(2,minmax(0,1fr))}.qdr-stats-6{grid-template-columns:repeat(2,minmax(0,1fr))}.qdr-grid-2{grid-template-columns:1fr}.qdr-signin-aside{display:none}.qdr-skel-grid{grid-template-columns:repeat(2,1fr)}.qdr-fields{grid-template-columns:1fr}.qdr-quota-grid{grid-template-columns:repeat(2,minmax(0,1fr))}.qdr-usage-id{max-width:100%}.qdr-usage-time{margin-left:0}.qdr-usage-model{max-width:100%}.qdr-editor-hint{margin-left:0;width:100%}.qdr-checkin-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.qdr-account-menu-head{flex-direction:column}.qdr-checkin-actions{width:100%;justify-content:flex-end}}
-@container qdr (max-width:520px){.qdr-root{font-size:0.78125rem}.qdr-subtitle{white-space:normal}.qdr-head{align-items:flex-start}.qdr-title{font-size:1rem}.qdr-stat-value{font-size:1rem}.qdr-model{padding:10px}.qdr-model-name{white-space:normal}.qdr-toolbar{align-items:stretch}.qdr-search{min-width:100%}.qdr-chips{overflow-x:auto;flex-wrap:nowrap;padding-bottom:1px}.qdr-chip{flex:none}.qdr-savebar{align-items:flex-start}.qdr-savebar-actions{width:100%;justify-content:flex-end}.qdr-signin{padding:13px}.qdr-signin-mark{width:30px;height:30px}.qdr-card{padding:12px}.qdr-card-actions{width:100%;justify-content:flex-end}.qdr-quota-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.qdr-quota-big strong{font-size:1.3125rem}.qdr-quota-pct{margin-left:0;width:100%}.qdr-editor{padding:11px}.qdr-model-stat-head{flex-direction:column;gap:3px}.qdr-model-stat-nums{width:100%;justify-content:space-between}.qdr-usage-head{align-items:flex-start}.qdr-usage-tools{width:100%;justify-content:space-between}.qdr-trial-form .qdr-select{max-width:none}.qdr-trial-actions{align-items:flex-start}.qdr-usage-top{row-gap:3px}.qdr-quota-wide{padding:12px}.qdr-quota-wide .qdr-quota-big strong{font-size:1.625rem}.qdr-checkin-actions{width:100%;justify-content:space-between}.qdr-checkin-actions .qdr-switch{grid-column:1/-1;justify-self:start;width:auto}.qdr-credits-toolbar{align-items:flex-start}.qdr-credits-mode{width:110px}.qdr-checkin-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.qdr-checkin-account{align-items:flex-start;flex-wrap:wrap}.qdr-checkin-account>button{width:100%;justify-content:center}.qdr-checkin-time{margin-left:0}.qdr-checkin-mini-big em{margin-left:0;width:100%}.qdr-account-actions{width:100%;justify-content:flex-end}.qdr-account-strip{flex-wrap:wrap}.qdr-account-main{flex:1 1 190px}.qdr-account-menu-title strong{white-space:normal}.qdr-account-row{flex-wrap:wrap}.qdr-account-row>button{width:100%;justify-content:center;margin-top:2px}.qdr-account-row>button:disabled{width:auto;align-self:flex-end;justify-content:flex-end}.qdr-account-title strong{white-space:normal}.qdr-account-row .qdr-account-meta{white-space:normal;overflow-wrap:anywhere}.qdr-account-list-foot{align-items:flex-start}.qdr-account-foot-actions{width:100%;justify-content:flex-end}.qdr-heat{--qdr-heat-cell:5px}.qdr-credits-toolbar{flex-direction:column;align-items:stretch}.qdr-credits-toolbar>button{align-self:flex-end}.qdr-chart-axis-label{font-size:1rem}.qdr-checkin-account>button:disabled{width:auto;justify-content:flex-end;align-self:flex-end}.qdr-checkin-actions{display:grid;grid-template-columns:auto 1fr;gap:6px}.qdr-checkin-actions .qdr-switch{grid-column:1/-1;justify-self:start;width:auto}.qdr-checkin-actions>button:last-child{justify-self:end}.qdr-range-display{width:100%;justify-content:flex-start}.qdr-credits-toolbar .qdr-chips{width:100%;overflow-x:auto;flex-wrap:nowrap}.qdr-credits-mode{width:100%}.qdr-credits-total{font-size:1.5rem}.qdr-credits-heat-card,.qdr-credits-card{padding:12px}}
+@container qdr (max-width:520px){.qdr-root{font-size:0.78125rem}.qdr-subtitle{white-space:normal}.qdr-head{align-items:flex-start}.qdr-title{font-size:1rem}.qdr-stat-value{font-size:1rem}.qdr-model{padding:10px}.qdr-model-name{white-space:normal}.qdr-toolbar{align-items:stretch}.qdr-search{min-width:100%}.qdr-chips{overflow-x:auto;flex-wrap:nowrap;padding-bottom:1px}.qdr-chip{flex:none}.qdr-savebar{align-items:flex-start}.qdr-savebar-actions{width:100%;justify-content:flex-end}.qdr-signin{padding:13px}.qdr-signin-mark{width:30px;height:30px}.qdr-card{padding:12px}.qdr-card-actions{width:100%;justify-content:flex-end}.qdr-quota-grid{grid-template-columns:repeat(3,minmax(0,1fr))}.qdr-quota-big strong{font-size:1.3125rem}.qdr-quota-pct{margin-left:0;width:100%}.qdr-editor{padding:11px}.qdr-model-stat-head{flex-direction:column;gap:3px}.qdr-model-stat-nums{width:100%;justify-content:space-between}.qdr-usage-head{align-items:flex-start}.qdr-usage-tools{width:100%;justify-content:space-between}.qdr-trial-form .qdr-select{max-width:none}.qdr-trial-actions{align-items:flex-start}.qdr-usage-top{row-gap:3px}.qdr-quota-wide{padding:12px}.qdr-quota-wide .qdr-quota-big strong{font-size:1.625rem}.qdr-checkin-actions{width:100%;justify-content:space-between}.qdr-checkin-actions .qdr-switch{grid-column:1/-1;justify-self:start;width:auto}.qdr-credits-toolbar{align-items:flex-start}.qdr-credits-mode{width:110px}.qdr-checkin-summary{grid-template-columns:repeat(2,minmax(0,1fr))}.qdr-checkin-account{align-items:flex-start;flex-wrap:wrap}.qdr-checkin-account>button{width:100%;justify-content:center}.qdr-checkin-time{margin-left:0}.qdr-checkin-mini-big em{margin-left:0;width:100%}.qdr-account-actions{width:100%;justify-content:flex-end}.qdr-account-strip{flex-wrap:wrap}.qdr-account-main{flex:1 1 190px}.qdr-account-menu-title strong{white-space:normal}.qdr-account-row{flex-wrap:wrap}.qdr-account-row>button{width:100%;justify-content:center;margin-top:2px}.qdr-account-row>button:disabled{width:auto;align-self:flex-end;justify-content:flex-end}.qdr-account-title strong{white-space:normal}.qdr-account-row .qdr-account-meta{white-space:normal;overflow-wrap:anywhere}.qdr-account-list-foot{align-items:flex-start}.qdr-account-foot-actions{width:100%;justify-content:flex-end}.qdr-pat-row{flex-wrap:wrap}.qdr-pat-row .qdr-account-row-actions{width:100%;max-width:none;justify-content:flex-end}.qdr-heat{--qdr-heat-cell:5px}.qdr-credits-toolbar{flex-direction:column;align-items:stretch}.qdr-credits-toolbar>button{align-self:flex-end}.qdr-chart-axis-label{font-size:1rem}.qdr-checkin-account>button:disabled{width:auto;justify-content:flex-end;align-self:flex-end}.qdr-checkin-actions{display:grid;grid-template-columns:auto 1fr;gap:6px}.qdr-checkin-actions .qdr-switch{grid-column:1/-1;justify-self:start;width:auto}.qdr-checkin-actions>button:last-child{justify-self:end}.qdr-range-display{width:100%;justify-content:flex-start}.qdr-credits-toolbar .qdr-chips{width:100%;overflow-x:auto;flex-wrap:nowrap}.qdr-credits-mode{width:100%}.qdr-credits-total{font-size:1.5rem}.qdr-credits-heat-card,.qdr-credits-card{padding:12px}}
 `;
       document.head.appendChild(style);
       return () => { try { style.remove(); } catch { /* ignore */ } };
@@ -4344,8 +4427,9 @@
         : (accountExtras || statusExtras);
       const quota = quotaSummary(extras);
       const low = quota && (quota.exceeded || quota.ratio >= 0.9 || quota.expiringSoon || quota.expired);
+      const quotaText = quotaPillText(quota);
       const title = quota
-        ? `Qoder 额度：${money(quota.remaining)} / ${money(quota.total)} ${quota.unit} · 已用 ${Math.round(quota.ratio * 100)}%${quota.at ? ` · 更新于 ${stamp(quota.at)}` : ''}${quota.expiresAt ? ` · ${dateLabel(quota.expiresAt)} 到期${quota.expired ? '（已过期）' : quota.expiringSoon ? `（${quota.daysToExpiry === 0 ? '今天' : `${quota.daysToExpiry} 天后`}）` : ''}` : ''} · 今日 ${today.requests || 0} 次（设置 → Qoder）`
+        ? `Qoder 额度：${quotaText}${quota.unlimited ? '' : ` ${quota.unit} · 已用 ${Math.round(quota.ratio * 100)}%`}${quota.at ? ` · 更新于 ${stamp(quota.at)}` : ''}${quota.expiresAt ? ` · ${dateLabel(quota.expiresAt)} 到期${quota.expired ? '（已过期）' : quota.expiringSoon ? `（${quota.daysToExpiry === 0 ? '今天' : `${quota.daysToExpiry} 天后`}）` : ''}` : ''} · 今日 ${today.requests || 0} 次（设置 → Qoder）`
         : quotaTried
           ? 'Qoder 已连接 · 额度暂时读取失败（设置 → Qoder 可刷新）'
           : `Qoder 已连接 · 正在读取额度（今日 ${today.requests || 0} 次）`;
@@ -4355,8 +4439,8 @@
         quota
           ? h(React.Fragment, null,
             h('span', { className: 'qdr-chat-usage-label' }, '额度'),
-            h('span', { className: 'qdr-chat-usage-quota' }, `${money(quota.remaining)} / ${money(quota.total)}`),
-            h('span', { className: 'qdr-chat-usage-pct', title: `已用 ${Math.round(quota.ratio * 100)}%${quota.expiringSoon ? ` · ${quota.daysToExpiry === 0 ? '今天' : `${quota.daysToExpiry} 天后`}到期` : ''}` }, `${Math.round(quota.ratio * 100)}%`))
+            h('span', { className: 'qdr-chat-usage-quota' }, quotaText),
+            quota.unlimited ? null : h('span', { className: 'qdr-chat-usage-pct', title: `已用 ${Math.round(quota.ratio * 100)}%${quota.expiringSoon ? ` · ${quota.daysToExpiry === 0 ? '今天' : `${quota.daysToExpiry} 天后`}到期` : ''}` }, `${Math.round(quota.ratio * 100)}%`))
           : h('span', { className: 'qdr-chat-usage-num' }, quotaTried ? '额度 —' : '额度读取中…'));
     }
 
@@ -4397,6 +4481,8 @@
     exports.getJson = getJson;
     exports.postJson = postJson;
     exports.safeHref = safeHref;
+    exports.moveAccountKey = moveAccountKey;
+    exports.quotaPillText = quotaPillText;
     exports.csvCell = csvCell;
     exports.toCsv = toCsv;
     exports.versionNotice = versionNotice;
