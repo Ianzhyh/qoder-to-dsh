@@ -109,6 +109,22 @@ export function createRouteTable({ controller, log = () => {} }) {
     },
     {
       kind: 'exact',
+      path: '/qoder/requests',
+      handler: wrap(async (req, res) => {
+        if (!allowRead(req, res)) return;
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        const days = Number(url.searchParams.get('days')) || 14;
+        const limit = Number(url.searchParams.get('limit')) || 80;
+        const model = String(url.searchParams.get('model') || '');
+        const onlyFailures = url.searchParams.get('onlyFailures') === '1';
+        sendJson(res, 200, {
+          ok: true,
+          ...(await controller.requests({ days, limit, model, onlyFailures })),
+        });
+      }),
+    },
+    {
+      kind: 'exact',
       path: '/qoder/credits',
       handler: wrap(async (req, res) => {
         if (!allowRead(req, res)) return;
@@ -126,7 +142,9 @@ export function createRouteTable({ controller, log = () => {} }) {
         const onClose = () => { if (!res.writableEnded) abort.abort(new Error('诊断已取消')); };
         res.on?.('close', onClose);
         try {
-          sendJson(res, 200, { ok: true, ...(await controller.diagnostics({ signal: abort.signal })) });
+          const url = new URL(req.url || '/', 'http://127.0.0.1');
+          const bundle = url.searchParams.get('bundle') === '1';
+          sendJson(res, 200, { ok: true, ...(await controller.diagnostics({ signal: abort.signal, bundle })) });
         } finally {
           res.off?.('close', onClose);
         }
@@ -140,6 +158,34 @@ export function createRouteTable({ controller, log = () => {} }) {
         // 每次都会读上游 plan/quota，并可能在 401 时刷新令牌、落盘凭据。
         if (!requireSideEffectGuard(req, res)) return;
         sendJson(res, 200, { ok: true, ...(await controller.account()) });
+      }),
+    },
+    {
+      kind: 'exact',
+      path: '/qoder/accounts',
+      handler: wrap(async (req, res) => {
+        if (!allowRead(req, res)) return;
+        sendJson(res, 200, { ok: true, ...(await controller.accounts()) });
+      }),
+    },
+    {
+      kind: 'exact',
+      path: '/qoder/accounts/prefs',
+      handler: wrap(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-qoder-panel header' });
+        const body = await readJsonBody(req);
+        sendJson(res, 200, { ok: true, ...(await controller.saveAccounts(body)) });
+      }),
+    },
+    {
+      kind: 'exact',
+      path: '/qoder/accounts/switch',
+      handler: wrap(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-qoder-panel header' });
+        const body = await readJsonBody(req);
+        sendJson(res, 200, { ok: true, ...(await controller.switchAccount({ key: String(body?.key || '') })) });
       }),
     },
     {
@@ -176,7 +222,10 @@ export function createRouteTable({ controller, log = () => {} }) {
       path: '/qoder/logs',
       handler: wrap(async (req, res) => {
         if (!allowRead(req, res)) return;
-        sendJson(res, 200, { ok: true, ...(await controller.logs()) });
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        const lines = Number(url.searchParams.get('lines')) || 120;
+        const query = String(url.searchParams.get('q') || '');
+        sendJson(res, 200, { ok: true, ...(await controller.logs({ lines, query })) });
       }),
     },
     {

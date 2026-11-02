@@ -11,6 +11,8 @@ import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 import { VERSION, PROVIDER, DISPLAY_NAME, REGIONS, DEFAULTS, PATHS, PACKAGE_ROOT } from '../../lib/config.mjs';
+import { effectiveProtocol } from '../../lib/client-env.mjs';
+import { buildDiagBundle, clientChecks, clientDrift, inspectClient } from '../../lib/diagnostics.mjs';
 import { QoderAdapter } from '../../lib/adapter.mjs';
 import { createTools } from '../../lib/tools.mjs';
 import { createRouteTable, mountRoutes } from './routes.mjs';
@@ -21,10 +23,15 @@ import { disposeChatTransport } from '../../lib/chat-transport.mjs';
 import {
   appendUsage, clearUsage as clearUsageFile, creditsReport, ensureUsageDaily, flushUsageSync,
   isProbe, isWritableDir, log as writeLog, localDayKey, readCheckin, readPrefs, readUsage,
-  readUsageDaily, reconcileUsage, recentLogs, summarizeUsage, writeCheckin, writePrefs,
+  readUsageDaily, reconcileUsage, recentLogs, summarizeRequests, summarizeUsage, writeCheckin, writePrefs,
+  readClientRuntime, writeClientRuntime, readCatalogCache,
 } from '../../lib/state.mjs';
 import { beijingDateKey, beijingHour, buildCheckinAccounts, checkinCanClaim, claimCampaigns, summarizeCheckinAccounts } from '../../lib/checkin.mjs';
 import { deviceAvailability } from '../../lib/umid.mjs';
+import { normalizeQuota, quotaSummaryText } from '../../lib/quota.mjs';
+import {
+  applyAccountPrefs, mergeAccounts, publicAccountRow, readAccounts, writeAccounts,
+} from '../../lib/accounts.mjs';
 import { toDirectory } from '../../lib/models.mjs';
 
 export const name = 'qoder';
@@ -49,7 +56,10 @@ function versionState() {
 
 /** 诊断页额度结论：无数据是 warn，不是 pass。 */
 export function quotaCheck(quota, extrasAt = 0, now = Date.now()) {
-  if (!quota || typeof quota !== 'object') {
+  const view = quota && Array.isArray(quota.groups) && quota.totals
+    ? quota
+    : normalizeQuota(quota, { at: extrasAt, now });
+  if (!view || !view.packages?.length) {
     const when = Number(extrasAt) > 0 ? `（上次成功：${new Date(Number(extrasAt)).toLocaleString('zh-CN')}）` : '';
     return {
       id: 'quota',
@@ -58,22 +68,22 @@ export function quotaCheck(quota, extrasAt = 0, now = Date.now()) {
       detail: `上游未返回额度数据${when}，无法确认剩余额度。`,
     };
   }
-  const total = Number(quota.userQuota?.total || 0) + Number(quota.addOnQuota?.total || 0);
-  const left = Number(quota.userQuota?.remaining || 0) + Number(quota.addOnQuota?.remaining || 0);
-  const percent = Number(quota.totalUsagePercentage);
-  const unit = /^credits?$/i.test(String(quota.userQuota?.unit || '')) ? 'Credits' : (quota.userQuota?.unit || 'credits');
+  const unit = view.packages[0]?.unit || 'credits';
+  const unitText = /^credits?$/i.test(String(unit)) ? 'Credits' : unit;
   const stale = Number(extrasAt) > 0 && now - Number(extrasAt) > 5 * 60_000;
-  const empty = total <= 0 && left <= 0;
-  let detail;
-  if (total > 0) detail = `剩余 ${left} / ${total} ${unit}`;
-  else if (Number.isFinite(percent)) detail = `已用 ${Math.round(percent * 100)}%（上游未返回总量）`;
-  else detail = '上游返回了额度对象，但没有剩余/总量字段。';
-  if (quota.isQuotaExceeded) detail += ' · 已用尽';
+  const empty = !view.unlimited && view.totals.total <= 0 && view.totals.remaining <= 0 && !(view.usagePercent > 0);
+  const emptyWarning = (view.warnings || []).some((warning) => warning.code === 'empty');
+  const oldBuild = (view.warnings || []).some((warning) => warning.code === 'oldBuild');
+  let detail = quotaSummaryText(view);
+  if (view.unlimited) detail = `不限量${view.totals.used ? ` · 已用 ${view.totals.used} ${unitText}` : ''}`;
+  else if (view.totals.total > 0) detail = `剩余 ${view.totals.remaining} / ${view.totals.total} ${unitText}`;
+  if (view.exceeded) detail += ' · 已用尽';
+  if (oldBuild) detail += ' · 额度接口返回 404/405，宿主可能是旧构建';
   if (stale) detail += ` · 数据更新于 ${new Date(Number(extrasAt)).toLocaleString('zh-CN')}`;
   return {
     id: 'quota',
     label: '账号额度',
-    status: quota.isQuotaExceeded || empty || stale ? 'warn' : 'pass',
+    status: view.exceeded || empty || emptyWarning || stale || oldBuild ? 'warn' : 'pass',
     detail,
   };
 }
@@ -190,6 +200,25 @@ export function apply(ctx, rawConfig = {}) {
       if (authChangeTimer.unref) authChangeTimer.unref();
     },
   });
+
+  // 客户端版本漂移：升级 Qoder 后旧目录/旧令牌可能先被用到。只提示和刷新，
+  // 不清凭据、不自动降级协议；是否重新登录由用户决定。
+  const clientRuntime = (() => {
+    const protocol = effectiveProtocol(config.region);
+    const previous = readClientRuntime();
+    const next = {
+      appVersion: protocol.appVersion,
+      cliVersion: protocol.cliVersion,
+      protocolSource: protocol.source.cosy,
+    };
+    const drift = clientDrift(previous, next);
+    try { writeClientRuntime(next); } catch (error) { log('保存客户端版本失败', String(error?.message || error)); }
+    if (drift) {
+      client.invalidateCatalog();
+      log('Qoder 客户端已升级', `${drift.from || '旧版本'} → ${drift.to || '新版本'}；目录将在后台刷新`);
+    }
+    return { protocol, previous, current: next, drift };
+  })();
 
   const adapter = new QoderAdapter({
     provider: config.provider,
@@ -339,6 +368,22 @@ export function apply(ctx, rawConfig = {}) {
         ? `已加载 v${VERSION}，磁盘 v${version.installed}；完全退出 dsh 再打开才会加载新代码。`
         : `v${VERSION}`,
     });
+    try {
+      const clientDiag = clientChecks({
+        region: status.region || config.region,
+        auth: client.auth,
+        protocol: clientRuntime.protocol,
+        catalog: readCatalogCache(),
+      });
+      checks.push(...clientDiag.checks);
+    } catch (error) {
+      checks.push({
+        id: 'qoder-client',
+        label: 'Qoder 客户端',
+        status: 'warn',
+        detail: `客户端环境探测失败：${String(error?.message || error)}`,
+      });
+    }
     if (status.signedIn) {
       const expired = status.token?.expiresAt && Number(status.token.expiresAt) <= Date.now();
       checks.push({
@@ -403,7 +448,7 @@ export function apply(ctx, rawConfig = {}) {
       try {
         const extras = await client.refreshExtras({ signal });
         if (signal?.aborted) throw signal.reason || new Error('诊断已取消');
-        checks.push(quotaCheck(extras && extras.quota, extras?.at || client.extrasAt, Date.now()));
+        checks.push(quotaCheck(extras?.quotaView || extras?.quota, extras?.at || client.extrasAt, Date.now()));
       } catch (error) {
         if (signal?.aborted) throw error;
         checks.push({ id: 'quota', label: '账号额度', status: 'warn', detail: String(error?.message || error) });
@@ -438,6 +483,14 @@ export function apply(ctx, rawConfig = {}) {
       displayName: config.displayName,
       region: status.region,
       regionLabel: status.regionLabel,
+      client: {
+        appVersion: clientRuntime.protocol.appVersion,
+        cliVersion: clientRuntime.protocol.cliVersion,
+        cosyVersion: clientRuntime.protocol.cosyVersion,
+        oauthUa: clientRuntime.protocol.oauthUa,
+        protocolSource: clientRuntime.protocol.source,
+        upgrade: clientRuntime.drift,
+      },
       signedIn: status.signedIn,
       account: status.account,
       token: status.token,
@@ -445,6 +498,7 @@ export function apply(ctx, rawConfig = {}) {
       extras: status.extras || null,
       extrasAt: status.extrasAt || 0,
       desktop: status.desktop || { available: false, candidates: [] },
+      accounts: accountRows(),
       route: state.route,
       catalog: {
         count: adapter.catalogCache.models.length,
@@ -554,6 +608,42 @@ export function apply(ctx, rawConfig = {}) {
   function checkinAccounts() {
     // 不走 status()：那里会扫描本机账号，自动签到没必要为此阻塞事件循环。
     return buildCheckinAccounts({ activeAuth: client.auth, activeRegion: client.auth?.region || client.region });
+  }
+
+  // ── 账号展示偏好（别名/顺序/隐藏） ──────────────────────────────────
+  let accountState = readAccounts();
+
+  function accountRows() {
+    const rows = checkinAccounts();
+    const applied = applyAccountPrefs(rows, accountState);
+    const expose = (row) => {
+      const pub = publicAccountRow(row);
+      return pub ? { ...pub, regionLabel: REGIONS[pub.region]?.label || '' } : null;
+    };
+    const active = rows.find((row) => row.active);
+    return {
+      accounts: applied.visible.map(expose).filter(Boolean),
+      hidden: applied.hidden.map(expose).filter(Boolean),
+      total: applied.all.length,
+      activeKey: active ? active.key : '',
+      current: accountState.current || (active ? active.key : ''),
+      prefs: {
+        order: [...accountState.order],
+        aliases: { ...accountState.aliases },
+        hidden: Object.keys(accountState.hidden),
+      },
+    };
+  }
+
+  // 用量账本只存 uid 尾号；渲染时映射回别名/昵称，绝不把完整 uid 再写进账本。
+  function accountLabelMap() {
+    const map = new Map();
+    for (const row of checkinAccounts()) {
+      const label = accountState.aliases[row.key] || row.label || '';
+      const uid = String(row.uid || '');
+      if (label && uid) map.set(`uid:${uid.slice(-8)}`, label);
+    }
+    return map;
   }
 
   /**
@@ -782,6 +872,8 @@ export function apply(ctx, rawConfig = {}) {
       const span = Math.min(30, Math.max(7, Number(days) || 14));
       const recent = Math.min(200, Math.max(20, Number(limit) || 80));
       const summary = summarizeUsage(records, span, Date.now(), usageDaily());
+      const labels = accountLabelMap();
+      summary.byAccount = (summary.byAccount || []).map((item) => ({ ...item, label: labels.get(item.account) || '' }));
       const from = summary.range.from || '';
       // 记录列表与上方统计必须使用同一个本地日窗口，否则切 7/30 天只变总数。
       const windowed = from ? records.filter((record) => localDayKey(record.at) >= from) : records;
@@ -790,9 +882,39 @@ export function apply(ctx, rawConfig = {}) {
         recent: windowed.slice(-recent).reverse(),
       };
     },
+    requests: async ({ days = 14, limit = 80, model = '', onlyFailures = false } = {}) => {
+      const labels = accountLabelMap();
+      const result = summarizeRequests(usageRecords(), { days, limit, model, onlyFailures });
+      return {
+        ...result,
+        items: result.items.map((item) => ({ ...item, accountLabel: labels.get(item.account) || '' })),
+      };
+    },
     credits: async ({ range = '7d' } = {}) => creditsReport(usageRecords(), { range, daily: usageDaily() }),
-    diagnostics: async ({ signal } = {}) => ({ checks: await buildChecks({ deep: true, signal }), logs: recentLogs(60) }),
-    logs: async () => ({ lines: recentLogs(120) }),
+    diagnostics: async ({ signal, bundle = false } = {}) => {
+      const checks = await buildChecks({ deep: true, signal });
+      const result = { checks, logs: recentLogs(60) };
+      if (bundle) {
+        const status = await snapshot({ deep: false, desktop: false });
+        result.bundle = buildDiagBundle({
+          status,
+          checks,
+          protocol: clientRuntime.protocol,
+          info: inspectClient(status.region || config.region),
+        });
+      }
+      return result;
+    },
+    logs: async ({ lines = 120, query = '' } = {}) => {
+      const count = Math.min(300, Math.max(20, Number(lines) || 120));
+      const needle = String(query || '').trim().toLowerCase();
+      const all = recentLogs(count);
+      return {
+        lines: needle ? all.filter((line) => String(line).toLowerCase().includes(needle)) : all,
+        query: needle,
+        total: all.length,
+      };
+    },
     refreshCatalog: async () => {
       const result = await directory({ refresh: true });
       notifyAdaptersUpdated();
@@ -833,6 +955,44 @@ export function apply(ctx, rawConfig = {}) {
       const data = await snapshot({});
       const extras = await client.refreshExtras().catch(() => null);
       return { ...data, extras: extras || data.extras || null };
+    },
+    accounts: async () => accountRows(),
+    saveAccounts: async (patch = {}) => {
+      accountState = writeAccounts(mergeAccounts(accountState, patch));
+      return accountRows();
+    },
+    switchAccount: async ({ key } = {}) => {
+      const wanted = String(key || '');
+      if (!wanted) {
+        const error = new Error('缺少账号 key');
+        error.statusCode = 400;
+        throw error;
+      }
+      const target = checkinAccounts().find((row) => row.key === wanted);
+      if (!target) {
+        const error = new Error('账号不存在或已失效；请重新扫描本机登录');
+        error.statusCode = 400;
+        throw error;
+      }
+      if (target.active) {
+        accountState = writeAccounts({ ...accountState, current: wanted });
+        return accountRows();
+      }
+      if (!['app', 'cli'].includes(target.kind)) {
+        const error = new Error('该账号来自插件登录，无法通过本机登录切换；请重新授权');
+        error.statusCode = 400;
+        throw error;
+      }
+      const result = await client.importDesktop({
+        region: target.region,
+        uid: target.uid,
+        kind: target.kind,
+        file: target.file,
+      });
+      accountState = writeAccounts({ ...accountState, current: wanted });
+      await directory({ refresh: true }).catch(() => {});
+      notifyAdaptersUpdated();
+      return { ...accountRows(), result };
     },
     pollDeviceAuth: async (id) => {
       if (!id) return { ok: false, error: 'missing device id' };

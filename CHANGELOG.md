@@ -20,6 +20,52 @@
 6. 可选：`npm publish`，让 `dsh plugin add qoder-to-dsh` 这条最短路径可用
    （registry 上目前未占用该包名）。
 
+## [1.4.0] - 2026-11-02
+
+这一版对齐 **Qoder 0.5.1**，并把账号、额度、请求与诊断补到可持续使用的成熟度。重点不是新增入口，而是让升级后的客户端、缓存和多账号状态都能被如实识别。
+
+### Added
+
+- **Qoder 0.5.1 适配**：COSY 版本与 OAuth UA 跟随客户端内置 CLI（本次 `1.1.79-hotfix.7`），从 `.qoder-versions` 的 `umid/manifest.json` 动态读取；`QODER_COSY_VERSION` / `QODER_OAUTH_UA` 可覆盖，`QODER_PROTOCOL=legacy` 一键回退到已验证的 `1.1.75`。
+- **客户端环境探测**：新增 `lib/client-env.mjs`，统一解析 launcher `state.ini`、安装根、多版本目录、`build-manifest`、endpoint cache、`umid-cache.json`、`.qoder-app-status.json` 与 `location.v1.json` 数据目录搬迁。
+- **推理端点**：endpoint cache 的 `inference.selected` 经域名白名单校验后作为网关首选，静态 `api3/api2/api1` 继续兜底。
+- **账号管理**：`accounts.json` 保存别名（≤24 字）、顺序、隐藏与上次切换；账号页支持改名、上移/下移、隐藏/恢复、恢复全部；同一账号的桌面/CLI 快照合并成一行，当前账号隐藏时仍保留可见标记。
+- **额度归一化**：新增 `lib/quota.mjs`，兼容 `userQuota`/`addOnQuota` 与未来 `quotas/packages/items` 数组；同名不同到期日分组、到期由近到远、`total<0`/`unlimited` 显示 `∞`；账号不一致、额度接口 404/405、数据过期都会标注。
+- **请求明细页**：新增 `GET /qoder/requests` 与独立页签，展示时间/模型/状态/首字/耗时/输入输出/账号/Credits；支持模型筛选、仅失败、暂停轮询、复制单条与 CSV 导出（BOM + 公式注入防护）。
+- **用量增强**：`/qoder/usage` 增加 `byAccount` 聚合，账号尾号映射回别名；用量页可导出每日 CSV。
+- **日志页**：独立页签，支持 `lines`/`q` 筛选、暂停、复制全部；服务端日志继续脱敏。
+- **客户端诊断**：新增 6 项检查（安装布局、COSY 协议、设备身份、数据目录、目录缓存账号、推理端点）与脱敏诊断包（邮箱 `a***@domain`、uid 尾 6 位、令牌样式统一替换）。
+- **升级提示**：记录最近一次客户端 app/CLI 版本；升级后顶部黄条提示“如遇 401 请先在官方客户端重新登录，再完全重启 dsh”，目录缓存带 CLI 版本并在后台刷新。
+
+### Changed
+
+- **账号切换**：面板切换走新的 `/qoder/accounts/switch`，成功后落盘当前账号；概览切换器与账号页共用同一套顺序、别名和隐藏状态。
+- **额度卡**：改为消费归一化后的 `quotaView`，不再由前端自己拼两个桶；套餐周期与到期时间相同时只显示一次。
+- **目录缓存**：schema 5 → 6，新增 `cliVersion`/`appVersion`；旧缓存只展示、后台刷新，不清空模型选择器。
+- **面板页签**：从 7 个扩到 9 个（新增请求、日志），补 `role=tab` / `aria-controls` / `aria-labelledby` 与窄屏横滑。
+- **诊断/日志**：`/qoder/diagnostics?bundle=1` 返回脱敏诊断包；`/qoder/logs` 支持行数与关键字过滤。
+
+### Fixed
+
+- **数据目录搬迁后找不到登录**：`desktop-auth` 和 `umid` 不再写死 APPDATA，按 `resolveAppDataDir` 跟随 symlink 或 `location.v1.json`。
+- **runtime-info 不可用时签到直接失效**：设备身份优先 runtime-info，失败后用 `umid-cache.json` 兜底并在诊断里说明来源。
+- **零额度/缺字段被误报成 0**：`normalizeQuota` 区分“字段缺失”和“余额为 0”；`status.account.credits` 只在 remaining 已知时覆盖。
+- **同名套餐互相覆盖**：额度按名称+到期日分组，月中到期的包不再被更晚的到期日盖住。
+- **旧客户端目录被当成当前目录**：目录缓存写入 CLI 版本，客户端升级后只后台刷新，不清空选择器。
+- **账号隐藏后当前账号消失**：当前账号即使标记隐藏也留在可见区，避免用户找不到正在使用的账号。
+
+### Tests
+
+- 新增 `client-env`（安装根/manifest/协议/端点白名单/location/symlink/umid-cache）10 项、`quota` 6 项、`accounts` 6 项、`diagnostics` 3 项、`a11y` 2 项。
+- `plugin-host` 扩到 24 项：账号路由、请求筛选、诊断包脱敏、日志过滤与路由数 23。
+- `client.test` 增加 CSV 公式注入用例；实机 `npm run test:live` 在 Qoder 0.5.1 上返回 `pong`，COSY 1.1.79-hotfix.7 通过。
+- 离线 CDP 渲染：9 页签、账号别名/隐藏、额度卡、请求表、日志页、客户端升级黄条与暗色主题，`__errors` 为空。
+
+### Docs
+
+- 1.4.0 的边界：**不做**自动切号、OpenAI/Anthropic 兼容端点、媒体/搜索桥、独立控制台；**中英双语留到 1.5**。
+- README 更新 0.5.1 实测、23 条路由、9 个页签、`accounts.json`/`client.json`、协议回退开关与已知限制。
+
 ## [1.3.1] - 2026-10-31
 
 这一版收口「看起来成功 / 看起来正常」的边角：网关故障切换不再挂死，取消与换号不再被当成可重试故障，凭据落盘失败会如实报错；面板读接口重新纳入跨站保护，图表切区间失败会明确标注仍在展示旧数据。设置面板同时完成一轮动效、材质与字阶打磨。

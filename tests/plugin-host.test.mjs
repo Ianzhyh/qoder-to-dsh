@@ -107,7 +107,7 @@ test('plugin registers one adapter, its tools, command and all panel routes', ()
   assert.ok(adapters[0].adapter && typeof adapters[0].adapter.stream === 'function');
   assert.deepEqual(tools.map((item) => item.name).sort(), ['qoder_diagnose', 'qoder_models', 'qoder_status', 'qoder_usage']);
   assert.deepEqual(commands.map((item) => item.name), ['qoder']);
-  assert.equal(routes.length, 19);
+  assert.equal(routes.length, 23);
   assert.ok(effects.length >= 2);
 });
 
@@ -174,6 +174,30 @@ test('recent usage follows the selected day window', async () => {
   assert.ok(month.json.recent.some((item) => item.model === 'old'));
 });
 
+test('requests endpoint filters by day, model and failures', async () => {
+  const { appendUsage } = await import('../lib/state.mjs');
+  appendUsage({ at: Date.now(), model: 'req-a', ok: true, totalTokens: 3, account: 'uid:abcd1234' });
+  appendUsage({ at: Date.now(), model: 'req-b', ok: false, totalTokens: 4, error: 'boom' });
+  appendUsage({ at: Date.now() - 10 * 86400000, model: 'req-old', ok: false, totalTokens: 5 });
+
+  const week = await call('GET', '/qoder/requests?days=7&limit=50');
+  assert.equal(week.status, 200);
+  assert.ok(week.json.items.some((item) => item.model === 'req-a'));
+  assert.ok(week.json.items.some((item) => item.model === 'req-b'));
+  assert.ok(!week.json.items.some((item) => item.model === 'req-old'), '7 天窗口外不应出现');
+
+  const failed = await call('GET', '/qoder/requests?days=7&onlyFailures=1');
+  assert.ok(failed.json.items.every((item) => item.ok === false));
+  assert.ok(failed.json.items.some((item) => item.model === 'req-b'));
+
+  const byModel = await call('GET', '/qoder/requests?days=7&model=req-a');
+  assert.ok(byModel.json.items.every((item) => item.model === 'req-a'));
+  assert.ok(byModel.json.models.includes('req-a'));
+
+  const usage = await call('GET', '/qoder/usage?days=7&limit=50');
+  assert.ok(Array.isArray(usage.json.summary.byAccount));
+});
+
 test('credits report returns a range series and a year heatmap', async () => {
   const { status, json } = await call('GET', '/qoder/credits?range=7d');
   assert.equal(status, 200);
@@ -182,7 +206,12 @@ test('credits report returns a range series and a year heatmap', async () => {
   assert.equal(json.range.days, 7);
   assert.equal(json.days.length, 7);
   assert.ok(json.series && Array.isArray(json.series.model) && Array.isArray(json.series.client));
-  assert.ok(json.heatmap.days.length >= 350 && json.heatmap.days.length <= 366);
+  // 热力图是「11 个月前的 1 号 → 今天」的 12 个自然月；月初运行时只有 ~330 天，
+  // 不能按固定 350 天断言。改为验证起点是 1 号，且天数与 from/to 跨度一致。
+  const heatFrom = new Date(`${json.heatmap.from}T00:00:00`);
+  const heatTo = new Date(`${json.heatmap.to}T00:00:00`);
+  assert.equal(heatFrom.getDate(), 1, '热力图应从自然月 1 号开始');
+  assert.equal(json.heatmap.days.length, Math.round((heatTo - heatFrom) / 86400000) + 1);
   assert.ok(Number.isFinite(json.heatmap.max));
 });
 
@@ -296,6 +325,48 @@ test('quotaCheck never reports missing quota data as green', () => {
   const stale = quotaCheck({ userQuota: { remaining: 5, total: 10 } }, Date.now() - 6 * 60_000);
   assert.equal(stale.status, 'warn');
   assert.match(stale.detail, /更新于/);
+});
+
+test('accounts routes expose display prefs and guard writes', async () => {
+  const read = await call('GET', '/qoder/accounts');
+  assert.equal(read.status, 200);
+  assert.ok(Array.isArray(read.json.accounts));
+  assert.ok(Array.isArray(read.json.hidden));
+  assert.equal(typeof read.json.total, 'number');
+
+  const denied = await call('POST', '/qoder/accounts/prefs', {
+    body: { order: ['x'], aliases: { x: 'X' }, hidden: { x: true } },
+  });
+  assert.equal(denied.status, 403);
+
+  const saved = await call('POST', '/qoder/accounts/prefs', {
+    panel: true,
+    body: { order: ['x'], aliases: { x: 'X' }, hidden: { x: true } },
+  });
+  assert.equal(saved.status, 200);
+  assert.deepEqual(saved.json.prefs.order, ['x']);
+  assert.equal(saved.json.prefs.aliases.x, 'X');
+  assert.deepEqual(saved.json.prefs.hidden, ['x']);
+
+  const restored = await call('POST', '/qoder/accounts/prefs', { panel: true, body: { restoreAll: true } });
+  assert.deepEqual(restored.json.prefs.hidden, []);
+
+  const switchDenied = await call('POST', '/qoder/accounts/switch', { body: { key: 'x' } });
+  assert.equal(switchDenied.status, 403);
+  const switchMissing = await call('POST', '/qoder/accounts/switch', { panel: true, body: {} });
+  assert.equal(switchMissing.status, 400);
+});
+
+test('diagnostics bundle is sanitized and logs can be filtered', async () => {
+  const diag = await call('GET', '/qoder/diagnostics?bundle=1', { panel: true });
+  assert.equal(diag.status, 200);
+  assert.ok(diag.json.bundle && diag.json.bundle.redacted === true);
+  assert.ok(Array.isArray(diag.json.bundle.checks));
+
+  const logs = await call('GET', '/qoder/logs?lines=20&q=__no_such_log__');
+  assert.equal(logs.status, 200);
+  assert.ok(Array.isArray(logs.json.lines));
+  assert.equal(logs.json.query, '__no_such_log__');
 });
 
 test('side-effect GETs require the panel header', async () => {

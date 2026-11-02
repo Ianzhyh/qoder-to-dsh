@@ -38,6 +38,30 @@
       }
     }
 
+    // CSV 单元格：公式注入（= + - @ 制表/回车开头）前置单引号，引号双写。
+    function csvCell(value) {
+      const text = value === null || value === undefined ? '' : String(value);
+      const guarded = /^[=+\-@\t\r]/.test(text) ? `'${text}` : text;
+      return `"${guarded.replace(/"/g, '""')}"`;
+    }
+
+    function toCsv(header, rows) {
+      const lines = [header, ...(rows || [])].map((row) => row.map(csvCell).join(','));
+      return `\ufeff${lines.join('\r\n')}\r\n`;
+    }
+
+    function downloadCsv(name, header, rows) {
+      const blob = new Blob([toCsv(header, rows)], { type: 'text/csv;charset=utf-8' });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = url;
+      link.download = name;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
+
     async function requestOnce(path, opts) {
       const { timeoutMs = REQUEST_TIMEOUT_MS, panel = false, ...init } = opts;
       const controller = init.signal ? null : new AbortController();
@@ -338,6 +362,35 @@
       return { tone: 'ok', text: '签到流程已结束。' };
     }
     function quotaSummary(extras) {
+      const view = extras && extras.quotaView;
+      if (view) {
+        const user = view.packages.find((item) => item.source === 'userQuota') || view.packages[0] || null;
+        const addOn = view.packages.find((item) => item.source === 'addOnQuota') || null;
+        const at = Number(view.at) || Number(extras.at) || 0;
+        return {
+          total: view.unlimited ? -1 : view.totals.total,
+          used: view.totals.used,
+          remaining: view.unlimited ? -1 : view.totals.remaining,
+          ratio: view.ratio,
+          unit: (user && user.unit) || (addOn && addOn.unit) || 'credits',
+          exceeded: view.exceeded,
+          expiresAt: view.expiresAt,
+          user,
+          addOn,
+          packages: view.packages,
+          groups: view.groups,
+          unlimited: view.unlimited,
+          detailUrl: safeHref(view.detailUrl),
+          upgradeUrl: safeHref(view.upgradeUrl),
+          planName: view.planName || '',
+          planPaid: view.planPaid === true,
+          planEnd: view.planEnd,
+          warnings: view.warnings || [],
+          at,
+          stale: (view.warnings || []).some((warning) => warning.code === 'stale'),
+        };
+      }
+      // 旧宿主/旧缓存兜底：保持 1.3 的字段口径。
       const quota = extras && extras.quota;
       if (!quota) return null;
       const user = quota.userQuota || null;
@@ -402,6 +455,10 @@
         gift: ['M20 12v9H4v-9', 'M2 7h20v5H2Z', 'M12 22V7', 'M12 7c-2.5 0-4-1.5-4-3a2 2 0 0 1 4 0c0 1.5 1.5 3 4 3', 'M12 7c2.5 0 4-1.5 4-3a2 2 0 0 0-4 0c0 1.5-1.5 3-4 3'],
         dot: ['M12 12h.01'],
         spark: ['M12 3v4', 'M12 17v4', 'M4.2 7.2l2.8 2.8', 'M17 14l2.8 2.8', 'M3 12h4', 'M17 12h4', 'M4.2 16.8 7 14', 'M17 10l2.8-2.8'],
+        download: ['M12 3v12', 'm7 10 5 5 5-5', 'M5 21h14'],
+        pause: ['M9 5v14', 'M15 5v14'],
+        up: ['m6 15 6-6 6 6'],
+        down: ['m6 9 6 6 6-6'],
       };
       const list = paths[name] || paths.dot;
       return h('svg', common, ...list.map((d, index) => h('path', { key: index, d })));
@@ -662,19 +719,33 @@
               h('div', { className: 'qdr-skel-line', style: { width: '45%' } }))
             : h('div', { className: 'qdr-quota-empty' }, '—'));
       }
-      const tone = info.exceeded || info.ratio >= 0.9 ? 'bad' : info.ratio >= 0.7 ? 'warn' : 'ok';
-      const percent = Math.round(info.ratio * 100);
+      const unlimited = info.unlimited === true;
+      const tone = unlimited ? 'ok' : info.exceeded || info.ratio >= 0.9 ? 'bad' : info.ratio >= 0.7 ? 'warn' : 'ok';
+      const percent = unlimited ? null : Math.round(info.ratio * 100);
       const unitText = /^credits?$/i.test(String(info.unit)) ? 'Credits' : info.unit;
+      const mismatch = (info.warnings || []).some((warning) => warning.code === 'accountMismatch');
+      const oldBuild = (info.warnings || []).some((warning) => warning.code === 'oldBuild');
+      const groupRows = Array.isArray(info.groups) ? info.groups : [];
+      const showGroups = groupRows.length > 2 || groupRows.some((group) => group.packages.length > 1);
+      const packValue = (pack) => {
+        if (!pack) return '—';
+        if (pack.unlimited) return '∞';
+        if (!pack.total && !pack.remaining) return '0 / 0';
+        return `${money(pack.remaining)} / ${money(pack.total)}`;
+      };
       return h('div', { className: `qdr-card qdr-quota${wide ? ' qdr-quota-wide' : ''}` },
         h('div', { className: 'qdr-card-head' },
           h('div', null,
             h('div', { className: 'qdr-quota-title-row' },
               h('div', { className: 'qdr-card-title' }, '额度'),
               info.planName ? h(Badge, { tone: info.planPaid ? 'green' : 'accent' }, info.planName) : null,
+              unlimited ? h(Badge, { tone: 'green' }, '不限量') : null,
               info.exceeded ? h(Badge, { tone: 'amber' }, '已用尽') : null,
+              mismatch ? h(Badge, { tone: 'amber', title: '上游返回的额度 userId 与当前登录账号不一致' }, '账号不一致') : null,
+              oldBuild ? h(Badge, { tone: 'amber', title: '额度接口返回 404/405，宿主可能是旧构建' }, '需重启 dsh') : null,
               info.stale ? h(Badge, { tone: 'amber', title: '上游额度读取失败或尚未刷新' }, '数据可能已过期') : null),
             h('div', { className: 'qdr-card-sub' },
-              info.expiresAt ? `到期 ${dateLabel(info.expiresAt)}` : '上游未提供到期时间',
+              info.expiresAt ? `到期 ${dateLabel(info.expiresAt)}` : (unlimited ? '不限期' : '上游未提供到期时间'),
               info.unit ? ` · 单位 ${unitText}` : '',
               info.at ? ` · 更新于 ${stamp(info.at)}` : '')),
           h('div', { className: 'qdr-card-actions' },
@@ -682,22 +753,27 @@
             h(Button, { size: 'sm', icon: 'refresh', disabled: Boolean(busy), onClick: onRefresh }, busy ? '读取中…' : '刷新'),
             onAccount ? h(Button, { size: 'sm', variant: 'ghost', onClick: onAccount }, '账号') : null)),
         h('div', { className: 'qdr-quota-big' },
-          h('strong', null, money(info.remaining)),
-          h('span', { className: 'qdr-quota-total' }, ` / ${money(info.total)} ${unitText}`),
-          h('span', { className: `qdr-quota-pct qdr-quota-pct-${tone}` }, `${percent}% 已用`)),
-        h(Meter, { value: info.ratio, tone, label: '账号额度使用进度' }),
+          h('strong', null, unlimited ? '∞' : money(info.remaining)),
+          h('span', { className: 'qdr-quota-total' }, unlimited ? ' 不限量' : ` / ${money(info.total)} ${unitText}`),
+          unlimited ? null : h('span', { className: `qdr-quota-pct qdr-quota-pct-${tone}` }, `${percent}% 已用`)),
+        unlimited ? null : h(Meter, { value: info.ratio, tone, label: '账号额度使用进度' }),
         h('div', { className: 'qdr-quota-grid' },
           h('div', null,
             h('span', null, '套餐额度'),
-            h('strong', null, info.user && info.user.total ? `${money(info.user.remaining)} / ${money(info.user.total)}` : '—')),
+            h('strong', null, packValue(info.user))),
           h('div', null,
             h('span', null, '加量包'),
-            h('strong', null, info.addOn && info.addOn.total ? `${money(info.addOn.remaining)} / ${money(info.addOn.total)}` : '无')),
+            h('strong', null, info.addOn ? packValue(info.addOn) : '无')),
           h('div', null,
             h('span', null, '已用'),
             h('strong', null, `${money(info.used)} ${unitText}`))),
-        (info.detailUrl || info.upgradeUrl || info.planEnd) ? h('div', { className: 'qdr-quota-links' },
-          info.planEnd ? h('span', { className: 'qdr-hint' }, `套餐周期至 ${dateLabel(info.planEnd)}`) : null,
+        showGroups ? h('div', { className: 'qdr-quota-packs' }, groupRows.map((group) => h('div', { className: 'qdr-quota-pack', key: group.key || `${group.name}-${group.expiresAt}` },
+          h('span', { className: 'qdr-quota-pack-name' },
+            group.name,
+            group.expiresAt ? h('span', { className: 'qdr-hint' }, ` · 到期 ${dateLabel(group.expiresAt)}`) : null),
+          h('strong', null, group.unlimited ? '∞' : `${money(group.remaining)} / ${money(group.total)}`)))) : null,
+        (info.detailUrl || info.upgradeUrl || (info.planEnd && info.planEnd !== info.expiresAt)) ? h('div', { className: 'qdr-quota-links' },
+          info.planEnd && info.planEnd !== info.expiresAt ? h('span', { className: 'qdr-hint' }, `套餐周期至 ${dateLabel(info.planEnd)}`) : null,
           info.detailUrl ? h('a', { className: 'qdr-quota-link', href: safeHref(info.detailUrl), target: '_blank', rel: 'noreferrer noopener' }, '用量明细', h(Icon, { name: 'external', size: 12 })) : null,
           info.upgradeUrl ? h('a', { className: 'qdr-quota-link', href: safeHref(info.upgradeUrl), target: '_blank', rel: 'noreferrer noopener' }, '升级套餐', h(Icon, { name: 'external', size: 12 })) : null) : null);
     }
@@ -1547,7 +1623,7 @@
 
     function CheckinPanel({ data, busy, error, onRun, onToggleAuto, onRefresh, onAccount }) {
       if (!data) {
-        return h('div', { className: 'qdr-panel', role: 'tabpanel' },
+        return h('div', { className: 'qdr-panel', role: 'tabpanel', id: 'qdr-checkin-panel', 'aria-labelledby': 'qdr-checkin-tab' },
           error
             ? h(Empty, {
               icon: 'alert', title: '签到状态读取失败', detail: error,
@@ -1577,7 +1653,7 @@
             : waiting ? '10:00 后开放'
               : errors ? '需处理'
                 : allSettled ? '本期无活动' : '暂无可领';
-      return h('div', { className: 'qdr-panel', role: 'tabpanel' },
+      return h('div', { className: 'qdr-panel', role: 'tabpanel', id: 'qdr-checkin-panel', 'aria-labelledby': 'qdr-checkin-tab' },
         h('div', { className: 'qdr-card qdr-checkin-hero' },
           h('div', { className: 'qdr-checkin-hero-top' },
             h('div', { className: 'qdr-checkin-icon' }, h(Icon, { name: 'gift', size: 22 })),
@@ -1687,6 +1763,7 @@
       const [diagnosticsError, setDiagnosticsError] = useState('');
       const [notice, setNotice] = useState(null);
       const [versionBannerClosed, setVersionBannerClosed] = useState(false);
+      const [clientBannerClosed, setClientBannerClosed] = useState(false);
       const [search, setSearch] = useState('');
       const [filter, setFilter] = useState('all');
       const [draftVisible, setDraftVisible] = useState(null);
@@ -1707,9 +1784,25 @@
       const [usageDays, setUsageDays] = useState(14);
       const [usageFilter, setUsageFilter] = useState('all');
       const [usageBusy, setUsageBusy] = useState(false);
+      const [requests, setRequests] = useState(null);
+      const [requestsBusy, setRequestsBusy] = useState(false);
+      const [requestsError, setRequestsError] = useState('');
+      const [requestDays, setRequestDays] = useState(7);
+      const [requestModel, setRequestModel] = useState('');
+      const [requestOnlyFailures, setRequestOnlyFailures] = useState(false);
+      const [requestsPaused, setRequestsPaused] = useState(false);
+      const [logs, setLogs] = useState(null);
+      const [logsBusy, setLogsBusy] = useState(false);
+      const [logsError, setLogsError] = useState('');
+      const [logsQuery, setLogsQuery] = useState('');
+      const [logsApplied, setLogsApplied] = useState('');
+      const [logsPaused, setLogsPaused] = useState(false);
       const [trialModel, setTrialModel] = useState('');
       const [trialSeq, setTrialSeq] = useState(0);
       const [accountBusy, setAccountBusy] = useState(true);
+      const [accountActionBusy, setAccountActionBusy] = useState('');
+      const [accountEditing, setAccountEditing] = useState('');
+      const [showHiddenAccounts, setShowHiddenAccounts] = useState(false);
       const [checkin, setCheckin] = useState(null);
       const [checkinBusy, setCheckinBusy] = useState(false);
       const [checkinError, setCheckinError] = useState('');
@@ -1728,6 +1821,8 @@
       const noticeTimer = useRef(null);
       const creditsSeq = useRef(0);
       const usageSeq = useRef(0);
+      const requestSeq = useRef(0);
+      const logsSeq = useRef(0);
       const accountSeq = useRef(0);
       const modelsSeq = useRef(0);
       const statusSeq = useRef(0);
@@ -1918,6 +2013,53 @@
         }
       }, []);
 
+      const loadRequests = useCallback(async (days, { silent = false, model = requestModel, onlyFailures = requestOnlyFailures } = {}) => {
+        const seq = ++requestSeq.current;
+        if (!silent) setRequestsBusy(true);
+        if (!silent) setRequestsError('');
+        try {
+          const params = new URLSearchParams({ days: String(days || requestDays), limit: '120' });
+          if (model) params.set('model', model);
+          if (onlyFailures) params.set('onlyFailures', '1');
+          const data = await getJson(`/qoder/requests?${params.toString()}`);
+          if (!mounted.current || seq !== requestSeq.current) return;
+          setRequests(data);
+          setRequestsError('');
+        } catch (err) {
+          if (!mounted.current || seq !== requestSeq.current) return;
+          const message = String(err.message || err);
+          if (!silent) {
+            setRequestsError(message);
+            setError(message);
+          }
+        } finally {
+          if (mounted.current && seq === requestSeq.current) setRequestsBusy(false);
+        }
+      }, [requestDays, requestModel, requestOnlyFailures]);
+
+      const loadLogs = useCallback(async ({ silent = false, query = '' } = {}) => {
+        const seq = ++logsSeq.current;
+        if (!silent) setLogsBusy(true);
+        if (!silent) setLogsError('');
+        try {
+          const params = new URLSearchParams({ lines: '200' });
+          if (query) params.set('q', query);
+          const data = await getJson(`/qoder/logs?${params.toString()}`);
+          if (!mounted.current || seq !== logsSeq.current) return;
+          setLogs(data);
+          setLogsError('');
+        } catch (err) {
+          if (!mounted.current || seq !== logsSeq.current) return;
+          const message = String(err.message || err);
+          if (!silent) {
+            setLogsError(message);
+            setError(message);
+          }
+        } finally {
+          if (mounted.current && seq === logsSeq.current) setLogsBusy(false);
+        }
+      }, []);
+
       const loadAccount = useCallback(async () => {
         const seq = ++accountSeq.current;
         setAccountBusy(true);
@@ -1932,6 +2074,59 @@
           if (mounted.current && seq === accountSeq.current) setAccountBusy(false);
         }
       }, []);
+
+      const applyAccountPayload = useCallback((data) => {
+        if (!data || data.ok === false) return;
+        setStatus((previous) => (previous ? {
+          ...previous,
+          accounts: {
+            ...(previous.accounts || {}),
+            accounts: data.accounts,
+            hidden: data.hidden,
+            total: data.total,
+            activeKey: data.activeKey,
+            current: data.current,
+            prefs: data.prefs,
+          },
+        } : previous));
+      }, []);
+
+      const saveAccountPrefs = useCallback(async (patch, successText = '') => {
+        setAccountActionBusy('prefs');
+        setError('');
+        try {
+          const data = await postJson('/qoder/accounts/prefs', patch);
+          if (!mounted.current) return;
+          if (data.ok === false) throw new Error(data.error || '保存失败');
+          applyAccountPayload(data);
+          if (successText) showNotice('ok', successText);
+        } catch (err) {
+          if (mounted.current) showNotice('error', `保存账号偏好失败：${String(err.message || err)}`);
+        } finally {
+          if (mounted.current) setAccountActionBusy('');
+        }
+      }, [applyAccountPayload, showNotice]);
+
+      const switchAccountRow = useCallback((row) => {
+        if (!row || row.current) return;
+        setAccountActionBusy('switch');
+        setError('');
+        return postJson('/qoder/accounts/switch', { key: row.key })
+          .then((data) => {
+            if (!mounted.current) return;
+            if (data.ok === false) throw new Error(data.error || '切换失败');
+            applyAccountPayload(data);
+            setSwitcherOpen(false);
+            showNotice('ok', `已切换到 ${row.name || row.alias || '本机账号'}`);
+            notifyAuth();
+          })
+          .catch((err) => {
+            if (mounted.current) showNotice('error', `切换账号失败：${String(err.message || err)}`);
+          })
+          .finally(() => {
+            if (mounted.current) setAccountActionBusy('');
+          });
+      }, [applyAccountPayload, notifyAuth, showNotice]);
 
       const loadCredits = useCallback(async (range) => {
         const seq = ++creditsSeq.current;
@@ -2028,6 +2223,18 @@
       }, [tab, creditsRange, loadCredits]);
 
       useVisibilityPoll(() => loadUsage(usageDays, true), 30_000, tab === 'usage');
+
+      useEffect(() => {
+        if (tab === 'requests' && !requestsPaused) loadRequests(requestDays);
+      }, [tab, requestDays, requestModel, requestOnlyFailures, requestsPaused, loadRequests]);
+
+      useVisibilityPoll(() => loadRequests(requestDays, { silent: true }), 30_000, tab === 'requests' && !requestsPaused);
+
+      useEffect(() => {
+        if (tab === 'logs' && !logsPaused) loadLogs({ query: logsApplied });
+      }, [tab, logsApplied, logsPaused, loadLogs]);
+
+      useVisibilityPoll(() => loadLogs({ silent: true, query: logsApplied }), 30_000, tab === 'logs' && !logsPaused);
 
       const loadDiagnostics = useCallback(async () => {
         const seq = ++diagnosticsSeq.current;
@@ -2363,6 +2570,30 @@
         catch { showNotice('error', '复制失败，请手动选择文本'); }
       };
 
+      const exportUsageCsv = () => {
+        const days = (usage && usage.summary && usage.summary.days) || [];
+        if (!days.length) { showNotice('error', '还没有可导出的用量'); return; }
+        downloadCsv('qoder-usage.csv',
+          ['date', 'requests', 'tokens', 'credits', 'savedCredits', 'failures'],
+          days.map((day) => [day.date, day.requests, day.tokens, day.credits, day.savedCredits, day.failures]));
+        showNotice('ok', '用量 CSV 已导出');
+      };
+
+      const exportRequestsCsv = () => {
+        const items = (requests && requests.items) || [];
+        if (!items.length) { showNotice('error', '当前筛选没有可导出的请求'); return; }
+        downloadCsv('qoder-requests.csv',
+          ['time', 'model', 'ok', 'status', 'probe', 'firstByteMs', 'latencyMs', 'promptTokens', 'completionTokens', 'cachedTokens', 'reasoningTokens', 'credits', 'savedCredits', 'account', 'client', 'errorCode', 'error'],
+          items.map((item) => [
+            new Date(item.at).toISOString(), item.model, item.ok ? 'ok' : 'fail', item.status,
+            item.probe ? 'probe' : '', item.firstByteMs, item.latencyMs,
+            item.promptTokens, item.completionTokens, item.cachedTokens, item.reasoningTokens,
+            item.credits, item.savedCredits, item.accountLabel || item.account, item.client,
+            item.errorCode, item.error,
+          ]));
+        showNotice('ok', '请求 CSV 已导出');
+      };
+
       const visibleSet = draftVisible === null ? null : new Set(draftVisible);
       const isVisible = useCallback((model) => (visibleSet === null ? true : visibleSet.has(model.id)), [draftVisible]);
 
@@ -2409,6 +2640,7 @@
 
       const signedIn = Boolean(status && status.signedIn);
       const versionText = status ? versionNotice(status.version, status.installedVersion) : '';
+      const clientUpgrade = status && status.client ? status.client.upgrade : null;
       const credentialProtection = (status && status.config && status.config.credentialProtection) || '本机密钥';
       const today = (status && status.usage && status.usage.today) || {};
       const usageSummary = usage && usage.summary;
@@ -2459,7 +2691,7 @@
         : '';
       const identity = accountIdentityNote(status && status.account, localAccounts);
 
-      const accountRows = useMemo(() => {
+      const fallbackAccountRows = useMemo(() => {
         const rows = [];
         const seen = new Set();
         if (status && status.signedIn && status.account) {
@@ -2505,15 +2737,77 @@
         return rows;
       }, [status, localAccounts, planLabel]);
 
+      const mapServerAccount = (row) => ({
+        key: row.key,
+        region: row.region,
+        regionLabel: row.regionLabel || regionShort(row.region),
+        uid: row.uid || '',
+        name: row.displayName || row.alias || row.label || row.email || '未命名账号',
+        rawName: row.label || '',
+        alias: row.alias || '',
+        email: row.email || '',
+        sourceLabel: row.sourceLabel || (row.kind === 'app' ? '桌面端' : 'CLI'),
+        expiresAt: row.expiresAt || 0,
+        expiresLabel: row.expiresAt ? dateLabel(row.expiresAt) : '',
+        tokenNeedsRefresh: row.active ? Boolean(status && status.token && status.token.needsRefresh) : false,
+        planLabel: row.active ? planLabel : '',
+        current: row.active === true,
+        hidden: row.hidden === true,
+        sources: row.sources,
+        candidate: null,
+      });
+
+      const accountRows = useMemo(() => {
+        const server = status && status.accounts;
+        if (server && Array.isArray(server.accounts)) return server.accounts.map(mapServerAccount);
+        return fallbackAccountRows;
+      }, [status, fallbackAccountRows, planLabel]); // eslint-disable-line react-hooks/exhaustive-deps
+
+      const hiddenAccountRows = useMemo(() => {
+        const server = status && status.accounts;
+        return server && Array.isArray(server.hidden) ? server.hidden.map(mapServerAccount) : [];
+      }, [status]); // eslint-disable-line react-hooks/exhaustive-deps
+
+      const switchRows = useMemo(() => accountRows.filter((row) => !row.hidden), [accountRows]);
+
+      const moveAccount = (row, delta) => {
+        const keys = [...accountRows, ...hiddenAccountRows].map((item) => item.key);
+        const index = keys.indexOf(row.key);
+        const next = index + delta;
+        if (index < 0 || next < 0 || next >= keys.length) return;
+        [keys[index], keys[next]] = [keys[next], keys[index]];
+        saveAccountPrefs({ order: keys }, '账号顺序已保存');
+      };
+
+      const toggleAccountHidden = (row, hidden) => {
+        saveAccountPrefs({ hidden: { [row.key]: hidden } }, hidden ? '已隐藏该账号' : '已恢复该账号');
+      };
+
+      const saveAccountAlias = (row, value) => {
+        const alias = String(value || '').trim().slice(0, 24);
+        setAccountEditing('');
+        if (alias === (row.alias || '')) return;
+        saveAccountPrefs({ aliases: { [row.key]: alias } }, alias ? '账号别名已保存' : '已清除账号别名');
+      };
+
       const tabs = [
         ['overview', '概览'],
         ['checkin', '签到'],
         ['models', '模型'],
         ['trial', '试跑'],
         ['usage', '用量'],
+        ['requests', '请求'],
         ['account', '账号'],
         ['diagnose', '诊断'],
+        ['logs', '日志'],
       ];
+
+      const panelProps = (id, extra = '') => ({
+        className: `qdr-panel${extra ? ` ${extra}` : ''}`,
+        role: 'tabpanel',
+        id: `qdr-${id}-panel`,
+        'aria-labelledby': `qdr-${id}-tab`,
+      });
 
       const onTabKeyDown = (event) => {
         const keys = ['ArrowRight', 'ArrowLeft', 'Home', 'End'];
@@ -2562,6 +2856,11 @@
           h('span', null, versionText),
           h('button', { type: 'button', className: 'qdr-banner-x', onClick: () => setVersionBannerClosed(true), 'aria-label': '关闭版本提示' }, h(Icon, { name: 'close', size: 13 }))) : null,
 
+        clientUpgrade && !clientBannerClosed ? h('div', { className: 'qdr-banner qdr-banner-warn', role: 'status' },
+          h(Icon, { name: 'alert', size: 15 }),
+          h('span', null, `Qoder 客户端已从 ${clientUpgrade.from || '旧版本'} 升级到 ${clientUpgrade.to || '新版本'}。若出现 401 或额度异常，请先在官方客户端重新登录，再完全退出并重启 dsh。`),
+          h('button', { type: 'button', className: 'qdr-banner-x', onClick: () => setClientBannerClosed(true), 'aria-label': '关闭客户端升级提示' }, h(Icon, { name: 'close', size: 13 }))) : null,
+
         !status ? (statusError
           ? h(Empty, {
             icon: 'alert', title: '无法读取 Qoder 状态', detail: statusError,
@@ -2598,6 +2897,8 @@
           }),
           tabs.map(([id, label]) => h('button', {
             key: id, type: 'button', role: 'tab', 'aria-selected': tab === id,
+            id: `qdr-${id}-tab`,
+            'aria-controls': `qdr-${id}-panel`,
             tabIndex: tab === id ? 0 : -1,
             ref: (node) => { tabRefs.current[id] = node; },
             className: `qdr-tab${tab === id ? ' qdr-tab-on' : ''}`,
@@ -2605,7 +2906,7 @@
           }, label))),
 
         h('div', { className: 'qdr-stage', ref: stageRef },
-        tab === 'overview' ? h('div', { className: 'qdr-panel qdr-panel-overview', role: 'tabpanel' },
+        tab === 'overview' ? h('div', panelProps('overview', 'qdr-panel-overview'),
           signedIn ? h(React.Fragment, null,
             h('div', { className: 'qdr-account-strip' },
               h('div', { className: 'qdr-avatar' }, (status.account && status.account.name || 'Q').slice(0, 1).toUpperCase()),
@@ -2620,7 +2921,7 @@
                 h(Button, {
                   size: 'sm', variant: localAccounts.length > 1 ? 'secondary' : 'ghost', icon: 'swap',
                   onClick: () => setSwitcherOpen((open) => !open),
-                }, localAccounts.length > 1 ? '切换账号' : '账号'),
+                }, switchRows.length > 1 ? '切换账号' : '账号'),
                 h(Button, { size: 'sm', variant: 'ghost', onClick: () => setTab('account') }, '管理'))),
             switcher.mounted ? h('div', { className: `qdr-account-menu${switcher.closing ? ' qdr-account-menu-out' : ''}` },
               h('div', { className: 'qdr-account-menu-head' },
@@ -2628,25 +2929,26 @@
                   h('div', { className: 'qdr-card-title' }, '本机已登录账号'),
                   h('div', { className: 'qdr-card-sub' }, '切换只影响插件当前使用的账号，不会修改 Qoder 官方客户端的登录态。')),
                 h(Button, { size: 'sm', icon: 'refresh', disabled: busy === 'desktop-scan', onClick: () => run('desktop-scan', async () => { await loadStatus(true, true); await loadCheckin(false); }) }, '重新扫描')),
-              localAccounts.length
-                ? h('div', { className: 'qdr-account-menu-list' }, localAccounts.map((candidate) => {
-                  const current = Boolean(status.account && status.account.uid === candidate.uid && status.region === candidate.region);
-                  const checkinAccount = checkinForCandidate(candidate);
-                  return h('div', { className: `qdr-account-menu-row${current ? ' qdr-account-menu-current' : ''}`, key: `${candidate.region}-${candidate.kind}-${candidate.uid || candidate.file}` },
-                    h('div', { className: 'qdr-candidate-mark' }, candidate.kind === 'app' ? 'D' : 'C'),
+              switchRows.length
+                ? h('div', { className: 'qdr-account-menu-list' }, switchRows.map((row) => {
+                  const current = row.current === true;
+                  const checkinAccount = checkinForAccount(row.region, row.uid);
+                  return h('div', { className: `qdr-account-menu-row${current ? ' qdr-account-menu-current' : ''}`, key: row.key },
+                    h('div', { className: 'qdr-candidate-mark' }, row.sourceLabel === '桌面端' ? 'D' : 'C'),
                     h('div', { className: 'qdr-account-menu-main' },
                       h('div', { className: 'qdr-account-menu-title' },
-                        h('strong', null, candidate.nickname || candidate.email || candidate.uid || '未命名账号'),
+                        h('strong', null, row.name),
+                        row.alias ? h(Badge, { tone: 'accent' }, '别名') : null,
                         current ? h(Badge, { tone: 'green' }, '当前') : null,
                         checkinAccount ? h(Badge, { tone: checkinMeta(checkinAccount.status).tone }, checkinAccountStatus(checkinAccount)) : null),
                       h('div', { className: 'qdr-account-menu-meta' },
-                        candidate.regionLabel || regionShort(candidate.region),
-                        ' · ', candidate.kind === 'app' ? '桌面端' : 'CLI',
-                        candidate.expiresAt ? ` · ${dateLabel(candidate.expiresAt)} 过期` : '')),
+                        row.regionLabel,
+                        ' · ', row.sourceLabel,
+                        row.expiresAt ? ` · ${dateLabel(row.expiresAt)} 过期` : '')),
                     h(Button, {
                       size: 'sm', variant: current ? 'ghost' : 'secondary',
-                      disabled: current || busy === 'desktop',
-                      onClick: () => importDesktop(candidate),
+                      disabled: current || Boolean(accountActionBusy),
+                      onClick: () => switchAccountRow(row),
                     }, current ? '当前' : '切换'));
                 }))
                 : h('div', { className: 'qdr-quiet' }, '没有检测到其他本机登录；在 Qoder 客户端登录后会自动出现在这里。'),
@@ -2734,7 +3036,7 @@
           onAccount: () => setTab('account'),
         }) : null,
 
-        tab === 'models' ? h('div', { className: 'qdr-panel', role: 'tabpanel' },
+        tab === 'models' ? h('div', panelProps('models'),
           h('div', { className: 'qdr-toolbar' },
             h('div', { className: 'qdr-search' },
               h(Icon, { name: 'search', size: 15 }),
@@ -2811,6 +3113,7 @@
         // 试跑面板常驻，只按页签隐藏：切去用量页再回来时，prompt 和结果还在。
         h('div', {
           className: 'qdr-panel', role: 'tabpanel', 'aria-hidden': tab !== 'trial',
+          id: 'qdr-trial-panel', 'aria-labelledby': 'qdr-trial-tab',
           style: tab === 'trial' ? undefined : { display: 'none' },
         }, h(TrialPanel, {
           key: 'trial-' + trialSeq + '-' + ((status && status.account && status.account.uid) || 'anon'),
@@ -2820,7 +3123,7 @@
           onCopy: copy,
         })),
 
-        tab === 'usage' ? h('div', { className: 'qdr-panel', role: 'tabpanel' },
+        tab === 'usage' ? h('div', panelProps('usage'),
           h(CreditsHeatmap, {
             data: credits && credits.heatmap,
             busy: creditsBusy,
@@ -2916,6 +3219,7 @@
                         'aria-pressed': usageFilter === id,
                         onClick: () => setUsageFilter(id),
                       }, label))),
+                    h(Button, { size: 'sm', variant: 'ghost', icon: 'download', onClick: exportUsageCsv }, 'CSV'),
                     h(Button, { size: 'sm', variant: 'ghost', icon: 'trash', disabled: Boolean(busy), onClick: clearUsage }, '清空'))),
                 recent.length ? h('div', { className: 'qdr-usage-list' },
                   recentShown.map((item, index) => h('div', { className: 'qdr-usage-row', key: index },
@@ -2944,7 +3248,72 @@
                       }, '复制')) : null)))
                   : h('div', { className: 'qdr-quiet' }, usageFilter === 'failed' ? '没有失败请求。' : '还没有请求记录。完成一次对话或试跑后出现。')))) : null,
 
-        tab === 'account' ? h('div', { className: 'qdr-panel', role: 'tabpanel' },
+        tab === 'requests' ? h('div', panelProps('requests'),
+          h('div', { className: 'qdr-card' },
+            h('div', { className: 'qdr-usage-head' },
+              h('div', null,
+                h('div', { className: 'qdr-card-title' }, '请求明细'),
+                h('div', { className: 'qdr-card-sub' },
+                  requests
+                    ? `${requests.total} 条${requests.total > (requests.items || []).length ? `（显示最近 ${(requests.items || []).length} 条）` : ''} · ${requests.range.from} ~ ${requests.range.to} · 只记录元数据`
+                    : '完成一次对话或试跑后出现。')),
+              h('div', { className: 'qdr-usage-tools' },
+                h(Segmented, {
+                  value: String(requestDays),
+                  onChange: (value) => setRequestDays(Number(value) || 7),
+                  ariaLabel: '请求时间范围',
+                  options: [['7', '7 天'], ['14', '14 天'], ['30', '30 天']],
+                }),
+                h('select', {
+                  className: 'qdr-select qdr-select-sm', value: requestModel, 'aria-label': '按模型筛选',
+                  onChange: (event) => setRequestModel(event.target.value),
+                },
+                h('option', { value: '' }, '全部模型'),
+                ((requests && requests.models) || []).map((model) => h('option', { key: model, value: model }, modelLabel(model)))),
+                h('button', {
+                  type: 'button', className: `qdr-chip${requestOnlyFailures ? ' qdr-chip-on' : ''}`,
+                  'aria-pressed': requestOnlyFailures,
+                  onClick: () => setRequestOnlyFailures((value) => !value),
+                }, '仅失败'),
+                h(Button, {
+                  size: 'sm', variant: requestsPaused ? 'primary' : 'secondary', icon: requestsPaused ? 'bolt' : 'pause',
+                  onClick: () => setRequestsPaused((value) => !value),
+                }, requestsPaused ? '继续刷新' : '暂停刷新'),
+                h(Button, { size: 'sm', variant: 'ghost', icon: 'download', onClick: exportRequestsCsv }, 'CSV'),
+                h(Button, { size: 'sm', icon: 'refresh', disabled: requestsBusy, onClick: () => loadRequests(requestDays) }, requestsBusy ? '读取中…' : '刷新'))),
+            requestsError ? h('div', { className: 'qdr-inline-warn', role: 'alert' },
+              h('span', null, requestsError),
+              h('button', { type: 'button', className: 'qdr-text-btn', onClick: () => loadRequests(requestDays) }, '重试')) : null,
+            requests && (requests.items || []).length ? h('div', { className: 'qdr-req-scroll' },
+              h('table', { className: 'qdr-req-table' },
+                h('thead', null, h('tr', null,
+                  ['时间', '模型', '状态', '首字', '耗时', '输入', '输出', '账号', 'Credits'].map((label) => h('th', { key: label, scope: 'col' }, label)))),
+                h('tbody', null, (requests.items || []).map((item, index) => h(React.Fragment, { key: `${item.at}-${index}` },
+                  h('tr', null,
+                    h('td', { className: 'qdr-req-time' }, stamp(item.at)),
+                    h('td', null,
+                      h('div', { className: 'qdr-req-model' }, modelLabel(item.model)),
+                      h('div', { className: 'qdr-req-id' }, item.model || '—')),
+                    h('td', null, h('span', { className: `qdr-usage-status qdr-usage-status-${item.ok ? 'ok' : 'bad'}` },
+                      item.ok ? (item.probe ? '试跑' : '成功') : statusLabel(item.status))),
+                    h('td', { className: 'qdr-req-num' }, item.firstByteMs ? duration(item.firstByteMs) : '—'),
+                    h('td', { className: 'qdr-req-num' }, item.latencyMs ? duration(item.latencyMs) : '—'),
+                    h('td', { className: 'qdr-req-num' }, compact(item.promptTokens)),
+                    h('td', { className: 'qdr-req-num' }, compact(item.completionTokens)),
+                    h('td', { className: 'qdr-req-account' }, item.accountLabel || item.account || '—'),
+                    h('td', { className: 'qdr-req-num' }, item.billable === false ? '免费' : (item.credits ? money(item.credits) : '—'))),
+                  !item.ok && item.error ? h('tr', { className: 'qdr-req-error-row' },
+                    h('td', { colSpan: 9 },
+                      h('span', null, `${item.errorCode ? `[${item.errorCode}] ` : ''}${item.error}`),
+                      h('button', {
+                        type: 'button', className: 'qdr-text-btn',
+                        onClick: () => copy(`${item.model} · ${stamp(item.at)}\n${item.error}`, '错误信息'),
+                      }, '复制'))) : null)))))
+              : h('div', { className: 'qdr-quiet' },
+                requestsBusy ? '正在读取请求明细…'
+                  : requestOnlyFailures ? '当前窗口没有失败请求。' : '当前窗口没有请求记录。'))) : null,
+
+        tab === 'account' ? h('div', panelProps('account'),
           h('div', { className: 'qdr-card qdr-account-list-card' },
             h('div', { className: 'qdr-card-head' },
               h('div', null,
@@ -2952,16 +3321,17 @@
                   accountRows.length ? h(Badge, { tone: 'neutral' }, `${accountRows.length} 个`) : null),
                 h('div', { className: 'qdr-card-sub' },
                   signedIn
-                    ? `${identity.text} 点「切换」立即更换插件当前使用的账号。`
+                    ? `${(accountRows.find((row) => row.current) || {}).name || identity.text} 点「切换」立即更换插件当前使用的账号。`
                     : '本机检测到的 Qoder 账号；切换会完成插件登录。')),
               h(Button, {
                 size: 'sm', icon: 'refresh', disabled: busy === 'desktop-scan',
                 onClick: () => run('desktop-scan', async () => { await loadStatus(true, true); await loadCheckin(false); }),
               }, '重新扫描')),
             signedIn && identity.note ? h('div', { className: 'qdr-inline-warn' }, identity.note) : null,
-            accountRows.length ? h('div', { className: 'qdr-account-list' }, accountRows.map((row) => {
+            accountRows.length ? h('div', { className: 'qdr-account-list' }, accountRows.map((row, index) => {
               const checkinInfo = checkinForAccount(row.region, row.uid);
               const checkinInfoMeta = checkinInfo ? checkinMeta(checkinInfo.status) : null;
+              const editing = accountEditing === row.key;
               const meta = [
                 row.regionLabel,
                 row.sourceLabel,
@@ -2972,24 +3342,74 @@
                 h('div', { className: 'qdr-account-mark' }, (row.name || '?').slice(0, 1).toUpperCase()),
                 h('div', { className: 'qdr-account-main' },
                   h('div', { className: 'qdr-account-title' },
-                    h('strong', null, row.name),
+                    editing ? h('input', {
+                      className: 'qdr-input qdr-account-alias',
+                      defaultValue: row.alias || '',
+                      autoFocus: true,
+                      maxLength: 24,
+                      placeholder: row.rawName || row.name,
+                      'aria-label': '账号别名',
+                      onBlur: (event) => saveAccountAlias(row, event.target.value),
+                      onKeyDown: (event) => {
+                        if (event.key === 'Enter') event.currentTarget.blur();
+                        else if (event.key === 'Escape') setAccountEditing('');
+                      },
+                    }) : h('strong', null, row.name),
+                    row.alias ? h(Badge, { tone: 'accent' }, '别名') : null,
                     row.current ? h(Badge, { tone: 'green' }, '当前') : null,
                     row.planLabel ? h(Badge, { tone: 'accent' }, row.planLabel) : null,
                     checkinInfoMeta ? h(Badge, { tone: checkinInfoMeta.tone }, checkinAccountStatus(checkinInfo)) : null),
                   h('div', { className: 'qdr-account-meta' }, meta),
                   row.current ? h('div', { className: 'qdr-account-current-line' },
                     `${row.tokenNeedsRefresh ? '访问令牌待换取' : `令牌到期 ${row.expiresLabel || '—'}`} · 账号 id ${row.uid || '—'}`) : null),
-                row.current
-                  ? h(Badge, { tone: 'green' }, '当前账号')
-                  : h(Button, {
-                    size: 'sm', variant: 'secondary', icon: 'swap',
-                    disabled: busy === 'desktop',
-                    onClick: () => row.candidate && importDesktop(row.candidate),
-                  }, '切换'));
+                h('div', { className: 'qdr-account-row-actions' },
+                  h('button', {
+                    type: 'button', className: 'qdr-icon-btn', title: '上移', 'aria-label': `上移 ${row.name}`,
+                    disabled: index === 0 || Boolean(accountActionBusy),
+                    onClick: () => moveAccount(row, -1),
+                  }, h(Icon, { name: 'up', size: 13 })),
+                  h('button', {
+                    type: 'button', className: 'qdr-icon-btn', title: '下移', 'aria-label': `下移 ${row.name}`,
+                    disabled: index === accountRows.length - 1 || Boolean(accountActionBusy),
+                    onClick: () => moveAccount(row, 1),
+                  }, h(Icon, { name: 'down', size: 13 })),
+                  h('button', {
+                    type: 'button', className: 'qdr-text-btn',
+                    onClick: () => setAccountEditing(editing ? '' : row.key),
+                  }, editing ? '取消' : '改名'),
+                  h('button', {
+                    type: 'button', className: 'qdr-text-btn', disabled: Boolean(accountActionBusy),
+                    onClick: () => toggleAccountHidden(row, true),
+                  }, '隐藏'),
+                  row.current
+                    ? h(Badge, { tone: 'green' }, '当前账号')
+                    : h(Button, {
+                      size: 'sm', variant: 'secondary', icon: 'swap',
+                      disabled: Boolean(accountActionBusy),
+                      onClick: () => switchAccountRow(row),
+                    }, '切换')));
             })) : h(Empty, {
               icon: 'key', title: '没有检测到本机 Qoder 登录',
               detail: '先在 Qoder 客户端登录，或使用下面的浏览器授权 / PAT。',
             }),
+            hiddenAccountRows.length ? h('div', { className: 'qdr-account-hidden' },
+              h('button', {
+                type: 'button', className: 'qdr-disclosure', 'aria-expanded': showHiddenAccounts,
+                onClick: () => setShowHiddenAccounts((value) => !value),
+              },
+              h(Icon, { name: 'lock', size: 14 }),
+              h('span', null, `已隐藏 ${hiddenAccountRows.length} 个账号`),
+              h(Icon, { name: 'chevron', size: 14 })),
+              showHiddenAccounts ? h('div', { className: 'qdr-account-list qdr-account-list-hidden' }, hiddenAccountRows.map((row) => h('div', { className: 'qdr-account-row qdr-account-row-hidden', key: row.key },
+                h('div', { className: 'qdr-account-mark' }, (row.name || '?').slice(0, 1).toUpperCase()),
+                h('div', { className: 'qdr-account-main' },
+                  h('div', { className: 'qdr-account-title' }, h('strong', null, row.name), row.alias ? h(Badge, { tone: 'accent' }, '别名') : null),
+                  h('div', { className: 'qdr-account-meta' }, [row.regionLabel, row.sourceLabel, row.email || (row.uid ? `uid …${row.uid.slice(-6)}` : '本机账号')].filter(Boolean).join(' · '))),
+                h(Button, { size: 'sm', variant: 'ghost', disabled: Boolean(accountActionBusy), onClick: () => toggleAccountHidden(row, false) }, '恢复')))) : null,
+              h('button', {
+                type: 'button', className: 'qdr-text-btn', disabled: Boolean(accountActionBusy),
+                onClick: () => saveAccountPrefs({ restoreAll: true }, '已恢复全部隐藏账号'),
+              }, '恢复全部')) : null,
             h('div', { className: 'qdr-account-list-foot' },
               h('div', { className: 'qdr-account-foot-note' },
                 h(Icon, { name: 'lock', size: 13 }),
@@ -3027,7 +3447,34 @@
             h(Icon, { name: 'lock', size: 14 }),
             h('span', null, '凭据文件：' + ((status && status.config && status.config.authPath) || '本机 dsh 数据目录') + ` · ${credentialProtection} 加密`))) : null,
 
-        tab === 'diagnose' && status ? h('div', { className: 'qdr-panel', role: 'tabpanel' },
+        tab === 'logs' ? h('div', panelProps('logs'),
+          h('div', { className: 'qdr-card' },
+            h('div', { className: 'qdr-usage-head' },
+              h('div', null,
+                h('div', { className: 'qdr-card-title' }, '日志'),
+                h('div', { className: 'qdr-card-sub' },
+                  logs
+                    ? `${(logs.lines || []).length} 行${logs.query ? `（筛选：${logs.query}）` : ''} · 已脱敏，不包含对话正文或令牌`
+                    : '只显示最近 200 行运行日志')),
+              h('div', { className: 'qdr-usage-tools' },
+                h('input', {
+                  type: 'search', className: 'qdr-input qdr-log-search', value: logsQuery,
+                  placeholder: '筛选关键字…', 'aria-label': '筛选日志',
+                  onChange: (event) => setLogsQuery(event.target.value),
+                  onKeyDown: (event) => { if (event.key === 'Enter') setLogsApplied(logsQuery.trim()); },
+                }),
+                h(Button, { size: 'sm', variant: 'secondary', icon: 'search', onClick: () => setLogsApplied(logsQuery.trim()) }, '筛选'),
+                h(Button, {
+                  size: 'sm', variant: logsPaused ? 'primary' : 'secondary', icon: logsPaused ? 'bolt' : 'pause',
+                  onClick: () => setLogsPaused((value) => !value),
+                }, logsPaused ? '继续刷新' : '暂停刷新'),
+                h(Button, { size: 'sm', variant: 'ghost', icon: 'copy', onClick: () => copy((logs && logs.lines || []).join('\n'), '日志') }, '复制全部'),
+                h(Button, { size: 'sm', icon: 'refresh', disabled: logsBusy, onClick: () => loadLogs({ query: logsApplied }) }, logsBusy ? '读取中…' : '刷新'))),
+            logsError ? h('div', { className: 'qdr-inline-warn', role: 'alert' }, h('span', null, logsError)) : null,
+            h('pre', { className: 'qdr-log-view' }, logs && (logs.lines || []).length ? (logs.lines || []).join('\n') : (logsBusy ? '正在读取…' : '暂无日志'))
+          )) : null,
+
+        tab === 'diagnose' && status ? h('div', panelProps('diagnose'),
           h('div', { className: 'qdr-card' },
             h('div', { className: 'qdr-card-head' },
               h('div', null,
@@ -3035,6 +3482,14 @@
                 h('div', { className: 'qdr-card-sub' }, '凭据 / 令牌 / 目录 / 路由 / 存储 / 偏好 / 额度')),
               h('div', { className: 'qdr-card-actions' },
                 h(Button, { size: 'sm', icon: 'refresh', disabled: busy === 'diag', onClick: () => run('diag', loadDiagnostics) }, busy === 'diag' ? '检查中…' : '重新检查'),
+                h(Button, {
+                  size: 'sm', variant: 'secondary', icon: 'copy', disabled: busy === 'diag-bundle',
+                  onClick: () => run('diag-bundle', async () => {
+                    const data = await getJson('/qoder/diagnostics?bundle=1', { panel: true, timeoutMs: DEEP_TIMEOUT_MS });
+                    if (!data.bundle) throw new Error('诊断包生成失败');
+                    await copy(JSON.stringify(data.bundle, null, 2), '诊断包');
+                  }),
+                }, busy === 'diag-bundle' ? '生成中…' : '诊断包'),
                 h(Button, { size: 'sm', variant: 'ghost', icon: 'copy', disabled: !diagnostics, onClick: () => {
                   const lines = [
                     `qoder-to-dsh ${status.version || ''} · provider=${status.provider || 'qoder'}`,
@@ -3059,6 +3514,9 @@
                 h('div', { className: 'qdr-card-sub' }, '面板、模型选择器和请求共用这一份进程状态。'))),
             h('div', { className: 'qdr-kv qdr-kv-wide' },
               h('span', null, '版本'), h('strong', null, status.version || '—'),
+              h('span', null, 'Qoder 客户端'), h('strong', { className: 'qdr-mono' }, status.client ? `${status.client.appVersion || '—'} · CLI ${status.client.cliVersion || '—'}` : '—'),
+              h('span', null, 'COSY / UA'), h('strong', { className: 'qdr-mono' }, status.client ? `${status.client.cosyVersion || '—'} · ${status.client.oauthUa || '—'}` : '—'),
+              h('span', null, '协议来源'), h('strong', null, status.client && status.client.protocolSource ? `${status.client.protocolSource.cosy || '—'} / ${status.client.protocolSource.ua || '—'}` : '—'),
               h('span', null, 'provider'), h('strong', { className: 'qdr-mono' }, status.provider || 'qoder'),
               h('span', null, 'Node'), h('strong', { className: 'qdr-mono' }, status.runtime && status.runtime.node || '—'),
               h('span', null, '进程'), h('strong', { className: 'qdr-mono' }, String(status.runtime && status.runtime.pid || '—')),
@@ -3365,6 +3823,10 @@
 .qdr-quota-grid>div{display:flex;flex-direction:column;gap:2px;min-width:0}
 .qdr-quota-grid span{font-size:0.59375rem;color:var(--qdr-faint);letter-spacing:.02em;white-space:nowrap}
 .qdr-quota-grid strong{font-size:0.71875rem;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.qdr-quota-packs{display:flex;flex-direction:column;gap:4px;margin-top:9px;padding-top:9px;border-top:1px solid var(--qdr-line)}
+.qdr-quota-pack{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:0.65625rem;color:var(--qdr-muted)}
+.qdr-quota-pack-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.qdr-quota-pack strong{font-size:0.71875rem;font-variant-numeric:tabular-nums;white-space:nowrap}
 .qdr-quota-links{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:9px;padding-top:9px;border-top:1px solid var(--qdr-line)}
 .qdr-quota-link{display:inline-flex;align-items:center;gap:4px;font-size:0.65625rem;color:var(--qdr-accent);text-decoration:none;transition:opacity .18s ease}
 .qdr-quota-link:hover{text-decoration:underline}
@@ -3400,6 +3862,22 @@
 .qdr-usage-error{display:flex;align-items:flex-start;gap:8px;margin-top:5px;padding:6px 8px;border-radius:6px;background:var(--qdr-bad-weak);color:var(--qdr-bad);font-size:0.625rem;line-height:1.45;overflow-wrap:anywhere}
 .qdr-usage-error>span{flex:1;min-width:0}
 .qdr-usage-error .qdr-text-btn{color:inherit;flex:none}
+.qdr-req-scroll{overflow-x:auto;margin-top:10px;border:1px solid var(--qdr-line);border-radius:9px}
+.qdr-req-table{width:100%;border-collapse:collapse;font-size:0.65625rem;min-width:760px}
+.qdr-req-table th{text-align:left;font-weight:600;color:var(--qdr-faint);padding:7px 9px;border-bottom:1px solid var(--qdr-line);background:var(--qdr-soft);white-space:nowrap}
+.qdr-req-table td{padding:7px 9px;border-bottom:1px solid var(--qdr-line);vertical-align:top;white-space:nowrap}
+.qdr-req-table tr:last-child td{border-bottom:none}
+.qdr-req-table tbody tr:hover{background:var(--qdr-soft)}
+.qdr-req-time{font-variant-numeric:tabular-nums;color:var(--qdr-muted)}
+.qdr-req-model{font-weight:600;max-width:190px;overflow:hidden;text-overflow:ellipsis}
+.qdr-req-id{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:0.5625rem;color:var(--qdr-faint);max-width:190px;overflow:hidden;text-overflow:ellipsis}
+.qdr-req-num{font-variant-numeric:tabular-nums;text-align:right}
+.qdr-req-account{max-width:150px;overflow:hidden;text-overflow:ellipsis}
+.qdr-req-error-row td{background:var(--qdr-bad-weak);color:var(--qdr-bad);white-space:normal;line-height:1.45;overflow-wrap:anywhere}
+.qdr-req-error-row .qdr-text-btn{color:inherit;margin-left:8px}
+.qdr-select-sm{max-width:150px;height:28px;padding:3px 8px;font-size:0.65625rem}
+.qdr-log-search{max-width:220px;height:28px;padding:3px 8px;font-size:0.6875rem}
+.qdr-log-view{margin:10px 0 0;padding:10px 12px;max-height:460px;overflow:auto;background:var(--qdr-soft);border:1px solid var(--qdr-line);border-radius:9px;font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:0.625rem;line-height:1.6;white-space:pre-wrap;overflow-wrap:anywhere;color:var(--qdr-muted)}
 /* ── 试跑 ──────────────────────────────────────────────────────── */
 .qdr-trial-price{display:flex;gap:4px;flex-wrap:wrap;flex:none}
 .qdr-trial-form{display:flex;flex-direction:column;gap:10px;margin-top:11px}
@@ -3473,6 +3951,13 @@
 .qdr-account-row .qdr-account-meta{font-size:0.65625rem;color:var(--qdr-muted);margin-top:3px;letter-spacing:.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .qdr-account-current-line{margin-top:6px;padding-top:6px;border-top:1px solid var(--qdr-line);font-family:ui-monospace,SFMono-Regular,Consolas,monospace;font-size:0.59375rem;color:var(--qdr-faint);overflow-wrap:anywhere}
 .qdr-account-row>button{flex:none;margin-top:1px}
+.qdr-account-row-actions{display:flex;align-items:center;gap:4px;flex-wrap:wrap;justify-content:flex-end;flex:none;max-width:46%}
+.qdr-account-row-actions .qdr-icon-btn{width:24px;height:24px;padding:0;justify-content:center}
+.qdr-account-alias{height:28px;padding:4px 8px;font-size:0.75rem;max-width:220px}
+.qdr-account-hidden{margin-top:10px;padding-top:9px;border-top:1px solid var(--qdr-line)}
+.qdr-account-list-hidden{margin-top:6px}
+.qdr-account-row-hidden{opacity:.72;background:transparent;border-style:dashed}
+.qdr-account-row-hidden:hover{transform:none}
 .qdr-account-list-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:12px;padding-top:11px;border-top:1px solid var(--qdr-line)}
 .qdr-account-foot-note{display:flex;align-items:flex-start;gap:6px;font-size:0.625rem;color:var(--qdr-faint);line-height:1.45;min-width:0}
 .qdr-account-foot-note svg{flex:none;margin-top:1px}
@@ -3803,6 +4288,8 @@
     exports.getJson = getJson;
     exports.postJson = postJson;
     exports.safeHref = safeHref;
+    exports.csvCell = csvCell;
+    exports.toCsv = toCsv;
     exports.versionNotice = versionNotice;
     exports.settingsNotice = settingsNotice;
     exports.usageBadges = usageBadges;

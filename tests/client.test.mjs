@@ -295,3 +295,19 @@ test('a per-request timeout can outlive the default so deep diagnostics can fini
   );
   assert.ok(Date.now() - started < 1000, '应按本次请求的 30ms 超时，而不是默认 20 秒');
 });
+
+test('CSV cells guard formula injection, quotes and newlines', async () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  assert.equal(exports.csvCell('=cmd|\' /C calc\'!A0'), '"\'=cmd|\' /C calc\'!A0"');
+  assert.equal(exports.csvCell('+1'), '"\'+1"');
+  assert.equal(exports.csvCell('-2'), '"\'-2"');
+  assert.equal(exports.csvCell('@x'), '"\'@x"');
+  assert.equal(exports.csvCell('a"b'), '"a""b"');
+  assert.equal(exports.csvCell('line\nbreak'), '"line\nbreak"');
+  assert.equal(exports.csvCell(null), '""');
+
+  const csv = exports.toCsv(['model', 'error'], [['m', '=HYPERLINK("http://x")'], ['n', 'ok']]);
+  assert.ok(csv.startsWith('\ufeff'), 'CSV 需要 BOM 让 Excel 识别 UTF-8');
+  assert.match(csv, /"'=HYPERLINK\(""http:\/\/x""\)"/);
+  assert.match(csv, /\r\n/);
+});
