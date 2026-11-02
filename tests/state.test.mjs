@@ -67,6 +67,7 @@ test('summarizeUsage aggregates a window and per-model breakdown', () => {
   assert.equal(summary.totals.failures, 1);
   assert.equal(summary.totals.credits, 0.35);
   assert.equal(summary.totals.cachedTokens, 20);
+  assert.equal(summary.totals.cacheHitRate, 20 / 180);
   assert.equal(summary.totals.reasoningTokens, 10);
   assert.equal(summary.totals.avgFirstByteMs, 73);
   assert.deepEqual(summary.byModel.map((item) => item.model), ['alpha', 'beta']);
@@ -74,6 +75,7 @@ test('summarizeUsage aggregates a window and per-model breakdown', () => {
   assert.equal(alpha.requests, 2);
   assert.equal(alpha.tokens, 200);
   assert.equal(alpha.successRate, 0.5);
+  assert.equal(alpha.cacheHitRate, 0.2);
   assert.equal(alpha.avgLatencyMs, 750);
   assert.equal(alpha.share, 200 / 300);
   assert.equal(summary.byModel[1].share, 100 / 300);

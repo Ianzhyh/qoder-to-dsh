@@ -239,6 +239,7 @@ const REQUIRED = [
   'lib/desktop-auth.mjs',
   'lib/diagnostics.mjs',
   'lib/models.mjs',
+  'lib/pat-store.mjs',
   'lib/qoder-api.mjs',
   'lib/qoder-sign.mjs',
   'lib/quota.mjs',

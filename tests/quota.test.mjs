@@ -95,6 +95,25 @@ test('account mismatch and old-build responses become warnings', () => {
   assert.ok(view.warnings.some((warning) => warning.code === 'stale'));
 });
 
+test('quota expiry marks the 7-day window and expired packs', () => {
+  const now = Date.now();
+  const soon = normalizeQuota({
+    userQuota: { total: 10, remaining: 5, used: 5, unit: 'credits' },
+    expiresAt: now + 3 * 86400000,
+  }, { now });
+  assert.equal(soon.daysToExpiry, 3);
+  assert.equal(soon.expiringSoon, true);
+  assert.equal(soon.expired, false);
+
+  const expired = normalizeQuota({
+    userQuota: { total: 10, remaining: 0, used: 10, unit: 'credits' },
+    expiresAt: now - 2 * 86400000,
+  }, { now });
+  assert.equal(expired.expired, true);
+  assert.equal(expired.expiringSoon, false);
+  assert.equal(expired.daysToExpiry, -2);
+});
+
 test('missing payload stays missing instead of a fake zero', () => {
   assert.equal(normalizeQuota(null), null);
   const empty = normalizeQuota({ userQuota: null, addOnQuota: null });

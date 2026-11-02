@@ -107,7 +107,7 @@ test('plugin registers one adapter, its tools, command and all panel routes', ()
   assert.ok(adapters[0].adapter && typeof adapters[0].adapter.stream === 'function');
   assert.deepEqual(tools.map((item) => item.name).sort(), ['qoder_diagnose', 'qoder_models', 'qoder_status', 'qoder_usage']);
   assert.deepEqual(commands.map((item) => item.name), ['qoder']);
-  assert.equal(routes.length, 23);
+  assert.equal(routes.length, 26);
   assert.ok(effects.length >= 2);
 });
 
@@ -176,7 +176,7 @@ test('recent usage follows the selected day window', async () => {
 
 test('requests endpoint filters by day, model and failures', async () => {
   const { appendUsage } = await import('../lib/state.mjs');
-  appendUsage({ at: Date.now(), model: 'req-a', ok: true, totalTokens: 3, account: 'uid:abcd1234' });
+  appendUsage({ at: Date.now(), model: 'req-a', ok: true, totalTokens: 3, promptTokens: 100, cachedTokens: 40, account: 'uid:abcd1234' });
   appendUsage({ at: Date.now(), model: 'req-b', ok: false, totalTokens: 4, error: 'boom' });
   appendUsage({ at: Date.now() - 10 * 86400000, model: 'req-old', ok: false, totalTokens: 5 });
 
@@ -185,6 +185,7 @@ test('requests endpoint filters by day, model and failures', async () => {
   assert.ok(week.json.items.some((item) => item.model === 'req-a'));
   assert.ok(week.json.items.some((item) => item.model === 'req-b'));
   assert.ok(!week.json.items.some((item) => item.model === 'req-old'), '7 天窗口外不应出现');
+  assert.equal(week.json.cacheHitRate, 0.4);
 
   const failed = await call('GET', '/qoder/requests?days=7&onlyFailures=1');
   assert.ok(failed.json.items.every((item) => item.ok === false));
@@ -367,6 +368,23 @@ test('diagnostics bundle is sanitized and logs can be filtered', async () => {
   assert.equal(logs.status, 200);
   assert.ok(Array.isArray(logs.json.lines));
   assert.equal(logs.json.query, '__no_such_log__');
+});
+
+test('PAT library lists metadata and guards switch/delete', async () => {
+  const list = await call('GET', '/qoder/pats');
+  assert.equal(list.status, 200);
+  assert.ok(Array.isArray(list.json.entries));
+  assert.equal(typeof list.json.count, 'number');
+
+  const switchDenied = await call('POST', '/qoder/pats/switch', { body: { id: 'x' } });
+  assert.equal(switchDenied.status, 403);
+  const switchMissing = await call('POST', '/qoder/pats/switch', { panel: true, body: {} });
+  assert.equal(switchMissing.status, 400);
+
+  const deleteDenied = await call('POST', '/qoder/pats/delete', { body: { id: 'x' } });
+  assert.equal(deleteDenied.status, 403);
+  const deleteMissing = await call('POST', '/qoder/pats/delete', { panel: true, body: {} });
+  assert.equal(deleteMissing.status, 400);
 });
 
 test('side-effect GETs require the panel header', async () => {

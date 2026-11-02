@@ -375,6 +375,9 @@
           unit: (user && user.unit) || (addOn && addOn.unit) || 'credits',
           exceeded: view.exceeded,
           expiresAt: view.expiresAt,
+          daysToExpiry: view.daysToExpiry,
+          expiringSoon: view.expiringSoon === true,
+          expired: view.expired === true,
           user,
           addOn,
           packages: view.packages,
@@ -740,12 +743,14 @@
               h('div', { className: 'qdr-card-title' }, '额度'),
               info.planName ? h(Badge, { tone: info.planPaid ? 'green' : 'accent' }, info.planName) : null,
               unlimited ? h(Badge, { tone: 'green' }, '不限量') : null,
+              info.expired ? h(Badge, { tone: 'amber' }, '额度已过期') : null,
+              !info.expired && info.expiringSoon ? h(Badge, { tone: 'amber' }, `${info.daysToExpiry === 0 ? '今天' : `${info.daysToExpiry} 天后`}到期`) : null,
               info.exceeded ? h(Badge, { tone: 'amber' }, '已用尽') : null,
               mismatch ? h(Badge, { tone: 'amber', title: '上游返回的额度 userId 与当前登录账号不一致' }, '账号不一致') : null,
               oldBuild ? h(Badge, { tone: 'amber', title: '额度接口返回 404/405，宿主可能是旧构建' }, '需重启 dsh') : null,
               info.stale ? h(Badge, { tone: 'amber', title: '上游额度读取失败或尚未刷新' }, '数据可能已过期') : null),
             h('div', { className: 'qdr-card-sub' },
-              info.expiresAt ? `到期 ${dateLabel(info.expiresAt)}` : (unlimited ? '不限期' : '上游未提供到期时间'),
+              info.expiresAt ? `到期 ${dateLabel(info.expiresAt)}${info.expired ? '（已过期）' : info.expiringSoon ? `（${info.daysToExpiry === 0 ? '今天' : `${info.daysToExpiry} 天后`}）` : ''}` : (unlimited ? '不限期' : '上游未提供到期时间'),
               info.unit ? ` · 单位 ${unitText}` : '',
               info.at ? ` · 更新于 ${stamp(info.at)}` : '')),
           h('div', { className: 'qdr-card-actions' },
@@ -1774,6 +1779,9 @@
       const [pat, setPat] = useState('');
       const [patError, setPatError] = useState('');
       const [showPat, setShowPat] = useState(false);
+      const [pats, setPats] = useState(null);
+      const [patBusy, setPatBusy] = useState('');
+      const [patStoreError, setPatStoreError] = useState('');
       const [dark, setDark] = useState(false);
       const [savedContext, setSavedContext] = useState({});
       const [savedParams, setSavedParams] = useState({});
@@ -2128,6 +2136,54 @@
           });
       }, [applyAccountPayload, notifyAuth, showNotice]);
 
+      const loadPats = useCallback(async () => {
+        try {
+          const data = await getJson('/qoder/pats');
+          if (!mounted.current) return;
+          setPats(data);
+          setPatStoreError(String(data.error || ''));
+        } catch (err) {
+          if (mounted.current) setPatStoreError(String(err.message || err));
+        }
+      }, []);
+
+      const switchPat = useCallback(async (id) => {
+        if (!id) return;
+        setPatBusy(`switch:${id}`);
+        setPatStoreError('');
+        try {
+          const data = await postJson('/qoder/pats/switch', { id });
+          if (!mounted.current) return;
+          if (data.ok === false) throw new Error(data.error || '切换失败');
+          setPats(data);
+          setShowPat(false);
+          showNotice('ok', '已切换 PAT 账号');
+          notifyAuth();
+        } catch (err) {
+          if (mounted.current) setPatStoreError(String(err.message || err));
+        } finally {
+          if (mounted.current) setPatBusy('');
+        }
+      }, [notifyAuth, showNotice]);
+
+      const deletePat = useCallback(async (entry) => {
+        if (!entry || entry.active) return;
+        if (!window.confirm(`删除 PAT「${entry.label || entry.name || entry.uidTail}」？\n只删除本机保存的凭据，不影响 Qoder 账号或当前登录。`)) return;
+        setPatBusy(`delete:${entry.id}`);
+        setPatStoreError('');
+        try {
+          const data = await postJson('/qoder/pats/delete', { id: entry.id });
+          if (!mounted.current) return;
+          if (data.ok === false) throw new Error(data.error || '删除失败');
+          setPats(data);
+          showNotice('ok', 'PAT 已删除');
+        } catch (err) {
+          if (mounted.current) setPatStoreError(String(err.message || err));
+        } finally {
+          if (mounted.current) setPatBusy('');
+        }
+      }, [showNotice]);
+
       const loadCredits = useCallback(async (range) => {
         const seq = ++creditsSeq.current;
         setCreditsBusy(true);
@@ -2324,6 +2380,10 @@
       useVisibilityPoll(() => loadCheckin(true), 30_000, tab === 'checkin' || tab === 'account' || (tab === 'overview' && Boolean(status && status.signedIn)));
 
       useEffect(() => {
+        if (tab === 'account') loadPats();
+      }, [tab, loadPats]);
+
+      useEffect(() => {
         if (!switcherOpen) return undefined;
         const onKey = (event) => { if (event.key === 'Escape') setSwitcherOpen(false); };
         const onPointer = (event) => {
@@ -2422,8 +2482,9 @@
           if (!result.ok) throw new Error(result.error || 'PAT 登录失败');
           setPat('');
           setShowPat(false);
-          showNotice('ok', '登录成功，模型目录已刷新。');
+          showNotice('ok', result.savedPat ? '登录成功，PAT 已保存到凭据库。' : '登录成功，模型目录已刷新。');
           notifyAuth();
+          await loadPats();
         } catch (err) {
           if (mounted.current) setPatError(String(err.message || err));
         } finally {
@@ -2583,12 +2644,13 @@
         const items = (requests && requests.items) || [];
         if (!items.length) { showNotice('error', '当前筛选没有可导出的请求'); return; }
         downloadCsv('qoder-requests.csv',
-          ['time', 'model', 'ok', 'status', 'probe', 'firstByteMs', 'latencyMs', 'promptTokens', 'completionTokens', 'cachedTokens', 'reasoningTokens', 'credits', 'savedCredits', 'account', 'client', 'errorCode', 'error'],
+          ['time', 'model', 'ok', 'status', 'probe', 'firstByteMs', 'latencyMs', 'promptTokens', 'completionTokens', 'cachedTokens', 'cacheHitRate', 'reasoningTokens', 'credits', 'savedCredits', 'account', 'client', 'errorCode', 'error'],
           items.map((item) => [
             new Date(item.at).toISOString(), item.model, item.ok ? 'ok' : 'fail', item.status,
             item.probe ? 'probe' : '', item.firstByteMs, item.latencyMs,
-            item.promptTokens, item.completionTokens, item.cachedTokens, item.reasoningTokens,
-            item.credits, item.savedCredits, item.accountLabel || item.account, item.client,
+            item.promptTokens, item.completionTokens, item.cachedTokens,
+            item.promptTokens ? Number((item.cachedTokens / item.promptTokens).toFixed(4)) : '',
+            item.reasoningTokens, item.credits, item.savedCredits, item.accountLabel || item.account, item.client,
             item.errorCode, item.error,
           ]));
         showNotice('ok', '请求 CSV 已导出');
@@ -3169,7 +3231,7 @@
             : h(React.Fragment, null,
               h('div', { className: 'qdr-stats qdr-stats-6' },
                 h(Stat, { label: '请求', value: String(usageTotals ? usageTotals.requests : 0), hint: usageTotals && usageTotals.failures ? `${usageTotals.failures} 次失败` : '窗口内' }),
-                h(Stat, { label: 'Tokens', value: compact(usageTotals ? usageTotals.tokens : 0), hint: usageTotals ? `${compact(usageTotals.promptTokens)} 入 / ${compact(usageTotals.completionTokens)} 出` : '' }),
+                h(Stat, { label: 'Tokens', value: compact(usageTotals ? usageTotals.tokens : 0), hint: usageTotals ? `${compact(usageTotals.promptTokens)} 入 / ${compact(usageTotals.completionTokens)} 出${usageTotals.cacheHitRate !== null && usageTotals.cacheHitRate !== undefined ? ` · 缓存命中 ${pct(usageTotals.cacheHitRate)}` : ''}` : '' }),
                 h(Stat, { label: 'Credits', value: usageTotals ? money(usageTotals.credits) : '—', hint: usageTotals && usageTotals.savedCredits ? `实扣 · 已省 ${money(usageTotals.savedCredits)}` : '上游实扣' }),
                 h(Stat, { label: '成功率', value: pct(usageTotals && usageTotals.successRate), tone: usageTotals && usageTotals.successRate !== null && usageTotals.successRate < 0.9 ? 'warn' : undefined }),
                 h(Stat, { label: '平均首字', value: usageTotals && usageTotals.avgFirstByteMs ? duration(usageTotals.avgFirstByteMs) : '—', hint: '上游首包' }),
@@ -3255,7 +3317,7 @@
                 h('div', { className: 'qdr-card-title' }, '请求明细'),
                 h('div', { className: 'qdr-card-sub' },
                   requests
-                    ? `${requests.total} 条${requests.total > (requests.items || []).length ? `（显示最近 ${(requests.items || []).length} 条）` : ''} · ${requests.range.from} ~ ${requests.range.to} · 只记录元数据`
+                    ? `${requests.total} 条${requests.total > (requests.items || []).length ? `（显示最近 ${(requests.items || []).length} 条）` : ''} · ${requests.range.from} ~ ${requests.range.to} · 只记录元数据${requests.cacheHitRate !== null && requests.cacheHitRate !== undefined ? ` · 缓存命中 ${pct(requests.cacheHitRate)}` : ''}`
                     : '完成一次对话或试跑后出现。')),
               h('div', { className: 'qdr-usage-tools' },
                 h(Segmented, {
@@ -3287,7 +3349,7 @@
             requests && (requests.items || []).length ? h('div', { className: 'qdr-req-scroll' },
               h('table', { className: 'qdr-req-table' },
                 h('thead', null, h('tr', null,
-                  ['时间', '模型', '状态', '首字', '耗时', '输入', '输出', '账号', 'Credits'].map((label) => h('th', { key: label, scope: 'col' }, label)))),
+                  ['时间', '模型', '状态', '首字', '耗时', '输入', '输出', '缓存', '账号', 'Credits'].map((label) => h('th', { key: label, scope: 'col' }, label)))),
                 h('tbody', null, (requests.items || []).map((item, index) => h(React.Fragment, { key: `${item.at}-${index}` },
                   h('tr', null,
                     h('td', { className: 'qdr-req-time' }, stamp(item.at)),
@@ -3300,10 +3362,14 @@
                     h('td', { className: 'qdr-req-num' }, item.latencyMs ? duration(item.latencyMs) : '—'),
                     h('td', { className: 'qdr-req-num' }, compact(item.promptTokens)),
                     h('td', { className: 'qdr-req-num' }, compact(item.completionTokens)),
+                    h('td', { className: 'qdr-req-num', title: item.cachedTokens ? `${compact(item.cachedTokens)} 缓存 tokens / ${compact(item.promptTokens)} 输入` : '没有命中前缀缓存' },
+                      item.cachedTokens
+                        ? `${compact(item.cachedTokens)}${item.promptTokens ? ` · ${Math.round(item.cachedTokens / item.promptTokens * 100)}%` : ''}`
+                        : '—'),
                     h('td', { className: 'qdr-req-account' }, item.accountLabel || item.account || '—'),
                     h('td', { className: 'qdr-req-num' }, item.billable === false ? '免费' : (item.credits ? money(item.credits) : '—'))),
                   !item.ok && item.error ? h('tr', { className: 'qdr-req-error-row' },
-                    h('td', { colSpan: 9 },
+                    h('td', { colSpan: 10 },
                       h('span', null, `${item.errorCode ? `[${item.errorCode}] ` : ''}${item.error}`),
                       h('button', {
                         type: 'button', className: 'qdr-text-btn',
@@ -3427,10 +3493,44 @@
             onCancel: () => setDevice(null),
           }),
 
+          h('div', { className: 'qdr-card qdr-pat-card' },
+            h('div', { className: 'qdr-card-head' },
+              h('div', null,
+                h('div', { className: 'qdr-card-title' }, 'PAT 凭据',
+                  pats && pats.count ? h(Badge, { tone: 'neutral' }, `${pats.count} 个`) : null),
+                h('div', { className: 'qdr-card-sub' }, '加密保存在本机；切换会重新换取短期令牌，面板不返回 PAT。')),
+              h(Button, { size: 'sm', icon: 'refresh', disabled: !pats && Boolean(patBusy), onClick: loadPats }, '刷新')),
+            patStoreError ? h('div', { className: 'qdr-inline-warn', role: 'alert' }, h('span', null, `PAT 凭据库：${patStoreError}`)) : null,
+            pats && pats.entries && pats.entries.length ? h('div', { className: 'qdr-pat-list' }, pats.entries.map((entry) => h('div', { className: 'qdr-pat-row', key: entry.id },
+              h('div', { className: 'qdr-account-mark' }, 'P'),
+              h('div', { className: 'qdr-account-main' },
+                h('div', { className: 'qdr-account-title' },
+                  h('strong', null, entry.label || entry.name || `uid …${entry.uidTail || '—'}`),
+                  entry.active ? h(Badge, { tone: 'green' }, '当前') : null),
+                h('div', { className: 'qdr-account-meta' },
+                  [entry.regionLabel, entry.uidTail ? `uid …${entry.uidTail}` : '', entry.email,
+                    entry.lastUsedAt ? `上次使用 ${stamp(entry.lastUsedAt)}` : `添加于 ${stamp(entry.addedAt)}`]
+                    .filter(Boolean).join(' · '))),
+              h('div', { className: 'qdr-account-row-actions' },
+                entry.active ? h(Badge, { tone: 'green' }, '当前账号') : h(Button, {
+                  size: 'sm', variant: 'secondary', icon: 'swap', disabled: Boolean(patBusy),
+                  onClick: () => switchPat(entry.id),
+                }, patBusy === `switch:${entry.id}` ? '切换中…' : '切换'),
+                h(Button, {
+                  size: 'sm', variant: 'ghost', icon: 'trash',
+                  disabled: entry.active || Boolean(patBusy),
+                  title: entry.active ? '当前账号正在使用；先切换或退出登录' : '只删除本机保存的 PAT',
+                  onClick: () => deletePat(entry),
+                }, patBusy === `delete:${entry.id}` ? '删除中…' : '删除'))))
+            ) : h('div', { className: 'qdr-quiet' }, '还没有保存的 PAT；在下方粘贴 pt- 令牌即可保存。'),
+            h('div', { className: 'qdr-foot-note' },
+              h(Icon, { name: 'lock', size: 14 }),
+              h('span', null, 'PAT 与访问令牌都用本机 DPAPI / AES-GCM 加密；面板和诊断包都不会返回令牌。'))),
+
           h('div', { className: 'qdr-card' },
             h('button', { type: 'button', className: 'qdr-disclosure', onClick: () => setShowPat((value) => !value), 'aria-expanded': showPat },
               h(Icon, { name: 'key', size: 15 }),
-              h('span', null, '使用 PAT 或访问令牌'),
+              h('span', null, '添加 PAT 或访问令牌'),
               h(Icon, { name: 'chevron', size: 14 })),
             showPat ? h('div', { className: 'qdr-pat' },
               h(Segmented, {
@@ -3440,7 +3540,7 @@
               h('input', { type: 'password', className: 'qdr-input', placeholder: 'pt-… / dt-… / jt-…', value: pat, onChange: (event) => { setPat(event.target.value); if (patError) setPatError(''); }, 'aria-label': 'PAT 或访问令牌', 'aria-invalid': Boolean(patError) }),
               patError ? h('div', { className: 'qdr-inline-warn', role: 'alert' }, patError) : null,
               h('div', { className: 'qdr-pat-foot' },
-                h('span', { className: 'qdr-hint' }, 'PAT 会先换取短期令牌；令牌加密保存在本机。'),
+                h('span', { className: 'qdr-hint' }, 'pt- 会保存到上方 PAT 凭据库；dt-/jt- 只作为一次性令牌，不保存。'),
                 h(Button, { size: 'sm', variant: 'primary', disabled: busy === 'pat', onClick: submitPat }, '登录'))) : null),
 
           h('div', { className: 'qdr-foot-note' },
@@ -3908,6 +4008,7 @@
 .qdr-chat-usage-num{color:rgba(127,127,127,.95);font-variant-numeric:tabular-nums}
 .qdr-chat-usage-label{color:rgba(127,127,127,.9);font-size:0.625rem}
 .qdr-chat-usage-quota{font-weight:650;font-variant-numeric:tabular-nums;letter-spacing:-.01em}
+.qdr-chat-usage-pct{font-size:0.59375rem;color:rgba(127,127,127,.9);font-variant-numeric:tabular-nums;white-space:nowrap}
 .qdr-chat-usage-low{color:var(--qdr-bad);background:var(--qdr-bad-weak);border-color:transparent}
 .qdr-chat-usage-low .qdr-logo{background:var(--qdr-bad)!important}
 /* ── 绿色主题补充：额度首屏、账号切换、签到 ─────────────────────── */
@@ -3958,6 +4059,13 @@
 .qdr-account-list-hidden{margin-top:6px}
 .qdr-account-row-hidden{opacity:.72;background:transparent;border-style:dashed}
 .qdr-account-row-hidden:hover{transform:none}
+.qdr-pat-list{display:flex;flex-direction:column;gap:7px;margin-top:10px}
+.qdr-pat-row{display:flex;align-items:flex-start;gap:10px;padding:10px 11px;background:var(--qdr-soft);border:1px solid var(--qdr-line);border-radius:12px;min-width:0}
+.qdr-pat-row .qdr-account-main{flex:1;min-width:0}
+.qdr-pat-row .qdr-account-title{display:flex;align-items:center;gap:6px;flex-wrap:wrap;font-size:0.78125rem;min-width:0}
+.qdr-pat-row .qdr-account-title strong{font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:100%}
+.qdr-pat-row .qdr-account-meta{font-size:0.65625rem;color:var(--qdr-muted);margin-top:3px;letter-spacing:.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.qdr-pat-row .qdr-account-row-actions{max-width:45%}
 .qdr-account-list-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-top:12px;padding-top:11px;border-top:1px solid var(--qdr-line)}
 .qdr-account-foot-note{display:flex;align-items:flex-start;gap:6px;font-size:0.625rem;color:var(--qdr-faint);line-height:1.45;min-width:0}
 .qdr-account-foot-note svg{flex:none;margin-top:1px}
@@ -4235,9 +4343,9 @@
         ? ((Number(accountExtras.at) || 0) >= (Number(statusExtras.at) || 0) ? accountExtras : statusExtras)
         : (accountExtras || statusExtras);
       const quota = quotaSummary(extras);
-      const low = quota && (quota.exceeded || quota.ratio >= 0.9);
+      const low = quota && (quota.exceeded || quota.ratio >= 0.9 || quota.expiringSoon || quota.expired);
       const title = quota
-        ? `Qoder 额度：${money(quota.remaining)} / ${money(quota.total)} ${quota.unit} · 已用 ${Math.round(quota.ratio * 100)}%${quota.at ? ` · 更新于 ${stamp(quota.at)}` : ''}${quota.expiresAt ? ` · ${dateLabel(quota.expiresAt)} 到期` : ''} · 今日 ${today.requests || 0} 次（设置 → Qoder）`
+        ? `Qoder 额度：${money(quota.remaining)} / ${money(quota.total)} ${quota.unit} · 已用 ${Math.round(quota.ratio * 100)}%${quota.at ? ` · 更新于 ${stamp(quota.at)}` : ''}${quota.expiresAt ? ` · ${dateLabel(quota.expiresAt)} 到期${quota.expired ? '（已过期）' : quota.expiringSoon ? `（${quota.daysToExpiry === 0 ? '今天' : `${quota.daysToExpiry} 天后`}）` : ''}` : ''} · 今日 ${today.requests || 0} 次（设置 → Qoder）`
         : quotaTried
           ? 'Qoder 已连接 · 额度暂时读取失败（设置 → Qoder 可刷新）'
           : `Qoder 已连接 · 正在读取额度（今日 ${today.requests || 0} 次）`;
@@ -4247,7 +4355,8 @@
         quota
           ? h(React.Fragment, null,
             h('span', { className: 'qdr-chat-usage-label' }, '额度'),
-            h('span', { className: 'qdr-chat-usage-quota' }, `${money(quota.remaining)} / ${money(quota.total)}`))
+            h('span', { className: 'qdr-chat-usage-quota' }, `${money(quota.remaining)} / ${money(quota.total)}`),
+            h('span', { className: 'qdr-chat-usage-pct', title: `已用 ${Math.round(quota.ratio * 100)}%${quota.expiringSoon ? ` · ${quota.daysToExpiry === 0 ? '今天' : `${quota.daysToExpiry} 天后`}到期` : ''}` }, `${Math.round(quota.ratio * 100)}%`))
           : h('span', { className: 'qdr-chat-usage-num' }, quotaTried ? '额度 —' : '额度读取中…'));
     }
 

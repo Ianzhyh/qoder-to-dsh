@@ -32,6 +32,9 @@ import { normalizeQuota, quotaSummaryText } from '../../lib/quota.mjs';
 import {
   applyAccountPrefs, mergeAccounts, publicAccountRow, readAccounts, writeAccounts,
 } from '../../lib/accounts.mjs';
+import {
+  findPat, publicPatStore, readPatStore, removePat, upsertPat, writePatStore,
+} from '../../lib/pat-store.mjs';
 import { toDirectory } from '../../lib/models.mjs';
 
 export const name = 'qoder';
@@ -384,6 +387,24 @@ export function apply(ctx, rawConfig = {}) {
         detail: `客户端环境探测失败：${String(error?.message || error)}`,
       });
     }
+    try {
+      const pats = patSnapshot();
+      checks.push({
+        id: 'pat-store',
+        label: 'PAT 凭据库',
+        status: pats.error ? 'warn' : 'pass',
+        detail: pats.error
+          ? `无法读取：${pats.error}；原文件未删除。`
+          : `${pats.count} 个已保存 PAT（只显示元数据，不包含令牌）`,
+      });
+    } catch (error) {
+      checks.push({
+        id: 'pat-store',
+        label: 'PAT 凭据库',
+        status: 'warn',
+        detail: String(error?.message || error),
+      });
+    }
     if (status.signedIn) {
       const expired = status.token?.expiresAt && Number(status.token.expiresAt) <= Date.now();
       checks.push({
@@ -646,6 +667,24 @@ export function apply(ctx, rawConfig = {}) {
     return map;
   }
 
+  function activePatContext() {
+    return {
+      activeUid: String(client.auth?.user?.id || ''),
+      activeRegion: client.auth?.region || config.region,
+      activeSource: client.auth?.source || '',
+    };
+  }
+
+  function patSnapshot(store = readPatStore()) {
+    const snapshot = publicPatStore(store, activePatContext());
+    for (const item of snapshot.entries) {
+      const raw = (store.entries || []).find((entry) => entry.id === item.id);
+      const alias = raw ? accountState.aliases[`${raw.region}:${raw.uid}`] : '';
+      if (alias) item.label = alias;
+    }
+    return snapshot;
+  }
+
   /**
    * 非激活账号不持有插件自己的令牌轮换状态，只能只读重读官方存储拿最新访问令牌。
    * 这样既能在官方客户端刷新后恢复签到，也不会因为插件刷新 drt- 影响官方客户端。
@@ -861,6 +900,12 @@ export function apply(ctx, rawConfig = {}) {
     if (autoCheckinTimer.unref) autoCheckinTimer.unref();
   }
 
+  const badRequest = (message) => {
+    const error = new Error(message);
+    error.statusCode = 400;
+    return error;
+  };
+
   const controller = {
     status: async ({ deep, rescan } = {}) => {
       if (rescan) invalidateDesktopScan();
@@ -994,6 +1039,34 @@ export function apply(ctx, rawConfig = {}) {
       notifyAdaptersUpdated();
       return { ...accountRows(), result };
     },
+    pats: async () => patSnapshot(),
+    switchPat: async ({ id } = {}) => {
+      const store = readPatStore();
+      if (store.error) throw badRequest(`PAT 凭据库无法读取：${store.error}`);
+      const entry = findPat(store, id);
+      if (!entry) throw badRequest('PAT 不存在；刷新列表后重试');
+      const result = await client.importPat(entry.pat, entry.region);
+      const next = upsertPat(store, { ...entry, lastUsedAt: Date.now() });
+      await writePatStore(next);
+      await directory({ refresh: true }).catch(() => {});
+      notifyAdaptersUpdated();
+      return { ...patSnapshot(next), result };
+    },
+    deletePat: async ({ id } = {}) => {
+      const store = readPatStore();
+      if (store.error) throw badRequest(`PAT 凭据库无法读取：${store.error}`);
+      const entry = findPat(store, id);
+      if (!entry) throw badRequest('PAT 不存在；刷新列表后重试');
+      const active = activePatContext();
+      if (active.activeSource === 'pat'
+        && entry.region === active.activeRegion
+        && entry.uid === active.activeUid) {
+        throw badRequest('当前账号正在使用这条 PAT；请先切换账号或退出登录，再删除');
+      }
+      const next = removePat(store, id);
+      await writePatStore(next);
+      return patSnapshot(next);
+    },
     pollDeviceAuth: async (id) => {
       if (!id) return { ok: false, error: 'missing device id' };
       const result = await client.pollDeviceAuth(id);
@@ -1009,10 +1082,36 @@ export function apply(ctx, rawConfig = {}) {
       return result;
     },
     importPat: async (token, region) => {
-      const result = await client.importPat(token, region || config.region);
+      const value = String(token || '').trim();
+      const result = await client.importPat(value, region || config.region);
+      let savedPat = false;
+      if (/^pt-/.test(value)) {
+        try {
+          const auth = client.auth || {};
+          const store = readPatStore();
+          if (store.error) throw new Error(store.error);
+          const next = upsertPat(store, {
+            region: auth.region || region || config.region,
+            pat: value,
+            uid: auth.user?.id || '',
+            name: auth.user?.name || '',
+            email: auth.user?.email || '',
+            avatarUrl: auth.user?.avatarUrl || '',
+            userType: auth.userType || '',
+            organizationId: auth.organizationId || '',
+            organizationName: auth.organizationName || '',
+            label: auth.user?.name || auth.user?.email || '',
+          });
+          await writePatStore(next);
+          savedPat = true;
+        } catch (error) {
+          // PAT 已经生效；保存到凭据库失败只影响“下次免粘贴”，不把登录判失败。
+          log('保存 PAT 到凭据库失败', String(error?.message || error));
+        }
+      }
       await directory({ refresh: true }).catch(() => {});
       notifyAdaptersUpdated();
-      return result;
+      return { ...result, savedPat };
     },
     logout: async () => {
       const result = await client.logout();

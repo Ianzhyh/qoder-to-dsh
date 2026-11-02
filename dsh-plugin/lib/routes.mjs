@@ -190,6 +190,34 @@ export function createRouteTable({ controller, log = () => {} }) {
     },
     {
       kind: 'exact',
+      path: '/qoder/pats',
+      handler: wrap(async (req, res) => {
+        if (!allowRead(req, res)) return;
+        sendJson(res, 200, { ok: true, ...(await controller.pats()) });
+      }),
+    },
+    {
+      kind: 'exact',
+      path: '/qoder/pats/switch',
+      handler: wrap(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-qoder-panel header' });
+        const body = await readJsonBody(req);
+        sendJson(res, 200, { ok: true, ...(await controller.switchPat({ id: String(body?.id || '') })) });
+      }),
+    },
+    {
+      kind: 'exact',
+      path: '/qoder/pats/delete',
+      handler: wrap(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-qoder-panel header' });
+        const body = await readJsonBody(req);
+        sendJson(res, 200, { ok: true, ...(await controller.deletePat({ id: String(body?.id || '') })) });
+      }),
+    },
+    {
+      kind: 'exact',
       path: '/qoder/checkin',
       handler: wrap(async (req, res) => {
         if (!allowRead(req, res)) return;

@@ -20,6 +20,42 @@
 6. 可选：`npm publish`，让 `dsh plugin add qoder-to-dsh` 这条最短路径可用
    （registry 上目前未占用该包名）。
 
+## [1.5.0] - 2026-11-02
+
+这一版补日常最常用的四件便利：多枚 PAT 保存/切换、缓存命中率、额度到期预警、对话页已用百分比。参考了同类 Qoder 插件 issue 里反复出现的「多 PAT 每次都要重粘」「不知道前缀缓存有没有命中」「积分快到期没有提醒」「侧栏只看得到剩余看不到已用」四类反馈。
+
+### Added
+
+- **PAT 凭据库**：新增 `lib/pat-store.mjs` 与 `pats.json`。同一区域可保存多枚 `pt-` PAT（整文件 DPAPI / AES-GCM 加密），账号页列出名称、区域、uid 尾号、添加/上次使用时间，可切换或删除；切换时重新走 `jobToken/exchange`，不保存短期访问令牌。`pt-` 导入成功后自动入库，`dt-` / `jt-` 仍只做一次性登录。
+- **PAT 路由**：新增 `GET /qoder/pats`、`POST /qoder/pats/switch`、`POST /qoder/pats/delete`；写接口沿用 `x-qoder-panel: 1`，返回体永远不含 PAT。
+- **缓存命中率**：`summarizeUsage` 新增 `totals.cacheHitRate`、`today.cacheHitRate`、按模型/账号命中率；用量页 Tokens 卡显示命中率，请求页签新增「缓存」列（命中 tokens + 比例）与 `cacheHitRate` CSV 字段；请求列表接口返回窗口命中率。
+- **额度到期预警**：`normalizeQuota` 新增 `daysToExpiry` / `expiringSoon` / `expired`；7 天内到期显示 `X 天后到期`，已过期显示 `额度已过期`；额度卡与对话页胶囊同步。
+- **对话页胶囊**：额度胶囊在 `剩余 / 总量` 后补已用百分比；临期或已过期时与低额度一样变黄。
+- **诊断**：新增「PAT 凭据库」检查（数量或解密错误），诊断包仍不含任何 PAT/令牌。
+
+### Changed
+
+- **导入 PAT**：`/qoder/auth/pat` 成功后返回 `savedPat`，账号页提示「PAT 已保存到凭据库」并立即刷新列表。
+- **删除保护**：当前正在使用的 PAT 不允许直接删除，必须先切换账号或退出登录；删除只影响本机记录，不影响 Qoder 账号。
+- **缓存口径**：命中率按 `cached_tokens / prompt_tokens` 计算，只表示上游前缀缓存，不代表计费折扣；缺失字段显示 `—`，不伪造 0%。
+
+### Fixed
+
+- **PAT 标签被 uid 覆盖**：`upsertPat` 保留首次添加的标签和 `addedAt`，同区域+uid 更新 PAT 时不丢备注。
+- **PAT 文件损坏被静默清空**：读取失败时返回空列表 + 错误，原文件保留，诊断页可见，不会自动删除或覆盖。
+- **额度 0 与字段缺失混淆**：到期字段缺失仍显示「不限期」；`daysToExpiry` 只在有真实到期时间时计算。
+
+### Tests
+
+- 新增 `tests/pat-store.test.mjs` 5 项：只收 `pt-`、同账号更新保留标签/时间、公开投影不含 PAT、加密落盘/损坏文件、id 稳定。
+- `plugin-host` 扩到 30 项：PAT 列表/切换/删除守卫、请求命中率、路由数 26。
+- `state` 与 `quota` 补缓存命中率、7 天临期/已过期断言。
+- 离线 CDP：账号页 PAT 列表与切换、请求页缓存列、额度临期徽标、对话页胶囊百分比，`__errors` 为空。
+
+### Docs
+
+- README 新增 PAT 凭据库、缓存命中率、额度预警、数据文件 `pats.json` 与对应已知限制；1.5.0 仍不含中英双语（留到 1.6）。
+
 ## [1.4.0] - 2026-11-02
 
 这一版对齐 **Qoder 0.5.1**，并把账号、额度、请求与诊断补到可持续使用的成熟度。重点不是新增入口，而是让升级后的客户端、缓存和多账号状态都能被如实识别。
