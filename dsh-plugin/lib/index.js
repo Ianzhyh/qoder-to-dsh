@@ -26,11 +26,14 @@ import {
   readUsageDaily, reconcileUsage, recentLogs, summarizeRequests, summarizeUsage, writeCheckin, writePrefs,
   readClientRuntime, writeClientRuntime, readCatalogCache,
 } from '../../lib/state.mjs';
-import { beijingDateKey, beijingHour, buildCheckinAccounts, checkinCanClaim, claimCampaigns, summarizeCheckinAccounts } from '../../lib/checkin.mjs';
+import {
+  ADDON_VALIDITY_FALLBACK_DAYS, addonBatches, beijingDateKey, beijingHour, buildCheckinAccounts,
+  checkinCanClaim, claimCampaigns, summarizeCheckinAccounts,
+} from '../../lib/checkin.mjs';
 import { deviceAvailability } from '../../lib/umid.mjs';
 import { normalizeQuota, quotaSummaryText } from '../../lib/quota.mjs';
 import {
-  applyAccountPrefs, mergeAccounts, publicAccountRow, readAccounts, writeAccounts,
+  applyAccountPrefs, mergeAccounts, publicAccountRow, readAccounts, syncKnownAccounts, writeAccounts,
 } from '../../lib/accounts.mjs';
 import {
   findPat, publicPatStore, readPatStore, removePat, upsertPat, writePatStore,
@@ -374,6 +377,22 @@ export function apply(ctx, rawConfig = {}) {
         ? `已加载 v${VERSION}，磁盘 v${version.installed}；完全退出 dsh 再打开才会加载新代码。`
         : `v${VERSION}`,
     });
+    const host = {
+      llm: typeof ctx.llm?.registerAdapter === 'function',
+      routes: config.routes ? Boolean(ctx.get?.('webServer')) : true,
+      tools: typeof ctx.get?.('tools')?.register === 'function',
+    };
+    checks.push({
+      id: 'host',
+      label: '宿主能力',
+      status: host.llm && host.routes && host.tools ? 'pass' : 'fail',
+      detail: [
+        host.llm ? 'llm.registerAdapter 可用' : 'llm.registerAdapter 缺失（dsh 版本过旧）',
+        config.routes ? (host.routes ? 'webServer 可用' : 'webServer 缺失，面板数据面不会挂载') : '面板路由已关闭（不算失败）',
+        host.tools ? 'tools 可用' : 'tools 缺失，斜杠命令/工具不可用',
+      ].join(' · '),
+      hint: host.llm ? '' : '升级 dsh 到 ≥ 0.2.1-rc.3 后完全重启。',
+    });
     try {
       const clientDiag = clientChecks({
         region: status.region || config.region,
@@ -622,6 +641,8 @@ export function apply(ctx, rawConfig = {}) {
   }
 
   // ── 每日签到（多账号） ────────────────────────────────────────────────
+  // 账号展示偏好与已见账号快照共用 accounts.json，必须在 checkinAccounts 之前初始化。
+  let accountState = readAccounts();
   let checkinState = readCheckin();
   const checkinRuns = new Map();
   const checkinAbort = new AbortController();
@@ -631,12 +652,90 @@ export function apply(ctx, rawConfig = {}) {
 
   function checkinAccounts() {
     // 不走 status()：那里会扫描本机账号，自动签到没必要为此阻塞事件循环。
-    return buildCheckinAccounts({ activeAuth: client.auth, activeRegion: client.auth?.region || client.region });
+    const rows = buildCheckinAccounts({ activeAuth: client.auth, activeRegion: client.auth?.region || client.region });
+    // 官方客户端同区只保留一份登录态，再登录会覆盖上一份。用已见账号快照补回，
+    // 列表才不会因为上游覆盖而突然少一行（缺失的标 missing，不参与签到）。
+    const synced = syncKnownAccounts(rows, accountState);
+    if (synced.changed) {
+      try {
+        accountState = writeAccounts(synced.state);
+      } catch (error) {
+        log('保存已见账号快照失败', String(error?.message || error));
+      }
+    }
+    return synced.rows;
+  }
+
+  /**
+   * 首次启用时把「领取账本」补出来：签到结果里最近一次 + 运行日志里更早的领取。
+   * 日志行没有 uid，只能按「区域 + 昵称」对回账号；对不上的宁可丢掉——
+   * 差额会以「到期未知」批次出现，而不是编一个日期。
+   */
+  function seedCheckinLedger() {
+    if (checkinState.ledger.length) return;
+    const rows = checkinAccounts();
+    const seeded = [];
+    const seen = new Set();
+    const push = (entry) => {
+      if (!entry.at || !entry.credits) return;
+      const dedupe = `${entry.key}:${beijingDateKey(entry.at)}:${entry.credits}`;
+      if (seen.has(dedupe)) return;
+      seen.add(dedupe);
+      seeded.push(entry);
+    };
+    for (const row of Object.values(checkinState.results)) {
+      if ((row.status === 'claimed' || row.status === 'already') && row.credits > 0) {
+        push({ key: row.key, region: row.region, uidTail: row.uidTail || '', at: row.checkedAt, credits: row.credits, validityDays: 0 });
+      }
+    }
+    try {
+      const text = readFileSync(PATHS.log, 'utf8');
+      const pattern = /^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?)Z \[qoder\] 签到 · (Qoder 国际版|Qoder 国内版) · (.*?): (?:claimed|already)(?: \+(\d+))/gm;
+      for (const match of text.matchAll(pattern)) {
+        const at = Date.parse(`${match[1]}Z`);
+        const credits = Number(match[4]) || 0;
+        if (!Number.isFinite(at) || !credits) continue;
+        const region = match[2] === 'Qoder 国内版' ? 'cn' : 'global';
+        const label = match[3].trim();
+        const row = rows.find((item) => item.region === region
+          && (item.label === label || accountState.aliases[item.key] === label));
+        if (!row) continue;
+        push({ key: row.key, region, uidTail: row.uidTail || '', at, credits, validityDays: 0 });
+      }
+    } catch { /* 日志读不到就只用 results */ }
+    if (seeded.length) {
+      try {
+        checkinState = writeCheckin({ ...checkinState, ledger: seeded });
+        log(`已从签到结果与运行日志回填 ${seeded.length} 条领取账本（用于推算加购额度到期）`);
+      } catch { /* 保底不阻塞启动 */ }
+    }
+  }
+  seedCheckinLedger();
+
+  /**
+   * 当前账号的加购额度分批视图（额度卡「每日赠送」用）。
+   * remaining 取自额度视图的 addOnQuota；账本按当前账号过滤。
+   */
+  function addonBatchesForActive() {
+    try {
+      const view = client.extras && client.extras.quotaView;
+      const addOn = (view && view.packages || []).find((item) => item.source === 'addOnQuota');
+      const remaining = addOn ? Math.max(0, Number(addOn.remaining) || 0) : 0;
+      if (!remaining) return null;
+      const region = client.auth && client.auth.region ? client.auth.region : config.region;
+      const uid = String(client.auth && client.auth.user ? client.auth.user.id || '' : '');
+      const key = `${region}:${uid || 'active'}`;
+      return addonBatches({
+        ledger: (checkinState.ledger || []).filter((item) => item.key === key),
+        remaining,
+        fallbackDays: ADDON_VALIDITY_FALLBACK_DAYS,
+      });
+    } catch {
+      return null;
+    }
   }
 
   // ── 账号展示偏好（别名/顺序/隐藏） ──────────────────────────────────
-  let accountState = readAccounts();
-
   function accountRows() {
     const rows = checkinAccounts();
     const applied = applyAccountPrefs(rows, accountState);
@@ -718,7 +817,10 @@ export function apply(ctx, rawConfig = {}) {
     const hour = beijingHour(now);
     const accounts = checkinAccounts();
     const devices = {
-      global: deviceAvailability('global'),
+      global: {
+        ...deviceAvailability('global'),
+        note: 'Qoder 国际版按设备去重：同一台设备每天通常只有列表里第一个账号能领到 100 Credits；这不是插件故障。',
+      },
       cn: deviceAvailability('cn'),
     };
     const mapped = accounts.map((account) => {
@@ -726,6 +828,7 @@ export function apply(ctx, rawConfig = {}) {
       const isToday = Boolean(saved && beijingDateKey(saved.checkedAt) === today);
       let status = isToday ? saved.status : 'idle';
       if (!isToday && hour < 10) status = 'waiting';
+      if (account.missing) status = 'login';
       const device = devices[account.region] || { available: false };
       return {
         key: account.key,
@@ -738,11 +841,16 @@ export function apply(ctx, rawConfig = {}) {
         uidTail: account.uidTail,
         expiresAt: account.expiresAt,
         tokenReady: account.tokenReady,
+        missing: account.missing === true,
         deviceAvailable: device.available,
         deviceReason: device.reason || '',
+        deviceSource: device.source || '',
+        deviceVersion: device.version || '',
         status,
         credits: isToday ? saved.credits : 0,
-        message: isToday ? saved.message : (hour < 10 ? '10:00（UTC+8）后开放领取' : '今天还没领取'),
+        message: account.missing
+          ? '本机已没有这个账号的登录态（客户端同区只保留一份），重新登录后恢复。'
+          : isToday ? saved.message : (hour < 10 ? '10:00（UTC+8）后开放领取' : '今天还没领取'),
         checkedAt: saved ? saved.checkedAt : 0,
         today: isToday,
         canClaim: checkinCanClaim({
@@ -850,6 +958,18 @@ export function apply(ctx, rawConfig = {}) {
         };
         checkinState.results[account.key] = record;
         results.push(record);
+        // 领取账本（append-only）：加购额度「领取后 N 天有效」是滚动的，
+        // 逐笔到期只能靠这笔账还原；already 也记（额度同样进了池子）。
+        if ((record.status === 'claimed' || record.status === 'already') && record.credits > 0) {
+          checkinState.ledger.push({
+            key: account.key,
+            region: account.region,
+            uidTail: account.uidTail || '',
+            at: record.checkedAt,
+            credits: record.credits,
+            validityDays: Math.max(0, Number(result.validityDays) || 0),
+          });
+        }
         log(`签到 · ${REGIONS[account.region].label} · ${account.label}: ${record.status}${record.credits ? ` +${record.credits}` : ''}${record.message ? `（${record.message}）` : ''}`);
         if (disposed || checkinAbort.signal.aborted) break;
         await wait(350);
@@ -1002,7 +1122,8 @@ export function apply(ctx, rawConfig = {}) {
     account: async () => {
       const data = await snapshot({});
       const extras = await client.refreshExtras().catch(() => null);
-      return { ...data, extras: extras || data.extras || null };
+      const merged = extras || data.extras || null;
+      return { ...data, extras: merged ? { ...merged, addonBatches: addonBatchesForActive() } : null };
     },
     accounts: async () => accountRows(),
     saveAccounts: async (patch = {}) => {

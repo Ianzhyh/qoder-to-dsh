@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 使用与排障文档
+    url: https://github.com/Ianzhyh/qoder-to-dsh#故障排查
+    about: 安装、升级、模型为空、签到、诊断包等问题先看 README 的故障排查表
+  - name: 讨论区
+    url: https://github.com/Ianzhyh/qoder-to-dsh/discussions
+    about: 使用经验、方案取舍、上游变更观察，欢迎在 Discussions 里聊

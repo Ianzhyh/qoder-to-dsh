@@ -142,3 +142,29 @@ test('normalizeCatalog exposes context_config options and ignores the legacy inp
   assert.equal(legacy.context_window_max, 96000);
   assert.deepEqual(legacy.context_window_options, [96000]);
 });
+
+test('limited-time free stops being free after its end time', () => {
+  const past = Math.floor((Date.now() - 60_000) / 1000);
+  const future = Math.floor((Date.now() + 3_600_000) / 1000);
+  const expired = normalizeCatalog({ chat: [{
+    key: 'promo-old',
+    display_name: 'Promo Old',
+    price_factor: 0,
+    original_price_factor: 1,
+    promotion: { end_at: past },
+  }] }).models;
+  assert.equal(expired[0].free, false, 'expired promo must not stay free');
+  assert.equal(expired[0].promotion_ends_at, past * 1000);
+  assert.equal(expired[0].credits, 1);
+
+  const live = normalizeCatalog({ chat: [{
+    key: 'promo-live',
+    display_name: 'Promo Live',
+    price_factor: 0,
+    original_price_factor: 1,
+    promotion: { end_at: future },
+  }] }).models;
+  assert.equal(live[0].free, true);
+  assert.equal(live[0].promotion_ends_at, future * 1000);
+  assert.equal(live[0].promotion_ends_at, future * 1000);
+});

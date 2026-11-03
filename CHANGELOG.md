@@ -20,6 +20,56 @@
 6. 可选：`npm publish`，让 `dsh plugin add qoder-to-dsh` 这条最短路径可用
    （registry 上目前未占用该包名）。
 
+## [1.6.0] - 2026-11-02
+
+这一版把「看起来成功、实际丢了语义」和「一次任务被上游拆成 N 条」两类问题一起收口。
+核心是任务身份、内容保真、错误动作矩阵、请求体预算和跨平台设备身份。
+
+### Added
+
+- **上游任务身份**：新增 `lib/task-identity.mjs`。按「会话 + 最后一条 user」把一次工具循环归成一个任务，稳定 `request_set_id` / `session_id` / `business.id` / `begin_at`，首次 `stage=start`、成功后 `processing`；只有 `request_id` / `chat_record_id` 每次新。LRU 512 条 / 2 小时。
+- **释放队列租约**：一轮结束 best-effort 调 `/api/v2/service/ask/finish?Encode=1`（payload + encodeVersion，COSY 签名），失败只写日志；`QODER_ASK_FINISH=0` 可关闭。
+- **内容保真**：工具结果 `isError` 以 `[tool error]` 前缀透传；未知内容块（`mcp_tool_use` / `web_search_tool_result` 等）降级成带标签文本；工具返回的图片以文本占位保留可感知性；`reasoning` 历史仍不回放但会计数。
+- **工具调用泄漏检测**：正文出现 DSML / `<function=` / `[assistant 请求调用工具]` 且没有结构化调用时，以 `TOOL_CALL_LEAK` 结束，不再当完成。
+- **非法工具调用策略**：默认 fail-fast；`QODER_INVALID_TOOL_POLICY=drop` 时丢弃坏调用并插入可见警告文本。
+- **请求体预算**：`lib/request-budget.mjs` 按最近 50 张图片 / 40 MiB 预检，超限从最旧图片降级；仍超限给出可读错误。`QODER_MAX_IMAGES` / `QODER_MAX_BODY_BYTES` 可调。
+- **模型预检**：目录热时拒绝目录外模型，目录冷/过期时透传；`QODER_SKIP_MODEL_PREFLIGHT=1` 逃生门；`[1m]` / `-1m` 后缀在查表前剥掉。
+- **错误动作矩阵**：新增 `errorAction()`（wait / switch / retry / compact / relogin / pick-model / fail），`pricingUrl`、`usage limit reached`、503 `queued the request` 归入正确语义；用量账本记录 `errorCode` / `errorAction`，请求页新增「仅需处理」筛选，概览显示今日失败动作分布。
+- **企业额度**：`normalizeQuota` 解析 `orgResourcePackage`（cap / used / remaining / expiresAt / 不限量）。
+- **限时免费截止**：目录解析 `promotion.end_at`；活动结束后不再永久显示免费，`toDirectory` 暴露 `promotionEndsAt`。
+- **usage 估算**：上游省略 usage 时按字符数估算并标 `estimated`，避免账本突然归零。
+- **跨平台**：`appDataRoot` / `localAppDataRoot` / `installRoots` 支持 macOS / Linux；`runtime-info` 支持无 `.exe` 与 `~/.qoder[.cn]/.bin`；`machineOS()` 按平台生成。
+- **诊断增强**：新增「宿主能力」检查（`registerAdapter` / `webServer` / `tools`）；诊断状态支持 `na`，macOS / Linux 的桌面凭据导入明确标“不适用”而不是 fail。
+- **签到透明化**：`unavailable` 允许手动重试；面板显示设备身份来源（本机组件 / 客户端缓存）与国际版「同设备每日通常仅首个账号可领」提示。
+- **隐私开关**：`QODER_SCAN_DESKTOP=0` 可完全关闭本机官方客户端扫描，此后只用浏览器授权 / PAT；诊断页显示「不适用」而不是失败。
+
+### Changed
+
+- **面板请求页**：错误行显示 `[errorCode]`，新增「仅需处理」；今日请求卡显示失败动作分布。
+- **账号页**：本机存在多个账号时提示“官方客户端切换不会自动改插件”。
+- **README**：补充 1.6 能力、平台矩阵、排障项；英文界面路线改到 1.7。
+
+### Fixed
+
+- **一次任务被上游记成 N 条对话**：不再每个请求重新生成 `request_set_id` / `session_id` / `business.id` / `begin_at`。
+- **430 版本门**：HTTP 430 自动用上一版 COSY 重试一次（`forceLegacy`），仍失败才报错。
+- **多进程令牌轮换**：刷新前先读磁盘，若另一个进程已写入更新令牌则直接采用，避免重复轮换 refresh token。
+- **prefs 未知键**：`normalizePrefs` 保留未知顶层/模型字段，升级后回滚不再丢配置。
+- **模型名带后缀被误判**：`normalizeModelId` 只剥已知 `[1m]` / `[2m]` / `[200k]` / `[400k]` / `-1m` 后缀，不做别名猜测。
+- **请求明细撑破面板、列被压成 `D…`**：先去掉固定 `min-width:860px` 与固定列宽（那会把「模型 / 状态」压成两三个字符），改回按内容排布 + 表格内部横向滚动（`contain:inline-size` 保证不反过来撑宽面板）；工具条允许换行并在 `≤860px` 独占一行。
+- **原生下拉框没有样式**：请求页的模型筛选是原生 `<select>`，只有布局类没有外观类，深色主题下露出浏览器默认白底控件；补齐边框、背景、聚焦环与自绘箭头。
+- **把「上游没给」说成「不限期」**：到期改成三态（有日期 / 明确永久 / 未返回）。只有每一份有余额的额度都标注永久时才显示「不限期」，任一个包缺字段就显示「部分额度上游未返回到期时间」，包行显示「到期未知」，不再替上游下结论。
+- **额度到期解析**：`expiresAt` 同时接受毫秒 / 秒 / ISO 字符串与 `expires_at` 等 snake_case 字段；新增 `/sash/api/v2/me/usage`（官方账号页用的那条）解析 `dedicatedResourcePackages`，包按到期由近到远排序并标出「最近到期」。实测老接口 `/api/v2/quota/usage` 只有 `expiresAt=253402214400000`（9999 哨兵）与 `end_date=0`，逐包到期只在网页账号页（cookie 会话）可见，转成 Bearer 调 `qoder.com.cn/sash/*` 会被 401 `missing cookie header` 拦下。
+- **资源包不可展开**：额度卡的资源包列表改成 `<details>` 折叠行，摘要显示到期日 / 「到期未知」，展开看总量 / 已用 / 剩余 / 到期，临期包标黄；缺字段时给出「逐包到期见网页账号页」的入口。
+- **每日赠送按到期分批**：加购/赠送额度是「每日 10:00 领取后 N 天有效」的滚动池，接口只给合计、不给逐笔到期（与 qoder-account-manager 的结论一致）。新增领取账本（`checkin.json` 的 `ledger`，append-only，按账号+日期+额度去重）：每次领取记一笔，到期 = 领取时刻 + `benefit.validity.days`，活动接口没给时按每日赠送默认 30 天推算并标注「推算」；消耗按先到期先扣分摊到各批；在 IDE 里领取、账本没记到的部分单列「到期未知」；首次启用会从签到结果与运行日志回填历史。额度卡新增「每日赠送 · 按到期分批」区，副标题的「最近到期」同时考虑批次与资源包。
+- **再登录后账号少一个**：官方客户端同一区域只保留一份登录态，覆盖后扫描会少一行。`accounts.json` 新增 `known` 快照（只存展示元数据，不含令牌），缺失账号以「需重新登录」占位补回，不参与签到、也不能直接切换。
+- **热力图选中行无样式**：`.qdr-heat-selected` 补上背景、间距与等宽数字。
+- **测试污染真实账本**：`tests/adapter.test.mjs` 没有隔离 `QODER_TO_DSH_HOME`，跑 `npm test` 会把用例里的假失败（`should not reach upstream` / `stop here`，account=`uid:test`）写进真实 `usage.json` 并计入失败统计；已改为临时目录隔离，并清掉已写入的 78 条假记录、修正 11-02 / 11-03 的请求数。
+
+### Tests
+
+- 新增 `tests/task-identity.test.mjs`、`tests/request-budget.test.mjs`；适配器、qoder-api、quota、models、state、checkin、client-env、umid 补 47 条用例，总计 293 条通过。
+
 ## [1.5.1] - 2026-11-02
 
 这一版是 1.5.0 的缺陷收口：重点修「看起来成功/看起来正常」的边角，以及账号、额度、PAT 在切换后的残留状态。

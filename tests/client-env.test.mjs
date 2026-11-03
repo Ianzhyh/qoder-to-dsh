@@ -249,3 +249,27 @@ test('readAppStatus and readUmidCache are region-scoped and tolerant', () => {
   assert.equal(cache.machineType, 'type');
   assert.equal(readUmidCache('global', { home }), null);
 });
+
+test('macOS install roots and data directories are discovered without Windows paths', () => {
+  const home = mkdtempSync(join(tmpdir(), 'qoder-mac-'));
+  mkdirSync(join(home, 'Library', 'Application Support', 'Qoder'), { recursive: true });
+  const roots = installRoots('global', { platform: 'darwin', home });
+  assert.ok(roots.some((entry) => entry.root.includes('Applications') && entry.root.endsWith('Qoder.app')));
+  assert.ok(roots.some((entry) => entry.root === join(home, 'Applications', 'Qoder.app')));
+  assert.equal(roots.some((entry) => entry.root.includes('Program Files')), false);
+  const info = appDataInfo('global', { platform: 'darwin', home });
+  assert.equal(info.dir, join(home, 'Library', 'Application Support', 'Qoder'));
+  assert.equal(info.source, 'platform');
+  rmSync(home, { recursive: true, force: true });
+});
+
+test('Linux install roots and config directories are discovered', () => {
+  const home = mkdtempSync(join(tmpdir(), 'qoder-linux-'));
+  mkdirSync(join(home, '.config', 'Qoder CN'), { recursive: true });
+  const roots = installRoots('cn', { platform: 'linux', home });
+  assert.ok(roots.some((entry) => entry.root.includes('opt') && entry.root.endsWith('Qoder CN')));
+  assert.ok(roots.some((entry) => entry.root.includes('opt') && entry.root.endsWith('qoder-cn')));
+  const info = appDataInfo('cn', { platform: 'linux', home });
+  assert.equal(info.dir, join(home, '.config', 'Qoder CN'));
+  rmSync(home, { recursive: true, force: true });
+});

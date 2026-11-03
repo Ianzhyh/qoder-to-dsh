@@ -30,3 +30,10 @@ test('multiple client installs pick the numerically newest runtime-info', () => 
 test('cleanup', () => {
   rmSync(local, { recursive: true, force: true });
 });
+
+test('machineOS follows the running platform instead of always claiming Windows', async () => {
+  const { machineOS } = await import('../lib/umid.mjs');
+  assert.equal(machineOS('win32', 'x64'), 'x86_64_windows');
+  assert.equal(machineOS('darwin', 'arm64'), 'aarch64_darwin');
+  assert.equal(machineOS('linux', 'x64'), 'x86_64_linux');
+});

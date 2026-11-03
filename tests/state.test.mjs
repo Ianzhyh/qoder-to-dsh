@@ -400,3 +400,34 @@ test('creditsReport falls back to the default range for prototype keys', () => {
   assert.match(report.range.from, /^\d{4}-\d{2}-\d{2}$/);
   assert.match(report.range.to, /^\d{4}-\d{2}-\d{2}$/);
 });
+
+test('normalizePrefs preserves unknown fields for forward/backward compatibility', () => {
+  const prefs = normalizePrefs({
+    visible: ['a'],
+    futureFeature: { mode: 'x' },
+    paramsByModel: { a: { temperature: 0.2, futureParam: 42 } },
+  });
+  assert.deepEqual(prefs.futureFeature, { mode: 'x' });
+  assert.equal(prefs.paramsByModel.a.temperature, 0.2);
+  assert.equal(prefs.paramsByModel.a.futureParam, 42);
+  const poisoned = normalizePrefs(JSON.parse('{"__proto__":{"polluted":true},"visible":null}'));
+  assert.equal(poisoned.polluted, undefined);
+  assert.equal({}.polluted, undefined);
+});
+
+test('checkin ledger keeps one entry per account/day/credits', async () => {
+  const { normalizeCheckin } = await import('../lib/state.mjs');
+  const clean = normalizeCheckin({
+    ledger: [
+      { key: 'cn:u1', region: 'cn', at: 1_700_000_000_000, credits: 100, validityDays: 30 },
+      { key: 'cn:u1', region: 'cn', at: 1_700_000_000_000, credits: 100, validityDays: 0 },
+      { key: 'cn:u1', region: 'cn', at: 1_700_000_000_000, credits: 100, validityDays: 7 },
+      { key: 'cn:u1', region: 'cn', at: 1_700_008_640_000, credits: 100, validityDays: 0 },
+      { key: 'cn:u2', region: 'cn', at: 1_700_000_000_000, credits: 100, validityDays: 0 },
+      { key: 'bad', at: 0, credits: 0 },
+    ],
+  });
+  assert.equal(clean.ledger.length, 3, '同账号同天同额度去重，跨天/跨账号保留');
+  assert.equal(clean.ledger[0].validityDays, 30, '第一次出现的有效期优先');
+  assert.equal(clean.ledger.every((item) => item.at > 0 && item.credits > 0), true);
+});

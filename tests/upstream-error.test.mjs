@@ -2,9 +2,9 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  CODE, classifyError, extractErrorEnvelope, normalizeErrorText,
+  ACTION, CODE, classifyError, errorAction, extractErrorEnvelope, normalizeErrorText,
   parseRetryAfterHeader, retryAfterFrom,
-  isModelQueue, isDailyCap, isTerminalSession, isVersionGate, isContentAudit, isTrialRestricted,
+  isModelQueue, isDailyCap, isTerminalSession, isVersionGate, isContentAudit, isTrialRestricted, isModelMissing,
 } from '../lib/upstream-error.mjs';
 
 test('Qoder queue is retryable and survives escaped JSON', () => {
@@ -42,6 +42,27 @@ test('existing 402/408/429/context classifications stay intact', () => {
   assert.equal(classifyError('credits exhausted', 429), CODE.RATE_LIMIT);
   assert.equal(classifyError('insufficient_quota', 429), CODE.QUOTA);
   assert.equal(classifyError('maximum context length exceeded', 400), CODE.CONTEXT);
+});
+
+test('quota and queue shapes seen in the wild are not mistaken for auth or 5xx', () => {
+  assert.equal(classifyError('{"pricingUrl":"https://qoder.com.cn/pricing?client=qoder"}', 403), CODE.QUOTA);
+  assert.equal(classifyError('usage limit reached', 429), CODE.QUOTA);
+  assert.equal(classifyError('Qoder 503: queued the request for dfmodel (this plan\'s queue: p3)', 503), CODE.RATE_LIMIT);
+  assert.equal(classifyError('service busy, try again in 30s', 503), CODE.RATE_LIMIT);
+  assert.equal(isModelQueue('queued the request for dfmodel'), true);
+  assert.equal(classifyError('unknown or disabled model "efficient"', 400), CODE.MODEL_NOT_FOUND);
+  assert.equal(isModelMissing('model_not_found'), true);
+});
+
+test('error actions give one next step per class', () => {
+  assert.equal(errorAction(CODE.QUOTA, 'Billing daily count exceeded'), ACTION.WAIT);
+  assert.equal(errorAction(CODE.QUOTA, 'insufficient credits'), ACTION.SWITCH);
+  assert.equal(errorAction(CODE.RATE_LIMIT, '10605 queued'), ACTION.WAIT);
+  assert.equal(errorAction(CODE.RATE_LIMIT, 'too many requests'), ACTION.RETRY);
+  assert.equal(errorAction(CODE.AUTH, '401'), ACTION.RELOGIN);
+  assert.equal(errorAction(CODE.CONTEXT, 'prompt too long'), ACTION.COMPACT);
+  assert.equal(errorAction(CODE.MODEL_NOT_FOUND, 'unknown model'), ACTION.PICK_MODEL);
+  assert.equal(errorAction(CODE.EMPTY, ''), ACTION.RETRY);
 });
 
 test('extractErrorEnvelope unwraps nested and escaped messages', () => {

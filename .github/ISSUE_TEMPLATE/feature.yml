@@ -1,0 +1,44 @@
+name: 功能建议
+description: 希望插件支持的能力、交互或兼容性
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你遇到的真实问题
+      description: 先讲场景和损失，不要直接跳到实现方案。
+      placeholder: "例如：长任务跑到一半被 code 110 停住，导致 ..."
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望的行为
+      description: 如果有多个方案，请列出取舍。
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你试过的替代方案
+      description: 例如换模型、换账号、调环境变量、用别的客户端。
+  - type: dropdown
+    id: scope
+    attributes:
+      label: 影响范围
+      options:
+        - 单个模型 / 单个账号
+        - 整个插件
+        - 跨平台（macOS / Linux）
+        - 文档 / 安装
+        - 不确定
+    validations:
+      required: true
+  - type: checkboxes
+    id: boundary
+    attributes:
+      label: 边界确认
+      options:
+        - label: 这个需求不涉及多账号池化、凭据导出、绕过风控或公网中转
+          required: true

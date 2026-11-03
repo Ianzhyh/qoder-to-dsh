@@ -1,0 +1,65 @@
+name: Bug 报告
+description: 功能异常、报错、模型/额度/签到不符合预期
+title: "[Bug] "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先做三件事，能省掉一半来回：
+        1. 完全退出 dsh 再打开（宿主端代码只在启动时加载）；
+        2. 设置 → Qoder → 诊断 → 「重新检查」，确认登录/目录/设备身份；
+        3. 复制诊断包（已脱敏），不要贴 token、cookie、完整邮箱或 uid。
+  - type: textarea
+    id: what
+    attributes:
+      label: 你做了什么，看到什么
+      description: 具体操作、预期结果、实际结果；有报错原文请原样贴出。
+      placeholder: |
+        1. 在模型选择器选 ...
+        2. 发送 ...
+        3. 预期 ...，实际 ...
+    validations:
+      required: true
+  - type: input
+    id: dsh
+    attributes:
+      label: dsh 版本与安装形态
+      placeholder: "例如 0.2.1-rc.3 / desktop profile / Windows 11"
+    validations:
+      required: true
+  - type: input
+    id: qoder
+    attributes:
+      label: Qoder 客户端 / CLI 版本与区域
+      placeholder: "例如 Qoder 0.5.1 国际版；qodercli 1.1.79-hotfix.7"
+    validations:
+      required: true
+  - type: dropdown
+    id: install
+    attributes:
+      label: 插件安装方式
+      options:
+        - Release tgz
+        - GitHub 直装
+        - 本地 link
+        - 其他
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: 诊断包 / 关键日志
+      description: 设置 → Qoder → 诊断 → 「诊断包」；或贴最近 20 行日志。请确认已脱敏。
+      render: text
+  - type: checkboxes
+    id: confirm
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已完全退出并重开 dsh
+          required: true
+        - label: 我已搜索现有 issue，确认没有重复
+          required: true
+        - label: 我已移除 token、cookie、完整邮箱/uid 等敏感信息
+          required: true

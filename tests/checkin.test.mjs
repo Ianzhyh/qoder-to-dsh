@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  beijingDateKey, beijingHour, campaignEndMs, campaignStartMs, checkinCanClaim, claimCampaigns,
-  inCampaignWindow, summarizeCampaigns, summarizeCheckinAccounts,
+  ADDON_VALIDITY_FALLBACK_DAYS, addonBatches, beijingDateKey, beijingHour, campaignEndMs, campaignStartMs,
+  checkinCanClaim, claimCampaigns, inCampaignWindow, summarizeCampaigns, summarizeCheckinAccounts, validityDaysOf,
 } from '../lib/checkin.mjs';
 
 const now = Date.UTC(2026, 9, 25, 4, 0, 0);
@@ -246,9 +246,56 @@ test('checkinCanClaim blocks closed windows but allows retrying a stale failure'
   assert.equal(checkinCanClaim({ ...base, status: 'device' }), true, '设备恢复后允许重试旧失败');
   assert.equal(checkinCanClaim({ ...base, status: 'login' }), true, '重新登录后允许重试旧失败');
   assert.equal(checkinCanClaim({ ...base, status: 'waiting' }), false);
-  assert.equal(checkinCanClaim({ ...base, status: 'unavailable' }), false);
+  assert.equal(checkinCanClaim({ ...base, status: 'unavailable' }), true, '无活动允许手动重试（活动可能刚下发）');
   assert.equal(checkinCanClaim({ ...base, status: 'claimed' }), false);
   assert.equal(checkinCanClaim({ ...base, status: 'already' }), false);
   assert.equal(checkinCanClaim({ tokenReady: false, deviceAvailable: true, status: 'error' }), false);
   assert.equal(checkinCanClaim({ tokenReady: true, deviceAvailable: false, status: 'error' }), false);
+});
+
+test('validityDaysOf reads the campaign validity in every shape the server used', () => {
+  assert.equal(validityDaysOf({ validity: { days: 30 } }), 30);
+  assert.equal(validityDaysOf({ validityDays: 7 }), 7);
+  assert.equal(validityDaysOf({ validity: 14 }), 14);
+  assert.equal(validityDaysOf({}), 0, '没给有效期不能编天数');
+  assert.equal(validityDaysOf(undefined), 0);
+});
+
+test('addonBatches spreads the pooled remaining first-expire-first-consumed', () => {
+  const now = Date.UTC(2026, 10, 3, 2, 0, 0);
+  const day = 86400000;
+  const ledger = [
+    { key: 'cn:u1', at: now - 24 * day, credits: 100, validityDays: 0 },
+    { key: 'cn:u1', at: now - 4 * day, credits: 100, validityDays: 0 },
+    { key: 'cn:u1', at: now - 3 * day, credits: 100, validityDays: 30 },
+  ];
+  const view = addonBatches({ ledger, remaining: 250, now });
+
+  // 最早那笔 100 被扣剩 50；三批都在有效期内；全部标 inferred（validityDays=0）。
+  assert.equal(view.batches.length, 3);
+  assert.equal(view.totalRemaining, 250);
+  assert.equal(view.batches[0].remaining, 50, '最旧的批次先被消耗');
+  assert.equal(view.batches[0].inferred, true);
+  assert.equal(view.batches[2].inferred, false, '接口给了 validity 的批次是精确值');
+  assert.equal(view.batches[2].validityDays, 30);
+  assert.equal(view.nextExpiry, view.batches[0].expiresAt, '最近到期就是最早那批');
+  assert.equal(view.fallbackDays, ADDON_VALIDITY_FALLBACK_DAYS);
+});
+
+test('addonBatches drops expired batches and reports untracked claims honestly', () => {
+  const now = Date.UTC(2026, 10, 3, 2, 0, 0);
+  const day = 86400000;
+  const ledger = [
+    { key: 'cn:u1', at: now - 40 * day, credits: 100, validityDays: 30 },
+    { key: 'cn:u1', at: now - 2 * day, credits: 100, validityDays: 30 },
+  ];
+  const view = addonBatches({ ledger, remaining: 450, now });
+
+  assert.equal(view.expiredCredits, 100, '过期批次的余额作废');
+  assert.equal(view.batches.length, 2);
+  assert.equal(view.batches[0].remaining, 100);
+  assert.equal(view.batches[1].untracked, true, '账本没记到的领取单独成批');
+  assert.equal(view.batches[1].remaining, 250);
+  assert.equal(view.batches[1].expiresAt, 0, '没有记录就不能有日期');
+  assert.equal(view.nextExpiry, view.batches[0].expiresAt);
 });

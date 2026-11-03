@@ -12,6 +12,7 @@ import {
   normalizeAlias,
   publicAccountRow,
   readAccounts,
+  syncKnownAccounts,
   writeAccounts,
 } from '../lib/accounts.mjs';
 
@@ -41,7 +42,7 @@ test('normalizeAccounts accepts legacy array hidden and dedupes order', () => {
   assert.deepEqual(value.hidden, { 'cn:u3': true });
   assert.equal(value.current, 'cn:u1');
   assert.equal(value.schemaVersion, 1);
-  assert.deepEqual(normalizeAccounts(null), { schemaVersion: 1, aliases: {}, order: [], hidden: {}, current: '' });
+  assert.deepEqual(normalizeAccounts(null), { schemaVersion: 1, aliases: {}, order: [], hidden: {}, known: [], current: '' });
 });
 
 test('mergeAccounts keeps untouched fields and appends order tails', () => {
@@ -99,4 +100,29 @@ test('accounts file round-trips through the normalizer', () => {
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+test('syncKnownAccounts keeps an account that the desktop client overwrote', () => {
+  const first = [
+    { key: 'cn:u1', region: 'cn', uid: 'u1', label: '一号', kind: 'app', sourceLabel: '桌面端', expiresAt: 100 },
+    { key: 'cn:u2', region: 'cn', uid: 'u2', label: '二号', kind: 'app', sourceLabel: '桌面端', expiresAt: 200 },
+  ];
+  const saved = syncKnownAccounts(first, {}, 1000);
+  assert.equal(saved.rows.length, 2);
+  assert.equal(saved.changed, true);
+  assert.equal(saved.state.known.length, 2);
+
+  // 再登录一个账号会覆盖同一份登录态：第二次只扫到 u2。
+  const second = syncKnownAccounts([first[1]], saved.state, 2000);
+  assert.deepEqual(second.rows.map((row) => row.key).sort(), ['cn:u1', 'cn:u2']);
+  const restored = second.rows.find((row) => row.key === 'cn:u1');
+  assert.equal(restored.missing, true, '缺失账号以占位行补回');
+  assert.equal(restored.tokenReady, false, '占位行不能当凭据用');
+  assert.equal(restored.active, false);
+  assert.equal(second.changed, false, '仅顺序/时间变化不算需要落盘');
+  assert.deepEqual(second.rows.filter((row) => !row.missing).map((row) => row.key), ['cn:u2']);
+
+  // 账号重新登录后回到正常行，不再标记 missing。
+  const third = syncKnownAccounts(first, second.state, 3000);
+  assert.equal(third.rows.some((row) => row.missing), false);
 });

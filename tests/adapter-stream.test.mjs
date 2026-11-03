@@ -464,6 +464,95 @@ test('first-byte timeout after headers is still a TIMEOUT, not a transport drop'
   assert.equal(lastUsage().status, 'stream-error');
 });
 
+test('task identity stays stable across a tool loop and releases the lease', async () => {
+  const payloads = [];
+  const releases = [];
+  const client = fakeClient(sseBody([
+    { choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }], usage: { prompt_tokens: 3, completion_tokens: 1, total_tokens: 4 } },
+  ]));
+  const chat = client.chat.bind(client);
+  client.chat = async (payload, options) => {
+    payloads.push(structuredClone(payload));
+    return chat(payload, options);
+  };
+  client.releaseAsk = async (info) => { releases.push(info); return true; };
+
+  const adapter = adapterFor(client);
+  const firstMessages = [{ role: 'user', content: [{ type: 'text', text: 'fix the bug' }] }];
+  await collect(adapter, { messages: firstMessages });
+  await collect(adapter, {
+    messages: [
+      ...firstMessages,
+      { role: 'assistant', content: [{ type: 'tool-call', id: 'c1', name: 'read', arguments: '{}' }] },
+      { role: 'tool', toolCallId: 'c1', content: [{ type: 'text', text: 'file' }] },
+    ],
+  });
+
+  assert.equal(payloads.length, 2);
+  assert.equal(payloads[0].task.id, payloads[1].task.id, 'same task across tool loop');
+  assert.equal(payloads[0].task.sessionId, payloads[1].task.sessionId);
+  assert.equal(payloads[0].task.beginAt, payloads[1].task.beginAt);
+  assert.equal(payloads[1].task.answered, true, 'second call is processing');
+  assert.equal(releases.length, 2);
+  assert.equal(releases[0].requestSetId, payloads[0].task.id);
+});
+
+test('a new user prompt starts a new task but keeps the session', async () => {
+  const payloads = [];
+  const client = fakeClient(sseBody([
+    { choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] },
+  ]));
+  const chat = client.chat.bind(client);
+  client.chat = async (payload, options) => { payloads.push(structuredClone(payload)); return chat(payload, options); };
+  client.releaseAsk = async () => true;
+
+  const adapter = adapterFor(client);
+  const first = [{ role: 'user', content: [{ type: 'text', text: 'one' }] }];
+  await collect(adapter, { messages: first });
+  await collect(adapter, {
+    messages: [...first, { role: 'assistant', content: [{ type: 'text', text: 'ok' }] }, { role: 'user', content: [{ type: 'text', text: 'two' }] }],
+  });
+  assert.notEqual(payloads[0].task.id, payloads[1].task.id);
+  assert.equal(payloads[0].task.sessionId, payloads[1].task.sessionId);
+});
+
+test('queue failures release the upstream lease', async () => {
+  const releases = [];
+  const client = errorClient({ status: 403, text: '{"code":"10605","message":"isQueued","retryAfterSeconds":30}' });
+  client.releaseAsk = async (info) => { releases.push(info); return true; };
+  const chunks = await collect(adapterFor(client));
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.failure.code, CODE.RATE_LIMIT);
+  assert.equal(releases.length, 1);
+  assert.ok(releases[0].requestSetId);
+});
+
 test('cleanup', () => {
   rmSync(home, { recursive: true, force: true });
+});
+
+test('HTTP 430 retries once with the legacy COSY version', async () => {
+  const payloads = [];
+  let call = 0;
+  const client = {
+    auth: { source: 'desktop' },
+    authGeneration: 0,
+    accountStamp() { return { account: 'uid:legacy', generation: 0 }; },
+    async chat(payload) {
+      payloads.push({ ...payload });
+      call += 1;
+      if (call === 1) {
+        return { ok: false, status: 430, headers: {}, body: null, text: async () => 'version too low' };
+      }
+      return { ok: true, status: 200, headers: {}, body: sseBody([
+        { choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }] },
+      ]), text: async () => '' };
+    },
+  };
+  const chunks = await collect(adapterFor(client));
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'stop');
+  assert.equal(payloads.length, 2);
+  assert.equal(payloads[1].forceLegacy, true);
+  assert.equal(payloads[0].forceLegacy, undefined);
 });

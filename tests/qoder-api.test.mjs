@@ -13,11 +13,11 @@ process.env.APPDATA = join(home, 'appdata');
 process.env.USERPROFILE = join(home, 'user');
 process.env.QODER_REGION = 'global';
 
-const { QoderClient, shouldAdoptDesktopAuth } = await import('../lib/qoder-api.mjs');
+const { QoderClient, shouldAdoptDesktopAuth, buildAskFinishBody } = await import('../lib/qoder-api.mjs');
 const { normalizeCatalog } = await import('../lib/qoder-api.mjs');
 const { QoderAdapter, StreamTranslator, CODE } = await import('../lib/adapter.mjs');
 const { PATHS, DEFAULTS } = await import('../lib/config.mjs');
-const { readEncryptedJson } = await import('../lib/secret-store.mjs');
+const { readEncryptedJson, writeEncryptedJson } = await import('../lib/secret-store.mjs');
 
 function deferred() {
   let resolve;
@@ -148,8 +148,42 @@ test('disk catalog restores raw model metadata for the first request after resta
   assert.equal(client.rawModel('vision'), null, '切换账号/刷新失败后不能残留旧目录');
 });
 
-test('disk catalog cache is account-scoped after a switch', () => {
-  writeFileSync(join(process.env.QODER_TO_DSH_HOME, 'catalog.json'), JSON.stringify({
+test('chat body keeps task and session ids stable while request ids stay unique', () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-task-token',
+    user: { id: 'u-task', name: 'Task Tester' },
+    source: 'token',
+  }, { silent: true, persist: false });
+  const task = {
+    key: 'k', id: '11111111-1111-4111-8111-111111111111',
+    sessionId: '22222222-2222-4222-8222-222222222222',
+    beginAt: 1700000000000, answered: false, name: 'fix bug',
+  };
+  const first = client.buildChatBody({
+    model: 'dfmodel', messages: [{ role: 'user', content: 'fix' }], task,
+  }, null);
+  assert.equal(first.request_set_id, task.id);
+  assert.equal(first.session_id, task.sessionId);
+  assert.equal(first.business.id, task.id);
+  assert.equal(first.business.begin_at, task.beginAt);
+  assert.equal(first.business.stage, 'start');
+  assert.match(first.request_id, /^[0-9a-f-]{36}$/);
+
+  task.answered = true;
+  const second = client.buildChatBody({
+    model: 'dfmodel', messages: [{ role: 'user', content: 'fix' }], task,
+  }, null);
+  assert.equal(second.request_set_id, task.id);
+  assert.equal(second.session_id, task.sessionId);
+  assert.equal(second.business.stage, 'processing');
+  assert.notEqual(second.request_id, first.request_id, 'request_id must be new per call');
+  assert.notEqual(second.chat_record_id, first.chat_record_id, 'chat_record_id must be new per call');
+});
+
+test('disk catalog cache is account-scoped after a switch', () => {  writeFileSync(join(process.env.QODER_TO_DSH_HOME, 'catalog.json'), JSON.stringify({
     at: Date.now(),
     region: 'global',
     account: 'u-old',
@@ -604,7 +638,7 @@ test('an in-flight quota request from the previous account cannot overwrite the 
     const target = String(url);
     const auth = String(options?.headers?.authorization || '');
     seen.push(auth);
-    if (target.endsWith('/api/v2/user/plan') || target.endsWith('/api/v2/quota/usage')) {
+    if (target.endsWith('/api/v2/user/plan') || target.endsWith('/api/v2/quota/usage') || target.endsWith('/sash/api/v2/me/usage')) {
       if (auth.includes('dt-old')) {
         await releaseOld.promise;
         return json({ account: 'old' });
@@ -623,7 +657,7 @@ test('an in-flight quota request from the previous account cannot overwrite the 
     assert.equal(old.plan.account, 'old');
     assert.equal(client.extras.plan.account, 'new', 'old account must not overwrite the new cache');
     assert.equal(client.extras.quota.account, 'new');
-    assert.equal(seen.filter((auth) => auth.includes('dt-old')).length, 2);
+    assert.equal(seen.filter((auth) => auth.includes('dt-old')).length, 3, 'plan + quota/usage + me/usage 各一次');
   });
 });
 
@@ -1163,4 +1197,54 @@ test('the last gateway 5xx body survives failover for diagnostics', async () => 
 
 test('cleanup', () => {
   rmSync(home, { recursive: true, force: true });
+});
+
+test('refresh adopts a newer token another process already persisted', async () => {
+  const now = Date.now();
+  writeEncryptedJson(PATHS.auth, {
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-disk-new',
+    refreshToken: 'drt-disk-new',
+    expiresAt: now + 3600_000,
+    updatedAt: now + 1000,
+    user: { id: 'u-shared', name: 'Shared' },
+    source: 'token',
+  });
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-old',
+    refreshToken: 'drt-old',
+    expiresAt: now + 60_000,
+    updatedAt: now - 1000,
+    user: { id: 'u-shared', name: 'Shared' },
+    source: 'token',
+  }, { silent: true, persist: false });
+
+  let calls = 0;
+  await withFetch(async () => {
+    calls += 1;
+    return json({ token: 'dt-should-not-be-used' });
+  }, async () => {
+    const next = await client.refreshAuth();
+    assert.equal(next.accessToken, 'dt-disk-new');
+    assert.equal(client.auth.accessToken, 'dt-disk-new');
+    assert.equal(calls, 0, '磁盘上已有更新令牌时不应再打刷新接口');
+  });
+});
+
+test('ask/finish body matches the client envelope shape', () => {
+  const body = JSON.parse(buildAskFinishBody({
+    modelKey: 'dfmodel', requestSetId: 'rs-1', userId: 'u-1', elapsedMs: 1234.6,
+  }));
+  assert.equal(body.encodeVersion, '1');
+  const payload = JSON.parse(body.payload);
+  assert.deepEqual(payload, {
+    model_key: 'dfmodel',
+    request_set_id: 'rs-1',
+    user_id: 'u-1',
+    time_consumed: 1235,
+  });
 });

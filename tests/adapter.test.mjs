@@ -1,10 +1,24 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
-import {
+// 必须在加载业务模块之前设定：adapter 记录用量时读的是 PATHS.usage，
+// 不隔离会把用例里的假请求（"should not reach upstream" 等）写进真实账本。
+// ESM 的静态 import 会先于赋值执行，所以这里只能用动态 import。
+const home = mkdtempSync(join(tmpdir(), 'qoder-adapter-'));
+process.env.DSH_HOME = home;
+process.env.QODER_TO_DSH_HOME = join(home, 'qoder');
+
+const {
   CODE, QoderAdapter, StreamTranslator, classifyError, findInvalidTool, mapUsage, sanitizeWire, toWireMessage, toWireTools,
-} from '../lib/adapter.mjs';
-import { DEFAULTS } from '../lib/config.mjs';
+} = await import('../lib/adapter.mjs');
+const { DEFAULTS } = await import('../lib/config.mjs');
+
+test('cleanup adapter fixtures', () => {
+  rmSync(home, { recursive: true, force: true });
+});
 
 test('StreamTranslator maps reasoning, text, tool calls and usage', () => {
   const translator = new StreamTranslator();
@@ -425,4 +439,178 @@ test('contextWindowFor honors a 1M selection and falls back to the model default
   assert.equal(adapter.contextWindowFor('deep'), 1000000, '1M 档位不能被旧的 max_input_tokens 砍掉');
   adapter.setContextWindows({ deep: 4000000 });
   assert.equal(adapter.contextWindowFor('deep'), 1000000, '超过模型上限时收敛到 1M');
+});
+
+test('warm catalog rejects an unknown model but cold catalog passes it through', async () => {
+  const client = {
+    auth: { source: 'token' },
+    authGeneration: 0,
+    accountStamp: () => ({ account: 'uid:test' }),
+    chat: async () => { throw new Error('should not reach upstream'); },
+  };
+  const adapter = new QoderAdapter({
+    provider: 'qoder', client,
+    prefs: { visible: null, pinned: '', includeAll: true, contextWindowByModel: {}, paramsByModel: {} },
+    log: () => {},
+  });
+  adapter.catalogCache = { at: Date.now(), models: [{ id: 'known' }], error: '', staleMs: 0 };
+
+  const chunks = [];
+  for await (const chunk of adapter.stream({ model: 'gone', messages: [{ role: 'user', content: 'hi' }] })) chunks.push(chunk);
+  const finish = chunks.find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.MODEL_NOT_FOUND);
+  assert.match(finish.reason.failure.message, /不在当前 Qoder 目录/);
+
+  adapter.catalogCache = { at: 0, models: [], error: '', staleMs: 0 };
+  const cold = [];
+  for await (const chunk of adapter.stream({ model: 'gone', messages: [{ role: 'user', content: 'hi' }] })) cold.push(chunk);
+  assert.match(cold.find((chunk) => chunk.type === 'finish').reason.failure.message, /should not reach upstream/);
+
+  process.env.QODER_SKIP_MODEL_PREFLIGHT = '1';
+  try {
+    adapter.catalogCache = { at: Date.now(), models: [{ id: 'known' }], error: '', staleMs: 0 };
+    const skipped = [];
+    for await (const chunk of adapter.stream({ model: 'gone', messages: [{ role: 'user', content: 'hi' }] })) skipped.push(chunk);
+    assert.match(skipped.find((chunk) => chunk.type === 'finish').reason.failure.message, /should not reach upstream/);
+  } finally {
+    delete process.env.QODER_SKIP_MODEL_PREFLIGHT;
+  }
+});
+
+test('model ids copied with a context suffix are normalized before lookup', async () => {
+  const payloads = [];
+  const client = {
+    auth: { source: 'token' },
+    authGeneration: 0,
+    accountStamp: () => ({ account: 'uid:test' }),
+    chat: async (payload) => { payloads.push(payload); throw new Error('stop here'); },
+  };
+  const adapter = new QoderAdapter({
+    provider: 'qoder', client,
+    prefs: { visible: null, pinned: '', includeAll: true, contextWindowByModel: {}, paramsByModel: {} },
+    log: () => {},
+  });
+  adapter.catalogCache = { at: Date.now(), models: [{ id: 'dfmodel' }], error: '', staleMs: 0 };
+  const chunks = [];
+  for await (const chunk of adapter.stream({ model: 'dfmodel[1m]', messages: [{ role: 'user', content: 'hi' }] })) chunks.push(chunk);
+  assert.equal(payloads[0].model, 'dfmodel');
+  assert.equal(chunks.find((chunk) => chunk.type === 'finish').reason.kind, 'error');
+});
+
+test('tool errors, unknown blocks and tool images keep their semantics', async () => {
+  const stats = {};
+  const failed = await toWireMessage({
+    role: 'tool',
+    toolCallId: 'c1',
+    isError: true,
+    content: [{ type: 'text', text: 'ENOENT: missing' }],
+  }, async () => null, stats);
+  assert.match(failed.content, /^\[tool error\]/);
+  assert.match(failed.content, /ENOENT/);
+
+  const withImage = await toWireMessage({
+    role: 'tool',
+    toolCallId: 'c2',
+    content: [{ type: 'text', text: 'screenshot' }, { type: 'image', attachmentId: 'a1' }],
+  }, async () => 'data:image/png;base64,AA==', stats);
+  assert.match(withImage.content, /1 张图片/);
+  assert.equal(stats.toolImages, 1);
+  assert.equal(stats.toolErrors, 1);
+
+  const assistant = await toWireMessage({
+    role: 'assistant',
+    content: [
+      { type: 'reasoning', text: 'hidden chain' },
+      { type: 'mcp_tool_use', name: 'search', input: { q: 'x' } },
+      { type: 'text', text: 'done' },
+    ],
+  }, async () => null, stats);
+  assert.equal(assistant.content.includes('hidden chain'), false, 'reasoning is not replayed as text');
+  assert.match(assistant.content, /\[mcp_tool_use\]/);
+  assert.match(assistant.content, /done/);
+  assert.equal(stats.droppedReasoning, 1);
+  assert.equal(stats.unknownBlocks, 1);
+
+  const user = await toWireMessage({
+    role: 'user',
+    content: [{ type: 'web_search_tool_result', results: [] }],
+  }, async () => null, stats);
+  assert.match(user.content[0].text, /\[web_search_tool_result\]/);
+});
+
+test('text-form tool calls are blocked instead of being treated as completion', () => {
+  const translator = new StreamTranslator();
+  translator.pushLine('data: {"choices":[{"delta":{"content":"[assistant 请求调用工具] [{\\"name\\":\\"read\\"}]"},"finish_reason":"stop"}]}');
+  const finish = translator.finish().find((chunk) => chunk.type === 'finish');
+  assert.equal(finish.reason.kind, 'error');
+  assert.equal(finish.reason.failure.code, CODE.TOOL_CALL_LEAK);
+
+  process.env.QODER_LEAK_DETECT = '0';
+  try {
+    const relaxed = new StreamTranslator();
+    relaxed.pushLine('data: {"choices":[{"delta":{"content":"[assistant 请求调用工具]"},"finish_reason":"stop"}]}');
+    assert.equal(relaxed.finish().find((chunk) => chunk.type === 'finish').reason.kind, 'stop');
+  } finally {
+    delete process.env.QODER_LEAK_DETECT;
+  }
+});
+
+test('invalid tool calls fail fast by default and can be dropped with a visible warning', () => {
+  const frame = 'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"bad.name","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}';
+  const strict = new StreamTranslator();
+  strict.pushLine(frame);
+  const strictFinish = strict.finish().find((chunk) => chunk.type === 'finish');
+  assert.equal(strictFinish.reason.kind, 'error');
+  assert.equal(strictFinish.reason.failure.code, CODE.INVALID);
+
+  process.env.QODER_INVALID_TOOL_POLICY = 'drop';
+  try {
+    const relaxed = new StreamTranslator();
+    relaxed.pushLine(frame);
+    const chunks = relaxed.finish();
+    assert.ok(chunks.some((chunk) => chunk.type === 'block-end' && /工具调用已丢弃/.test(chunk.block?.text || '')));
+    assert.equal(chunks.find((chunk) => chunk.type === 'finish').reason.kind, 'stop');
+  } finally {
+    delete process.env.QODER_INVALID_TOOL_POLICY;
+  }
+});
+
+test('missing upstream usage is estimated and marked, not recorded as zero', () => {
+  const translator = new StreamTranslator({ inputChars: 400 });
+  translator.pushLine('data: {"choices":[{"delta":{"reasoning":"think"},"finish_reason":"stop"}]}');
+  const usage = translator.finish().find((chunk) => chunk.type === 'usage').usage;
+  assert.equal(usage.estimated, true);
+  assert.equal(usage.inputTokens, 100);
+  assert.ok(usage.outputTokens >= 1);
+  assert.equal(usage.totalTokens, usage.inputTokens + usage.outputTokens);
+});
+
+test('interleaved parallel tool calls keep their ids, names and arguments', () => {
+  const translator = new StreamTranslator();
+  translator.pushLine('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"c1","function":{"name":"read","arguments":"{\\"a\\":"}}]}}]}');
+  translator.pushLine('data: {"choices":[{"delta":{"tool_calls":[{"index":1,"id":"c2","function":{"name":"write","arguments":"{\\"b\\":"}}]}}]}');
+  translator.pushLine('data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]}}]}');
+  translator.pushLine('data: {"choices":[{"delta":{"tool_calls":[{"index":1,"function":{"arguments":"2}"}}]},"finish_reason":"tool_calls"}]}');
+  const chunks = translator.finish();
+  const calls = chunks.filter((chunk) => chunk.type === 'block-end' && chunk.block.type === 'tool-call').map((chunk) => chunk.block);
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls.map((call) => call.id).sort(), ['c1', 'c2']);
+  assert.equal(calls.find((call) => call.id === 'c1').arguments, '{"a":1}');
+  assert.equal(calls.find((call) => call.id === 'c2').arguments, '{"b":2}');
+  assert.equal(chunks.find((chunk) => chunk.type === 'finish').reason.kind, 'tool-calls');
+});
+
+test('non-function tools are counted instead of disappearing silently', () => {
+  const stats = {};
+  const tools = toWireTools({
+    tools: [
+      { name: 'read', description: 'r', parameters: { type: 'object' } },
+      { type: 'custom', name: '' },
+      { name: 'read', description: 'duplicate' },
+    ],
+  }, stats);
+  assert.equal(tools.length, 1);
+  assert.equal(tools[0].function.name, 'read');
+  assert.equal(stats.skippedTools, 1);
 });

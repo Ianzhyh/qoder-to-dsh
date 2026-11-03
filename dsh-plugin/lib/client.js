@@ -194,6 +194,17 @@
       return String(Math.round(value));
     }
     const pct = (n) => (n === null || n === undefined || !Number.isFinite(Number(n)) ? '—' : Math.round(Number(n) * 100) + '%');
+    const ACTION_LABELS = {
+      wait: '等待重置', switch: '换号/充值', retry: '可重试', compact: '压缩上下文',
+      relogin: '重新登录', 'pick-model': '换模型', fail: '需处理',
+    };
+    function actionSummary(map) {
+      const entries = Object.entries(map || {}).filter(([, count]) => Number(count) > 0);
+      if (!entries.length) return '';
+      entries.sort((a, b) => Number(b[1]) - Number(a[1]));
+      return ' · ' + entries.map(([action, count]) => `${ACTION_LABELS[action] || action} ${count}`).join(' · ');
+    }
+    const needsAction = (item) => item && item.ok === false && item.errorAction && item.errorAction !== 'retry';
     // 与服务端 resolveModel 同一条公式：有插件默认先取默认值，再受模型输出
     // 上限收敛；否则用模型上限，最后才退回 Qoder CLI 的 32K。
     const autoOutputTokens = (pluginMaxTokens, modelMaxTokens, providerDefault) => {
@@ -343,7 +354,10 @@
       const known = Boolean(uid) && list.some((candidate) => String(candidate && candidate.uid || '') === uid);
       return {
         text: `插件当前使用 ${name}；本机检测到 ${list.length} 个账号。`,
-        note: uid && !known ? '当前账号来自 PAT / 浏览器授权，不在本机桌面端登录列表中。' : '',
+        note: [
+          uid && !known ? '当前账号来自 PAT / 浏览器授权，不在本机桌面端登录列表中。' : '',
+          list.length > 1 ? '在官方客户端切换账号不会自动改插件；如已切换，请在下方点该账号的「切换」。' : '',
+        ].filter(Boolean).join(' '),
       };
     }
     function checkinNotice(data, key = '') {
@@ -392,6 +406,13 @@
           unit: (user && user.unit) || (addOn && addOn.unit) || 'credits',
           exceeded: view.exceeded,
           expiresAt: view.expiresAt,
+          expiresKnown: view.expiresKnown === true,
+          expiryIncomplete: view.expiryIncomplete === true,
+          neverExpires: view.neverExpires === true,
+          nextExpiry: Number(view.nextExpiry) || 0,
+          nextExpiryName: view.nextExpiryName || '',
+          nextExpiryDays: Number.isFinite(view.nextExpiryDays) ? view.nextExpiryDays : null,
+          nextExpirySoon: view.nextExpirySoon === true,
           daysToExpiry: view.daysToExpiry,
           expiringSoon: view.expiringSoon === true,
           expired: view.expired === true,
@@ -405,6 +426,7 @@
           planName: view.planName || '',
           planPaid: view.planPaid === true,
           planEnd: view.planEnd,
+          addonBatches: (extras && extras.addonBatches) || null,
           warnings: view.warnings || [],
           at,
           stale: (view.warnings || []).some((warning) => warning.code === 'stale'),
@@ -461,6 +483,7 @@
       const paths = {
         refresh: ['M20 11a8 8 0 1 0-2.3 5.7', 'M20 5v6h-6'],
         check: ['M20 6 9 17l-5-5'],
+        info: ['M12 16v-5', 'M12 8h.01', 'M12 22a10 10 0 1 0 0-20 10 10 0 0 0 0 20Z'],
         alert: ['M12 9v4', 'M12 17h.01', 'M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0Z'],
         close: ['M18 6 6 18', 'M6 6l12 12'],
         search: ['M11 19a8 8 0 1 0 0-16 8 8 0 0 0 0 16Z', 'm21 21-4.35-4.35'],
@@ -758,9 +781,18 @@
       const mismatch = (info.warnings || []).some((warning) => warning.code === 'accountMismatch');
       const oldBuild = (info.warnings || []).some((warning) => warning.code === 'oldBuild');
       const groupRows = Array.isArray(info.groups) ? info.groups : [];
-      const showGroups = (info.packages || []).some((item) => item.source !== 'userQuota' && item.source !== 'addOnQuota')
-        || groupRows.length > 2
-        || groupRows.some((group) => Array.isArray(group.packages) && group.packages.length > 1);
+      const packs = groupRows.filter((group) => group.unlimited || group.total > 0 || group.used > 0);
+      const addon = info.addonBatches && Array.isArray(info.addonBatches.batches) ? info.addonBatches : null;
+      const addonRows = addon ? addon.batches : [];
+      const ledgerNext = Number(addon && addon.nextExpiry) || 0;
+      const viewNext = Number(info.nextExpiry) || 0;
+      const nextExpiry = (ledgerNext && viewNext) ? Math.min(ledgerNext, viewNext) : (ledgerNext || viewNext);
+      const nextDays = nextExpiry ? Math.floor((nextExpiry - Date.now()) / 86400000) : null;
+      const nextText = nextExpiry
+        ? `最近到期 ${dateLabel(nextExpiry)}${nextDays === 0 ? '（今天）' : nextDays > 0 ? `（${nextDays} 天后）` : ''}`
+        // 只有每一份额度都明确永久时才说不限期；有包缺字段就如实说“部分未返回”。
+        : (unlimited ? '不限期' : info.expiryIncomplete ? '部分额度上游未返回到期时间'
+          : info.neverExpires ? '不限期（上游标注永久额度）' : '上游未返回到期时间');
       const packValue = (pack) => {
         if (!pack) return '—';
         if (pack.unlimited) return '∞';
@@ -768,6 +800,10 @@
         if (!pack.total && !pack.remaining) return '0 / 0';
         return `${money(pack.remaining)} / ${money(pack.total)}`;
       };
+      // 到期只有三种状态：有日期 / 上游明确永久 / 上游没给。不能把后两者都说成「不限期」。
+      const packExpiryText = (group) => (group.expiresAt
+        ? `到期 ${dateLabel(group.expiresAt)}`
+        : group.neverExpires ? '不限期' : '到期未知');
       return h('div', { className: `qdr-card qdr-quota${wide ? ' qdr-quota-wide' : ''}` },
         h('div', { className: 'qdr-card-head' },
           h('div', null,
@@ -777,12 +813,14 @@
               unlimited ? h(Badge, { tone: 'green' }, '不限量') : null,
               info.expired ? h(Badge, { tone: 'amber' }, '额度已过期') : null,
               !info.expired && info.expiringSoon ? h(Badge, { tone: 'amber' }, `${info.daysToExpiry === 0 ? '今天' : `${info.daysToExpiry} 天后`}到期`) : null,
+              !info.expired && nextExpiry && (info.nextExpirySoon || (Number.isFinite(nextDays) && nextDays >= 0 && nextDays <= 7) || (Number.isFinite(nextDays) && nextDays < 0))
+                ? h(Badge, { tone: 'amber', title: '最近一笔额度即将到期' }, nextDays < 0 ? '有额度已过期' : nextDays === 0 ? '今天有额度到期' : `${nextDays} 天后到期`) : null,
               info.exceeded ? h(Badge, { tone: 'amber' }, '已用尽') : null,
               mismatch ? h(Badge, { tone: 'amber', title: '上游返回的额度 userId 与当前登录账号不一致' }, '账号不一致') : null,
               oldBuild ? h(Badge, { tone: 'amber', title: '额度接口返回 404/405，宿主可能是旧构建' }, '需重启 dsh') : null,
               info.stale ? h(Badge, { tone: 'amber', title: '上游额度读取失败或尚未刷新' }, '数据可能已过期') : null),
             h('div', { className: 'qdr-card-sub' },
-              info.expiresAt ? `到期 ${dateLabel(info.expiresAt)}${info.expired ? '（已过期）' : info.expiringSoon ? `（${info.daysToExpiry === 0 ? '今天' : `${info.daysToExpiry} 天后`}）` : ''}` : (unlimited ? '不限期' : '上游未提供到期时间'),
+              nextText,
               info.unit ? ` · 单位 ${unitText}` : '',
               info.at ? ` · 更新于 ${stamp(info.at)}` : '')),
           h('div', { className: 'qdr-card-actions' },
@@ -804,11 +842,56 @@
           h('div', null,
             h('span', null, '已用'),
             h('strong', null, `${money(info.used)} ${unitText}`))),
-        showGroups ? h('div', { className: 'qdr-quota-packs' }, groupRows.map((group) => h('div', { className: 'qdr-quota-pack', key: group.key || `${group.name}-${group.expiresAt}` },
-          h('span', { className: 'qdr-quota-pack-name' },
-            group.name,
-            group.expiresAt ? h('span', { className: 'qdr-hint' }, ` · 到期 ${dateLabel(group.expiresAt)}`) : null),
-          h('strong', null, group.unlimited ? '∞' : `${money(group.remaining)} / ${money(group.total)}`)))) : null,
+        addonRows.length ? h('div', { className: 'qdr-quota-packs' },
+          h('div', { className: 'qdr-quota-packs-head' },
+            h('span', null, '每日赠送 · 按到期分批'),
+            h('span', { className: 'qdr-hint' }, `先到期先扣 · 每日 10:00 后领取，领取后 ${addon.fallbackDays || 30} 天有效`)),
+          addonRows.map((batch, index) => h('div', { className: 'qdr-pack', key: `${batch.at}-${index}` },
+            h('div', { className: 'qdr-pack-summary' },
+              h('span', { className: 'qdr-pack-name' },
+                batch.untracked ? '本地未记录的领取' : `领取于 ${dateLabel(batch.at)}`),
+              batch.untracked ? null : h('span', { className: 'qdr-pack-count' }, `+${money(batch.credits)}`),
+              h('span', {
+                className: `qdr-pack-exp${batch.expiresAt && batch.expiresAt === nextExpiry ? ' qdr-pack-exp-next' : ''}${!batch.expiresAt ? ' qdr-pack-exp-unknown' : ''}`,
+                title: batch.untracked
+                  ? '在 IDE 里领取的，插件没有记录，无法推算到期；以网页账号页为准。'
+                  : batch.inferred ? `活动接口没返回有效期，按每日赠送默认 ${addon.fallbackDays} 天推算。` : `领取后 ${batch.validityDays} 天有效。`,
+              }, batch.expiresAt
+                ? `到期 ${dateLabel(batch.expiresAt)}${batch.inferred ? '（推算）' : ''}${batch.expiresAt === nextExpiry ? ' · 最近' : ''}`
+                : '到期未知'),
+              h('strong', { className: 'qdr-pack-value' }, `${money(batch.remaining)} Credits`)),
+            batch.untracked || batch.inferred ? h('div', { className: 'qdr-pack-body' },
+              h('div', { className: 'qdr-pack-note' },
+                batch.untracked
+                  ? '这笔是在 IDE 里领取的，插件没有记录，无法推算到期；以网页账号页为准。'
+                  : `活动接口没返回有效期，按每日赠送默认 ${addon.fallbackDays} 天推算；以网页账号页为准。`)) : null))) : null,
+        packs.length ? h('div', { className: 'qdr-quota-packs' },
+          h('div', { className: 'qdr-quota-packs-head' },
+            h('span', null, '资源包'),
+            info.detailUrl
+              ? h('a', { className: 'qdr-quota-link', href: safeHref(info.detailUrl), target: '_blank', rel: 'noreferrer noopener' }, nextExpiry ? `最近到期 ${dateLabel(nextExpiry)}` : '逐包到期见网页账号页', h(Icon, { name: 'external', size: 11 }))
+              : h('span', { className: 'qdr-hint' }, nextExpiry ? `最近到期 ${dateLabel(nextExpiry)}` : '上游未返回到期时间')),
+          packs.map((group) => h('details', {
+            className: 'qdr-pack',
+            key: group.key || `${group.name}-${group.expiresAt}`,
+          },
+          h('summary', { className: 'qdr-pack-summary' },
+            h('span', { className: 'qdr-pack-name' }, group.name),
+            group.packages && group.packages.length > 1 ? h('span', { className: 'qdr-pack-count' }, `${group.packages.length} 个`) : null,
+            h('span', {
+              className: `qdr-pack-exp${group.expiresAt && group.expiresAt === nextExpiry ? ' qdr-pack-exp-next' : ''}${!group.expiresAt && !group.neverExpires ? ' qdr-pack-exp-unknown' : ''}`,
+              title: group.expiresAt ? `到期 ${dateLabel(group.expiresAt)}` : group.neverExpires ? '上游标注为永久额度' : '上游没有返回这个包的到期时间，逐包到期只在网页账号页可见',
+            }, packExpiryText(group)),
+            h('strong', { className: 'qdr-pack-value' }, group.unlimited ? '∞' : `${money(group.remaining)} / ${money(group.total)}`)),
+          h('div', { className: 'qdr-pack-body' },
+            h('div', null, h('span', null, '总量'), h('strong', null, group.unlimited ? '∞' : money(group.total))),
+            h('div', null, h('span', null, '已用'), h('strong', null, money(group.used))),
+            h('div', null, h('span', null, '剩余'), h('strong', null, group.unlimited ? '∞' : money(group.remaining))),
+            h('div', null, h('span', null, '到期'), h('strong', null, group.expiresAt ? dateLabel(group.expiresAt) : group.neverExpires ? '不限期' : '上游未返回')),
+            group.expiresAt && group.expiresAt === nextExpiry
+              ? h('div', { className: 'qdr-pack-note' }, '这是最近要到期的一包') : null,
+            !group.expiresAt && !group.neverExpires
+              ? h('div', { className: 'qdr-pack-note' }, '插件接口只拿到汇总额度；逐包到期请点上方链接到网页账号页查看。') : null)))) : null,
         (info.detailUrl || info.upgradeUrl || (info.planEnd && info.planEnd !== info.expiresAt)) ? h('div', { className: 'qdr-quota-links' },
           info.planEnd && info.planEnd !== info.expiresAt ? h('span', { className: 'qdr-hint' }, `套餐周期至 ${dateLabel(info.planEnd)}`) : null,
           info.detailUrl ? h('a', { className: 'qdr-quota-link', href: safeHref(info.detailUrl), target: '_blank', rel: 'noreferrer noopener' }, '用量明细', h(Icon, { name: 'external', size: 12 })) : null,
@@ -843,8 +926,8 @@
     }
 
     function CheckRow({ check }) {
-      const tone = check.status === 'pass' ? 'ok' : check.status === 'warn' ? 'warn' : 'bad';
-      const icon = check.status === 'pass' ? 'check' : check.status === 'warn' ? 'alert' : 'close';
+      const tone = check.status === 'pass' ? 'ok' : check.status === 'warn' ? 'warn' : check.status === 'na' ? 'neutral' : 'bad';
+      const icon = check.status === 'pass' ? 'check' : check.status === 'warn' ? 'alert' : check.status === 'na' ? 'info' : 'close';
       return h('div', { className: 'qdr-check' },
         h('span', { className: `qdr-check-icon qdr-check-${tone}` }, h(Icon, { name: icon, size: 14 })),
         h('div', { className: 'qdr-check-body' },
@@ -868,6 +951,7 @@
       if (model.supportsReasoning) out.push({ text: (model.reasoningEfforts || []).join('/') || '思考', tone: 'violet' });
       if (model.free) out.push({ text: '免费', tone: 'green' });
       else if (model.credits !== null && model.credits !== undefined) out.push({ text: '×' + money(model.credits), tone: 'neutral' });
+      if (model.free && model.promotionEndsAt) out.push({ text: `限时免费至 ${dateLabel(model.promotionEndsAt)}`, tone: 'amber' });
       if (model.promotionActive && model.discount) out.push({ text: `促销 ${Math.round(model.discount * 100)}%`, tone: 'amber' });
       if (model.badge && !(model.promotionActive && /^谷时/.test(model.badge))) out.push({ text: model.badge, tone: 'amber' });
       if (customized) out.push({ text: '自定义', tone: 'accent' });
@@ -1013,6 +1097,7 @@
           h(Badge, { tone: model.official === false ? 'neutral' : 'green' }, model.official === false ? '非官方' : '官方目录'),
           model.supportsImages ? h(Badge, { tone: 'neutral' }, '图片输入') : null,
           model.free ? h(Badge, { tone: 'green' }, '免费') : (model.credits !== null && model.credits !== undefined ? h(Badge, { tone: 'neutral' }, '×' + money(model.credits) + ' Credits') : null),
+          model.free && model.promotionEndsAt ? h(Badge, { tone: 'amber' }, `限时免费至 ${dateLabel(model.promotionEndsAt)}`) : null,
           model.promotionActive && model.discount ? h(Badge, { tone: 'amber' }, `促销 ${Math.round(model.discount * 100)}%`) : null,
           model.badge ? h(Badge, { tone: 'amber' }, model.badge) : null),
         h('div', { className: 'qdr-fields' },
@@ -1697,7 +1782,10 @@
             h('div', { className: 'qdr-checkin-copy' },
               h('div', { className: 'qdr-checkin-title' }, '每日签到',
                 h(Badge, { tone: data.auto ? 'green' : 'neutral' }, data.auto ? '自动签到已开启' : '自动签到已关闭')),
-              h('div', { className: 'qdr-checkin-sub' }, data.window)),
+              h('div', { className: 'qdr-checkin-sub' }, data.window),
+              data.devices && data.devices.global && data.devices.global.note
+                ? h('div', { className: 'qdr-hint', style: { marginTop: '6px' } }, data.devices.global.note)
+                : null),
             h('div', { className: 'qdr-checkin-actions' },
               h('button', {
                 type: 'button', role: 'switch', 'aria-checked': Boolean(data.auto),
@@ -1752,6 +1840,8 @@
                 h('div', { className: 'qdr-checkin-meta' },
                   account.uidTail ? `uid …${account.uidTail}` : '本机账号',
                   account.expiresAt ? ` · ${dateLabel(account.expiresAt)} 过期` : '',
+                  account.deviceSource === 'cache' ? ' · 设备身份来自客户端缓存'
+                    : account.deviceSource === 'runtime-info' ? ' · 设备身份来自本机组件' : '',
                   !account.deviceAvailable ? ` · ${account.deviceReason || '设备身份不可用'}` : ''),
                 h('div', { className: 'qdr-checkin-status-line' },
                   h(Badge, { tone: meta.tone }, checkinAccountStatus(account)),
@@ -1830,6 +1920,7 @@
       const [requestDays, setRequestDays] = useState(7);
       const [requestModel, setRequestModel] = useState('');
       const [requestOnlyFailures, setRequestOnlyFailures] = useState(false);
+      const [requestOnlyActionable, setRequestOnlyActionable] = useState(false);
       const [requestsPaused, setRequestsPaused] = useState(false);
       const [logs, setLogs] = useState(null);
       const [logsBusy, setLogsBusy] = useState(false);
@@ -2871,6 +2962,8 @@
         planLabel: row.active ? planLabel : '',
         current: row.active === true,
         hidden: row.hidden === true,
+        missing: row.missing === true,
+        tokenReady: row.tokenReady === true,
         sources: row.sources,
         candidate: null,
       });
@@ -3057,6 +3150,7 @@
                         h('strong', null, row.name),
                         row.alias ? h(Badge, { tone: 'accent' }, '别名') : null,
                         current ? h(Badge, { tone: 'green' }, '当前') : null,
+                        row.missing ? h(Badge, { tone: 'amber' }, '需重新登录') : null,
                         checkinAccount ? h(Badge, { tone: checkinMeta(checkinAccount.status).tone }, checkinAccountStatus(checkinAccount)) : null),
                       h('div', { className: 'qdr-account-menu-meta' },
                         row.regionLabel,
@@ -3064,9 +3158,10 @@
                         row.expiresAt ? ` · ${dateLabel(row.expiresAt)} 过期` : '')),
                     h(Button, {
                       size: 'sm', variant: current ? 'ghost' : 'secondary',
-                      disabled: current || Boolean(accountActionBusy),
+                      disabled: current || Boolean(accountActionBusy) || row.missing === true,
+                      title: row.missing ? '本机已没有这个账号的登录态，先在 Qoder 客户端重新登录' : '',
                       onClick: () => switchAccountRow(row),
-                    }, current ? '当前' : '切换'));
+                    }, current ? '当前' : row.missing ? '需登录' : '切换'));
                 }))
                 : h('div', { className: 'qdr-quiet' }, '没有检测到其他本机登录；在 Qoder 客户端登录后会自动出现在这里。'),
               h('div', { className: 'qdr-account-menu-foot' },
@@ -3081,7 +3176,7 @@
               onRunCheckin: () => runCheckin(''),
             }),
             h('div', { className: 'qdr-stats' },
-              h(Stat, { label: '今日请求', value: String(today.requests || 0), hint: today.failures ? `${today.failures} 次失败` : '全部成功' }),
+              h(Stat, { label: '今日请求', value: String(today.requests || 0), hint: today.failures ? `${today.failures} 次失败${actionSummary(today.failureByAction)}` : '全部成功' }),
               h(Stat, { label: 'Tokens', value: compact(today.tokens || 0), hint: today.savedCredits ? `${money(today.credits)} Credits · 已省 ${money(today.savedCredits)}` : (today.credits ? `${money(today.credits)} Credits` : '本地统计') }),
               h(Stat, { label: '平均首字', value: today.avgFirstByteMs ? duration(today.avgFirstByteMs) : '—', hint: '上游首包' }),
               h(Stat, { label: '成功率', value: pct(today.successRate), hint: '今日', tone: today.successRate !== null && today.successRate < 0.9 ? 'warn' : undefined })),
@@ -3413,6 +3508,11 @@
                   'aria-pressed': requestOnlyFailures,
                   onClick: () => setRequestOnlyFailures((value) => !value),
                 }, '仅失败'),
+                h('button', {
+                  type: 'button', className: `qdr-chip${requestOnlyActionable ? ' qdr-chip-on' : ''}`,
+                  'aria-pressed': requestOnlyActionable,
+                  onClick: () => setRequestOnlyActionable((value) => !value),
+                }, '仅需处理'),
                 h(Button, {
                   size: 'sm', variant: requestsPaused ? 'primary' : 'secondary', icon: requestsPaused ? 'bolt' : 'pause',
                   onClick: () => setRequestsPaused((value) => !value),
@@ -3426,7 +3526,9 @@
               h('table', { className: 'qdr-req-table' },
                 h('thead', null, h('tr', null,
                   ['时间', '模型', '状态', '首字', '耗时', '输入', '输出', '缓存', '账号', 'Credits'].map((label) => h('th', { key: label, scope: 'col' }, label)))),
-                h('tbody', null, (requests.items || []).map((item, index) => h(React.Fragment, { key: `${item.at}-${index}` },
+                h('tbody', null, (requests.items || [])
+                  .filter((item) => !requestOnlyActionable || needsAction(item))
+                  .map((item, index) => h(React.Fragment, { key: `${item.at}-${index}` },
                   h('tr', null,
                     h('td', { className: 'qdr-req-time' }, stamp(item.at)),
                     h('td', null,
@@ -3453,7 +3555,8 @@
                       }, '复制'))) : null)))))
               : h('div', { className: 'qdr-quiet' },
                 requestsBusy ? '正在读取请求明细…'
-                  : requestOnlyFailures ? '当前窗口没有失败请求。' : '当前窗口没有请求记录。'))) : null,
+                  : requestOnlyActionable ? '当前窗口没有需要手动处理的请求。'
+                    : requestOnlyFailures ? '当前窗口没有失败请求。' : '当前窗口没有请求记录。'))) : null,
 
         tab === 'account' ? h('div', panelProps('account'),
           h('div', { className: 'qdr-card qdr-account-list-card' },
@@ -3500,6 +3603,7 @@
                     row.alias ? h(Badge, { tone: 'accent' }, '别名') : null,
                     row.current ? h(Badge, { tone: 'green' }, '当前') : null,
                     row.hidden ? h(Badge, { tone: 'amber' }, '已隐藏') : null,
+                    row.missing ? h(Badge, { tone: 'amber', title: '本机已没有这个账号的登录态（客户端同区只保留一份登录），重新登录该账号即可恢复。' }, '需重新登录') : null,
                     row.planLabel ? h(Badge, { tone: 'accent' }, row.planLabel) : null,
                     checkinInfoMeta ? h(Badge, { tone: checkinInfoMeta.tone }, checkinAccountStatus(checkinInfo)) : null),
                   h('div', { className: 'qdr-account-meta' }, meta),
@@ -3534,9 +3638,10 @@
                     ? h(Badge, { tone: 'green' }, '当前账号')
                     : h(Button, {
                       size: 'sm', variant: 'secondary', icon: 'swap',
-                      disabled: Boolean(accountActionBusy),
+                      disabled: Boolean(accountActionBusy) || row.missing === true,
+                      title: row.missing ? '本机已没有这个账号的登录态，先重新登录再切换' : '',
                       onClick: () => switchAccountRow(row),
-                    }, '切换')));
+                    }, row.missing ? '需登录' : '切换')));
             })) : h(Empty, {
               icon: 'key', title: '没有检测到本机 Qoder 登录',
               detail: '先在 Qoder 客户端登录，或使用下面的浏览器授权 / PAT。',
@@ -4006,10 +4111,29 @@
 .qdr-quota-grid>div{display:flex;flex-direction:column;gap:2px;min-width:0}
 .qdr-quota-grid span{font-size:0.59375rem;color:var(--qdr-faint);letter-spacing:.02em;white-space:nowrap}
 .qdr-quota-grid strong{font-size:0.71875rem;font-weight:600;font-variant-numeric:tabular-nums;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.qdr-quota-packs{display:flex;flex-direction:column;gap:4px;margin-top:9px;padding-top:9px;border-top:1px solid var(--qdr-line)}
-.qdr-quota-pack{display:flex;align-items:center;justify-content:space-between;gap:10px;font-size:0.65625rem;color:var(--qdr-muted)}
-.qdr-quota-pack-name{min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.qdr-quota-pack strong{font-size:0.71875rem;font-variant-numeric:tabular-nums;white-space:nowrap}
+.qdr-quota-packs{display:flex;flex-direction:column;gap:2px;margin-top:9px;padding-top:9px;border-top:1px solid var(--qdr-line)}
+.qdr-quota-packs-head{display:flex;align-items:baseline;justify-content:space-between;gap:10px;font-size:0.65625rem;color:var(--qdr-muted);margin-bottom:3px}
+.qdr-pack{border-radius:8px;border:1px solid transparent;transition:background .18s ease,border-color .18s ease}
+.qdr-pack[open]{background:var(--qdr-soft);border-color:var(--qdr-line)}
+.qdr-pack-summary{display:flex;align-items:center;gap:8px;padding:5px 6px;border-radius:8px;list-style:none;font-size:0.65625rem;color:var(--qdr-muted);min-width:0}
+/* 每日赠送的批次行是静态展示，不能长得像能点开的样子。 */
+details>.qdr-pack-summary{cursor:pointer}
+details>.qdr-pack-summary::-webkit-details-marker{display:none}
+.qdr-pack-summary:hover{background:var(--qdr-soft)}
+details>.qdr-pack-summary:hover{background:var(--qdr-soft)}
+.qdr-pack-summary:focus-visible{outline:2px solid var(--qdr-accent);outline-offset:2px}
+.qdr-pack-summary::before{content:'';width:0;height:0;flex:none;border-left:4px solid currentColor;border-top:3.5px solid transparent;border-bottom:3.5px solid transparent;opacity:.55;transition:transform .18s ease;transform-origin:1px 50%}
+.qdr-pack[open]>.qdr-pack-summary::before{transform:rotate(90deg)}
+.qdr-pack-name{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--qdr-fg);font-weight:600}
+.qdr-pack-count{flex:none;font-size:0.59375rem;padding:0 5px;border-radius:999px;background:var(--qdr-soft-2);color:var(--qdr-muted)}
+.qdr-pack-exp{flex:none;font-size:0.625rem;color:var(--qdr-faint);font-variant-numeric:tabular-nums;white-space:nowrap}
+.qdr-pack-exp-next{color:var(--qdr-warn);font-weight:600}
+.qdr-pack-exp-unknown{color:var(--qdr-faint);font-style:italic}
+.qdr-pack-value{flex:none;font-size:0.6875rem;font-variant-numeric:tabular-nums;white-space:nowrap}
+.qdr-pack-body{display:grid;grid-template-columns:repeat(auto-fit,minmax(96px,1fr));gap:4px 12px;padding:2px 6px 8px 20px}
+.qdr-pack-body>div{display:flex;align-items:baseline;justify-content:space-between;gap:8px;font-size:0.625rem;color:var(--qdr-muted)}
+.qdr-pack-body>div>strong{color:var(--qdr-fg);font-variant-numeric:tabular-nums;font-weight:600}
+.qdr-pack-note{grid-column:1/-1;justify-content:flex-start!important;color:var(--qdr-faint);font-size:0.59375rem}
 .qdr-quota-links{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-top:9px;padding-top:9px;border-top:1px solid var(--qdr-line)}
 .qdr-quota-link{display:inline-flex;align-items:center;gap:4px;font-size:0.65625rem;color:var(--qdr-accent);text-decoration:none;transition:opacity .18s ease}
 .qdr-quota-link:hover{text-decoration:underline}
@@ -4019,7 +4143,19 @@
 /* ── 用量 ──────────────────────────────────────────────────────── */
 .qdr-stats-6{grid-template-columns:repeat(3,minmax(0,1fr))}
 .qdr-usage-head{display:flex;align-items:center;justify-content:space-between;gap:8px;flex-wrap:wrap}
-.qdr-usage-tools{display:flex;align-items:center;gap:8px;flex:none}
+.qdr-usage-head>div:first-child{flex:1 1 220px;min-width:0}
+/* 工具条必须能换行：不换行时它的 min-content 比卡片宽，会把整块面板撑出横向滚动条。 */
+.qdr-usage-tools{display:flex;align-items:center;gap:8px;flex:0 1 auto;flex-wrap:wrap;justify-content:flex-end;min-width:0}
+.qdr-usage-tools>.qdr-select,.qdr-usage-tools>.qdr-select-sm{flex:0 1 150px;min-width:96px}
+/* 请求页的模型筛选是原生 <select>，没走自定义下拉；不补样式会在深色主题里露出白底控件。 */
+select.qdr-select{appearance:none;-webkit-appearance:none;width:auto;height:28px;padding:0 24px 0 9px;border:1px solid var(--qdr-line);border-radius:8px;background-color:var(--qdr-soft);color:var(--qdr-fg);font-family:inherit;font-size:0.65625rem;line-height:26px;cursor:pointer;outline:none;background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 10 6'><path d='M1 1l4 4 4-4' fill='none' stroke='%23858f88' stroke-width='1.4' stroke-linecap='round' stroke-linejoin='round'/></svg>");background-repeat:no-repeat;background-position:right 7px center;background-size:9px 6px;transition:border-color .18s,background-color .18s}
+select.qdr-select:hover{border-color:var(--qdr-accent-border);background-color:var(--qdr-soft-2)}
+select.qdr-select:focus-visible{outline:2px solid var(--qdr-accent);outline-offset:1px}
+select.qdr-select option{background:var(--qdr-card);color:var(--qdr-fg)}
+/* 面板宽度不够时让工具条独占一行，避免 7 个控件被挤成两行。 */
+@container qdr (max-width:860px){
+  .qdr-usage-tools{flex:1 1 100%;justify-content:flex-start}
+}
 .qdr-model-stats{display:flex;flex-direction:column;gap:8px;margin-top:10px}
 .qdr-model-stat{padding:9px 10px;border:1px solid var(--qdr-line);border-radius:9px;background:var(--qdr-soft)}
 .qdr-model-stat-head{display:flex;align-items:flex-start;justify-content:space-between;gap:8px}
@@ -4045,8 +4181,10 @@
 .qdr-usage-error{display:flex;align-items:flex-start;gap:8px;margin-top:5px;padding:6px 8px;border-radius:6px;background:var(--qdr-bad-weak);color:var(--qdr-bad);font-size:0.625rem;line-height:1.45;overflow-wrap:anywhere}
 .qdr-usage-error>span{flex:1;min-width:0}
 .qdr-usage-error .qdr-text-btn{color:inherit;flex:none}
-.qdr-req-scroll{overflow-x:auto;margin-top:10px;border:1px solid var(--qdr-line);border-radius:9px}
-.qdr-req-table{width:100%;border-collapse:collapse;font-size:0.65625rem;min-width:860px}
+.qdr-req-scroll{overflow-x:auto;overscroll-behavior-x:contain;margin-top:10px;border:1px solid var(--qdr-line);border-radius:9px;max-width:100%;min-width:0;contain:inline-size}
+/* 表格按内容排布：列不会被压成「D…」「连接失…」。
+   宿主比表格窄时只在这一块内部横向滚动，contain:inline-size 保证不会反过来撑宽面板。 */
+.qdr-req-table{width:100%;min-width:660px;border-collapse:collapse;font-size:0.65625rem}
 .qdr-req-table th{text-align:left;font-weight:600;color:var(--qdr-faint);padding:7px 9px;border-bottom:1px solid var(--qdr-line);background:var(--qdr-soft);white-space:nowrap}
 .qdr-req-table td{padding:7px 9px;border-bottom:1px solid var(--qdr-line);vertical-align:top;white-space:nowrap}
 .qdr-req-table tr:last-child td{border-bottom:none}
@@ -4216,6 +4354,8 @@
 .qdr-heat-4{background:var(--qdr-heat-4)}
 .qdr-heat-empty{background:transparent}
 .qdr-heat-foot{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;font-size:0.59375rem;color:var(--qdr-faint);margin-top:3px}
+.qdr-heat-selected{display:flex;align-items:center;gap:6px;margin-top:6px;padding:5px 8px;border-radius:7px;background:var(--qdr-soft);color:var(--qdr-muted);font-size:0.625rem;font-variant-numeric:tabular-nums}
+.qdr-heat-selected svg{color:var(--qdr-faint);flex:none}
 .qdr-heat-legend{display:inline-flex;align-items:center;gap:4px}
 .qdr-heat-legend i{width:10px;height:10px;border-radius:3px;display:inline-block}
 .qdr-credits-card{padding:16px}
