@@ -194,10 +194,10 @@ test('appDataInfo follows APPDATA path, location.v1.json, then gives up', () => 
   const home = join(base, 'home');
   const appDir = join(appData, 'com.qoder.app.stable');
   mkdirSync(appDir, { recursive: true });
-  const direct = appDataInfo('global', { appData, home });
+  const direct = appDataInfo('global', { platform: 'win32', appData, home });
   assert.equal(direct.source, 'appdata');
   assert.equal(direct.dir, appDir);
-  assert.equal(resolveAppDataDir('global', { appData, home }), appDir);
+  assert.equal(resolveAppDataDir('global', { platform: 'win32', appData, home }), appDir);
 
   rmSync(appDir, { recursive: true, force: true });
   const target = join(base, 'moved-data');
@@ -206,12 +206,12 @@ test('appDataInfo follows APPDATA path, location.v1.json, then gives up', () => 
     revision: 1,
     activeRoots: [{ logicalPath: appDir, targetPath: target }],
   });
-  const moved = appDataInfo('global', { appData, home });
+  const moved = appDataInfo('global', { platform: 'win32', appData, home });
   assert.equal(moved.source, 'location');
   assert.equal(moved.dir, target);
   assert.equal(moved.appDataPath, appDir);
 
-  const missing = appDataInfo('global', { appData: join(base, 'empty'), home: join(base, 'nohome') });
+  const missing = appDataInfo('global', { platform: 'win32', appData: join(base, 'empty'), home: join(base, 'nohome') });
   assert.equal(missing.dir, '');
   assert.equal(missing.source, '');
 });

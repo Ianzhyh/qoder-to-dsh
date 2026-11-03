@@ -68,7 +68,7 @@
 
 ### Tests
 
-- 新增 `tests/task-identity.test.mjs`、`tests/request-budget.test.mjs`；适配器、qoder-api、quota、models、state、checkin、client-env、umid 补 47 条用例，总计 293 条通过。
+- 新增 `tests/task-identity.test.mjs`、`tests/request-budget.test.mjs`；适配器、qoder-api、quota、models、state、checkin、client-env、umid 补 48 条用例，总计 294 条通过。
 
 ## [1.5.1] - 2026-11-02
 
