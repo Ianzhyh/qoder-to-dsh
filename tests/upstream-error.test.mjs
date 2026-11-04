@@ -6,6 +6,7 @@ import {
   parseRetryAfterHeader, retryAfterFrom,
   isModelQueue, isDailyCap, isTerminalSession, isVersionGate, isContentAudit, isTrialRestricted, isModelMissing,
 } from '../lib/upstream-error.mjs';
+import { QoderAdapter } from '../lib/adapter.mjs';
 
 test('Qoder queue is retryable and survives escaped JSON', () => {
   assert.equal(classifyError('upstream isQueued', 200), CODE.RATE_LIMIT);
@@ -126,4 +127,13 @@ test('retry hints never downgrade an exhausted daily cap to a retryable rate lim
 test('parameter names and RPC timeouts are not hijacked by bare keywords', () => {
   assert.equal(classifyError('rpc error: desc = context deadline exceeded', 500), CODE.TIMEOUT);
   assert.equal(classifyError('invalid parameter frequency_penalty', 400), CODE.INVALID);
+});
+
+test('every code the panel tells users to retry is in the host retry policy', () => {
+  const adapter = new QoderAdapter({ provider: 'qoder', client: {} });
+  const retryable = new Set(adapter.providerRetryPolicy().retryableCodes);
+  for (const code of Object.values(CODE)) {
+    if (errorAction(code, '') !== ACTION.RETRY) continue;
+    assert.ok(retryable.has(code), `${code} 的建议是 retry，但不在 providerRetryPolicy.retryableCodes 里`);
+  }
 });

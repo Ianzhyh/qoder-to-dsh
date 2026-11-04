@@ -8,8 +8,881 @@
     var React;
     try { React = require('react'); } catch (error) { React = globalThis.React; }
     if (!React) throw new Error('qoder-to-dsh: react is not available');
-    const h = React.createElement;
+    const RAW_H = React.createElement;
     const { useState, useEffect, useCallback, useRef, useMemo, useLayoutEffect } = React;
+
+    // ── 界面语言 ────────────────────────────────────────────────────────
+    // 面板是纯 React 渲染：所有文案最终都会经过 h()。在渲染入口统一翻译，
+    // 比在 800 多个调用点逐个包 t() 更不容易漏，也不会动到日志/模型名等数据。
+    // 用户内容容器用 data-i18n="off" 标记，绝不能被翻译。
+    const LANG_STORAGE_KEY = 'qoder-to-dsh.lang';
+    const LANG_MODES = ['auto', 'zh', 'en'];
+    let UI_LOCALE = 'zh';
+
+    function detectLocale() {
+      try {
+        const declared = typeof document !== 'undefined' && document.documentElement
+          ? String(document.documentElement.lang || '')
+          : '';
+        const language = typeof navigator !== 'undefined' ? String(navigator.language || '') : '';
+        const tag = (declared || language).toLowerCase();
+        if (tag) return tag.startsWith('zh') ? 'zh' : 'en';
+      } catch { /* 非浏览器环境默认中文 */ }
+      return 'zh';
+    }
+
+    function storedLangMode() {
+      try {
+        if (typeof localStorage === 'undefined') return 'auto';
+        const value = localStorage.getItem(LANG_STORAGE_KEY);
+        if (LANG_MODES.includes(value)) return value;
+      } catch { /* 隐私模式可能禁用存储 */ }
+      return 'auto';
+    }
+
+    function resolveLangMode(mode) {
+      return mode === 'zh' || mode === 'en' ? mode : detectLocale();
+    }
+
+    function setUILangMode(mode) {
+      const next = LANG_MODES.includes(mode) ? mode : 'auto';
+      try { if (typeof localStorage !== 'undefined') localStorage.setItem(LANG_STORAGE_KEY, next); } catch { /* ignore */ }
+      UI_LOCALE = resolveLangMode(next);
+      try {
+        if (typeof window !== 'undefined' && typeof CustomEvent === 'function') {
+          window.dispatchEvent(new CustomEvent('qoder:lang-changed', { detail: { mode: next, locale: UI_LOCALE } }));
+        }
+      } catch { /* older webview */ }
+      return UI_LOCALE;
+    }
+
+    // 中文原文 → English。键必须与渲染时的最终字符串完全一致；动态句子由
+    // EN_RULES（正则）和 EN_PHRASES（长片段优先）兜底。
+    // i18n:en:begin
+    const EN = Object.assign(Object.create(null), {
+      "签到使用本机 Qoder 客户端设备身份（runtime-info），令牌只在本机内存使用；每天 10:00（UTC+8）后开放，DSH 运行期间自动领取。非官方接口，活动变更时会在账号行显示原因。": "Check-in uses the local Qoder client device identity (runtime-info); tokens stay in local memory. Opens daily after 10:00 (UTC+8) and runs automatically while DSH is running. Unofficial API; account rows show the reason if the campaign changes.",
+      "「自动」输出使用 Qoder CLI 默认 32K（插件或模型有更高默认时以它们为准）；温度「自动」不传，由上游决定。保存后对下一次请求生效；已开始会话的占用率显示不会回填。": "Auto output uses the Qoder CLI default of 32K (a higher plugin or model default wins); Auto temperature is omitted and decided upstream. Saved settings apply to the next request; already-started sessions do not backfill usage.",
+      "只统计上游实际扣费的 Credits：免费模型即使返回原价估算也不计入，折扣请求只记实扣；已省金额单独汇总。数据只来自本机请求元数据，不包含 prompt / 回复内容。": "Counts only upstream-billed Credits: free models are excluded even if they return a list price, and discounted requests record only the billed amount; savings are summarized separately. Data comes from local request metadata and never includes prompts or replies.",
+      "点模型行展开详情：可改上下文窗口、思考档位、温度和最大输出；默认模型即使未勾选也会保留在选择器中。": "Click a model row for details: context window, reasoning effort, temperature, and max output; the default model stays in the selector even when unchecked.",
+      "PAT 与访问令牌都用本机 DPAPI / AES-GCM 加密；面板和诊断包都不会返回令牌。": "PATs and access tokens are encrypted with local DPAPI / AES-GCM; the panel and diagnostics never return tokens.",
+      "插件接口还没就绪（HTTP 404）：如果刚升级插件，请完全退出并重启 dsh，再刷新本页。": "Plugin API is not ready (HTTP 404): after upgrading, fully quit and restart dsh, then refresh this page.",
+      "Ctrl/⌘ + Enter 运行 · 消耗 Qoder Credits · 不发送工具调用": "Ctrl/⌘ + Enter to run · uses Qoder Credits · no tool calls",
+      "退出 Qoder？\n这会删除本机保存的加密凭据，但不会影响 Qoder 官方客户端的登录。": "Sign out of Qoder?\nThis removes encrypted credentials on this machine but does not affect the official Qoder client.",
+      ").name || identity.text} 点「切换」立即更换插件当前使用的账号。": ").name || identity.text} Click Switch to change the plugin's active account.",
+      "优先导入本机 Qoder 已登录账号；也可以使用浏览器授权或 PAT。凭据只保存在本机（": "Imports a signed-in local Qoder account first; browser authorization or PAT also works. Credentials stay local (",
+      "自动 = 不指定；Qoder CLI 聊天请求不传 temperature，由上游决定": "Auto = omit; Qoder CLI chat requests do not send temperature; upstream decides",
+      "自动注册 provider=qoder，并把当前账号可用的模型写进 dsh 选择器。": "Registers provider=qoder and writes the account's available models into the dsh selector.",
+      "。若出现 401 或额度异常，请先在官方客户端重新登录，再完全退出并重启 dsh。": ". If 401 or quota errors appear, sign in again in the official client, then fully quit and restart dsh.",
+      "清空本地用量记录？\n只删除 token/延迟统计，不影响 Qoder 账号和模型。": "Clear local usage records?\nOnly token/latency stats are removed; Qoder account and models are unaffected.",
+      "本机已没有这个账号的登录态（客户端同区只保留一份登录），重新登录该账号即可恢复。": "This account is no longer signed in locally (the client keeps one sign-in per region); sign in again to restore it.",
+      "选择一个模型，发一句话，就能看到真实回复、思考过程、token 用量与首字延迟。": "Pick a model and send one line to see the real reply, reasoning, token usage, and first-byte latency.",
+      "pt- 会保存到上方 PAT 凭据库；dt-/jt- 只作为一次性令牌，不保存。": "pt- tokens are saved to the PAT store above; dt-/jt- are one-time tokens and are not saved.",
+      "先在 Qoder 客户端登录；插件会只读扫描本机登录态，多个账号可以分别领取。": "Sign in to the Qoder client first; the plugin scans local sign-ins read-only and claims each account separately.",
+      "额度接口返回 404/405：宿主可能是旧构建，完全退出 dsh 再打开。": "Quota API returned 404/405; the host may be an old build. Fully quit and reopen dsh.",
+      "在官方客户端切换账号不会自动改插件；如已切换，请在下方点该账号的「切换」。": "Switching in the official client does not change the plugin; click Switch on that account below.",
+      "这笔是在 IDE 里领取的，插件没有记录，无法推算到期；以网页账号页为准。": "Claimed in the IDE; the plugin has no record and cannot infer expiry; refer to the web account page.",
+      "模型参数已保存，下一次请求生效；选择器元数据需完全退出 dsh 后刷新。": "Model parameters saved for the next request; selector metadata refreshes after fully quitting dsh.",
+      "切换只影响插件当前使用的账号，不会修改 Qoder 官方客户端的登录态。": "Switching only changes the plugin's active account; it does not modify the official Qoder client sign-in.",
+      "显示设置已保存；模型选择器刷新需完全退出 dsh，已保存的偏好不会丢失。": "Display settings saved; the selector refreshes after fully quitting dsh; saved preferences persist.",
+      "Qoder 已连接 · 额度暂时读取失败（设置 → Qoder 可刷新）": "Qoder connected · quota temporarily unavailable (refresh in Settings → Qoder)",
+      "没有检测到其他本机登录；在 Qoder 客户端登录后会自动出现在这里。": "No other local sign-ins detected; they appear here after signing in to the Qoder client.",
+      "切换只影响插件当前使用的账号，不会修改或退出 Qoder 官方客户端。": "Switching only changes the plugin's active account; it does not modify or sign out the official client.",
+      "DeepSeek Harness 原生接入 · 单进程 · 无额外端口": "Native DeepSeek Harness integration · single process · no extra ports",
+      "优先只读导入本机 Qoder 登录态；也可以用浏览器授权或 PAT。": "Imports the local Qoder sign-in read-only first; browser authorization or PAT also works.",
+      "在 IDE 里领取的，插件没有记录，无法推算到期；以网页账号页为准。": "Claimed in the IDE; the plugin has no record and cannot infer expiry; refer to the web account page.",
+      "每个本机已登录账号都会单独领取；切换账号不会修改官方客户端登录态。": "Each local account is claimed separately; switching does not change the official client sign-in.",
+      "先在 Qoder 客户端登录，或使用下面的浏览器授权 / PAT。": "Sign in to the Qoder client first, or use browser authorization / PAT below.",
+      "需要本机 Qoder 客户端的 runtime-info 设备身份": "Requires the local Qoder client's runtime-info device identity",
+      "账号来自本机桌面端/CLI 的只读扫描，切换后模型目录会自动重载。": "Accounts come from a read-only local desktop/CLI scan; the model catalog reloads after switching.",
+      "当前账号来自 PAT / 浏览器授权，不在本机桌面端登录列表中。": "The current account comes from a PAT or browser authorization and is not in the local desktop list.",
+      "凭据 / 令牌 / 目录 / 路由 / 存储 / 偏好 / 额度": "Credentials / token / catalog / routing / storage / preferences / quota",
+      "」？\n只删除本机保存的凭据，不影响 Qoder 账号或当前登录。": "\"?\nOnly removes locally stored credentials; Qoder account and sign-in are unaffected.",
+      "插件接口只拿到汇总额度；逐包到期请点上方链接到网页账号页查看。": "The plugin API only returns aggregate quota; see the web account page for per-pack expiry.",
+      "模型参数和显示设置都还没有保存，切换页签会丢失这些修改。继续？": "Both model parameters and display settings are unsaved; switching tabs discards them. Continue?",
+      "本机已没有这个账号的登录态，先在 Qoder 客户端重新登录": "This account is no longer signed in locally; sign in again in the Qoder client",
+      "加密保存在本机；切换会重新换取短期令牌，面板不返回 PAT。": "Encrypted locally; switching exchanges a short-lived token; the panel never returns the PAT.",
+      "用当前模型发一次真实请求；默认最低思考档位，结果会计入用量。": "Send one real request with the current model; defaults to the lowest effort and counts toward usage.",
+      "自动 = 插件默认优先，否则跟随官方推荐；对话中仍可临时切换": "Auto = plugin default first, otherwise official recommendation; still switchable per chat",
+      "qoder-to-dsh · 非官方接入，仅使用本机自有账号": "qoder-to-dsh · unofficial integration, local accounts only",
+      "可随时取消；会同时中止上游等待（已产生的用量仍可能计费）。": "Cancel anytime; stops upstream waiting (usage already generated may still be billed).",
+      "在浏览器里登录 Qoder，完成后模型会自动出现在选择器里": "Sign in to Qoder in the browser; models appear in the selector automatically",
+      "登录成功，但 PAT 未保存到凭据库；诊断页可查看原因。": "Signed in, but the PAT was not saved; see Diagnostics for details.",
+      "还没有保存的 PAT；在下方粘贴 pt- 令牌即可保存。": "No saved PAT yet; paste a pt- token below to save one.",
+      "上游没有返回这个包的到期时间，逐包到期只在网页账号页可见": "Upstream did not return this pack's expiry; per-pack expiry is only on the web account page",
+      "整个流程只在 dsh 插件进程内完成，不启动第二个服务。": "The whole flow runs inside the dsh plugin process; no second service.",
+      "只统计本机请求元数据，不包含 prompt / 回复内容": "Only local request metadata; no prompt or reply content",
+      "窗口内 tokens 占比；用于判断额度花在哪个账号。": "Token share in this window; shows which account spends quota.",
+      "已经是当前模型最低档；想更快可换非思考模型或缩短输出。": "This is already the lowest effort; use a non-reasoning model or shorten output for speed.",
+      "原生 adapter，无需 settings.yaml": "Native adapter; no settings.yaml needed",
+      "这个区间没有实际计费 Credits（免费模型不计入）": "No billed Credits in this range (free models excluded)",
+      "本机检测到的 Qoder 账号；切换会完成插件登录。": "Local Qoder accounts; switching completes plugin sign-in.",
+      "模型可直接对话；面板同时显示额度、用量、试跑和诊断。": "Models are ready to chat; the panel also shows quota, usage, test runs, and diagnostics.",
+      "试跑会真实调用 Qoder 模型，并记录到用量统计。": "A test run calls Qoder for real and is recorded in usage.",
+      "窗口内 tokens 占比；用于判断额度花在哪里。": "Token share in this window; shows where quota is spent.",
+      "模型参数还没有保存，切换页签会丢失这些修改。继续？": "Model parameters are unsaved; switching tabs discards them. Continue?",
+      "上游返回的额度 userId 与当前登录账号不一致": "Upstream quota userId does not match the signed-in account",
+      "显示设置还没有保存，切换页签会丢失这些修改。继续？": "Display settings are unsaved; switching tabs discards them. Continue?",
+      "想更快可降低本次思考档位、换非思考模型或缩短输出。": "For speed, lower the effort, use a non-reasoning model, or shorten output.",
+      "在打开的页面里选择账号并确认，本页会自动完成登录。": "Choose an account in the opened page; this panel signs in automatically.",
+      "自动签到已被 QODER_CHECKIN=0 禁用": "Auto check-in is disabled by QODER_CHECKIN=0",
+      "Qoder 的模型清单与账号绑定，登录后自动出现。": "Qoder's model catalog is tied to your account and appears after sign-in.",
+      "模型参数还没有保存，去试跑会丢失这些修改。继续？": "Model parameters are unsaved; test run discards them. Continue?",
+      "已在新窗口打开授权页；若被拦截，点击上面的链接。": "The authorization page opened in a new window; if blocked, use the link above.",
+      "先到期先扣 · 每日 10:00 后领取，领取后": "First-expire-first-used · claim after 10:00 daily; valid for ",
+      "额度接口返回 404/405，宿主可能是旧构建": "Quota API returned 404/405; the host may be an old build",
+      "完成一次对话后，这里会显示 token 趋势。": "After one conversation, the token trend appears here.",
+      "这次授权会话已失效，重新发起即可获取新的链接。": "This authorization expired; start again for a new link.",
+      "本机已没有这个账号的登录态，先重新登录再切换": "This account is no longer signed in locally; sign in again before switching",
+      "留空使用已保存 / 官方默认；本次选择不保存": "Leave empty to use saved / official defaults; this choice is not saved",
+      "）；面板只显示账号、计数和延迟，不返回令牌。": "); the panel only shows account, counts, and latency, never tokens.",
+      "当前模型有未保存的参数，切换会丢失。继续？": "This model has unsaved parameters; switching discards them. Continue?",
+      "还没有请求记录。完成一次对话或试跑后出现。": "No requests yet. Appears after a conversation or test run.",
+      "活动每天 10:00（UTC+8）后开放。": "The campaign opens daily after 10:00 (UTC+8).",
+      "浏览器拦截了新窗口，请点上方链接继续授权。": "The browser blocked the pop-up; use the link above to continue.",
+      "面板、模型选择器和请求共用这一份进程状态。": "The panel, model selector, and requests share this process state.",
+      "上游没有返回 usage，按文本字符数估算": "Upstream did not return usage; estimated from text characters",
+      "；完全退出 dsh 再打开才会加载新代码。": "; fully quit and reopen dsh to load new code.",
+      "Qoder 已连接 · 正在读取额度（今日": "Qoder connected · loading quota (today ",
+      "还有账号未领取，正在等待下一次自动重试。": "Some accounts are still unclaimed; waiting for the next retry.",
+      "近一年还没有 Credits 消耗记录。": "No Credits usage in the last 12 months.",
+      "每天 10:00 后自动领取本机所有账号": "Automatically claim for all local accounts after 10:00 daily",
+      "上游额度还没读到。刷新账号信息即可获取。": "Upstream quota has not loaded. Refresh account info to fetch it.",
+      "的上下文、温度和最大输出恢复为官方默认？": " context, temperature, and max output to official defaults?",
+      "HTTP 429: 上游限流，请稍后重试": "HTTP 429: upstream rate limited, try again later",
+      "不需要桌面端，也不会读取本机已有登录。": "No desktop client needed; existing local sign-in is not read.",
+      "打开 Qoder 客户端登录后重新扫描": "Sign in to the Qoder client, then rescan",
+      "登录后显示套餐额度、加量包和到期时间。": "After signing in, shows plan quota, add-on packs, and expiry.",
+      "默认模型会始终保留在 dsh 选择器中": "The default model always stays in the dsh selector",
+      "统计接口暂时不可用；可重试或稍后再看。": "Stats are temporarily unavailable; retry or check later.",
+      "显示设置已保存，模型选择器会立即更新。": "Display settings saved; the model selector updates immediately.",
+      "写一个 JS 防抖函数，并说明边界情况": "Write a JS debounce function and explain edge cases",
+      "上游限流：HTTP 429，请稍后重试": "Upstream rate limited: HTTP 429, try again later",
+      "当前账号被隐藏；恢复后仍保持当前账号": "The current account is hidden; restoring keeps it current",
+      "这个区间没有实际计费 Credits": "No billed Credits in this range",
+      "活动接口没返回有效期，按每日赠送默认": "The campaign API did not return validity; assuming ",
+      "每天 10:00（UTC+8）后开放": "Opens daily after 10:00 (UTC+8)",
+      "把 Qoder 的模型接进 dsh": "Bring Qoder models into dsh",
+      "部分历史来自每日汇总（明细已裁剪）": "Some history comes from daily rollups (details pruned)",
+      "当前账号正在使用；先切换或退出登录": "This account is in use; switch or sign out first",
+      "登录成功，PAT 已保存到凭据库。": "Signed in; PAT saved to the credential store.",
+      "等待浏览器授权，点击重新打开授权页": "Waiting for browser authorization; reopen the page",
+      "原生 provider=qoder": "Native provider=qoder",
+      "当前窗口没有需要手动处理的请求。": "No requests need manual action in this window.",
+      "可以重试，或检查网络与登录状态。": "Retry, or check your network and sign-in status.",
+      "没有检测到本机 Qoder 登录": "No local Qoder sign-in detected",
+      "没有检测到本机 Qoder 账号": "No local Qoder account detected",
+      "模型参数已保存，下一次请求生效。": "Model parameters saved; effective on the next request.",
+      "授权链接通常 10 分钟内有效。": "The authorization link is usually valid for 10 minutes.",
+      "，可填更高（输入与输出共享上下文": ", can be higher (input and output share the context",
+      "· 已脱敏，不包含对话正文或令牌": " · redacted; no conversation body or tokens",
+      "按天统计 tokens · 今日": "Daily tokens · today ",
+      "近一年 Credits 热力图，": "Credits heatmap over 12 months, ",
+      "关于 Credits 统计口径": "About Credits accounting",
+      "活动尚未下发，稍后会自动重试。": "Campaign not released yet; will retry automatically.",
+      "温度需要是 0–2 之间的数字": "Temperature must be a number between 0 and 2",
+      "只显示最近 200 行运行日志": "Shows only the latest 200 log lines",
+      "只展示失败请求，不记录对话内容": "Failed requests only; no conversation content",
+      "Credits 热力图读取失败": "Failed to load Credits heatmap",
+      "，避免等待过久；本次选择不保存": ", to avoid a long wait; this choice is not saved",
+      "；dsh 显式传参时以请求为准": "; explicit dsh parameters take precedence",
+      "· 只记录元数据，不含对话内容": " · metadata only, no conversation content",
+      "Credits，部分账号失败：": " Credits; some accounts failed: ",
+      " · 设备身份来自客户端缓存": " · device identity from client cache",
+      "插件默认（已按模型上限收敛）": "Plugin default (clamped to model cap)",
+      "换个关键词，或切回「全部」。": "Try another keyword or switch back to All.",
+      "请先粘贴 PAT 或访问令牌": "Paste a PAT or access token first",
+      "网络波动，正在重试授权状态…": "Network hiccup; retrying authorization status…",
+      "已脱敏，不包含令牌或对话内容": "Redacted; no tokens or conversation content",
+      "用三句话解释什么是上下文窗口": "Explain a context window in three sentences",
+      "Credits 趋势读取失败": "Failed to load Credits trend",
+      "目录刷新失败，继续使用缓存：": "Catalog refresh failed; using cache: ",
+      " · 设备身份来自本机组件": " · device identity from local component",
+      "不限期（上游标注永久额度）": "No expiry (upstream marks permanent)",
+      "部分额度上游未返回到期时间": "Some quota packs have no upstream expiry",
+      "当前没有可领取的签到活动。": "No check-in campaign to claim right now.",
+      "登录成功，模型目录已刷新。": "Signed in; model catalog refreshed.",
+      "目录为空，先刷新目录或登录": "The catalog is empty; refresh it or sign in",
+      "上游额度读取失败或尚未刷新": "Upstream quota failed or has not refreshed",
+      "使用本机 Qoder 登录": "Use the local Qoder sign-in",
+      "搜索模型 id、名称或厂商": "Search model id, name, or vendor",
+      "完成一次对话或试跑后出现。": "Appears after one conversation or test run.",
+      "无法读取 Qoder 状态": "Cannot read Qoder status",
+      "Credits 消耗热力图": "Credits usage heatmap",
+      "次（设置 → Qoder）": " requests (Settings → Qoder)",
+      "近一年每日实际扣费分布 ·": "Daily billed credits over 12 months · ",
+      "天推算；以网页账号页为准。": " days (inferred); refer to the web account page.",
+      "Credits 消耗趋势，": "Credits usage trend, ",
+      "按天统计 · 正在读取…": "Daily stats · loading…",
+      "当前筛选没有可导出的请求": "No requests match the current filter",
+      "复制失败，请手动选择文本": "Copy failed; select the text manually",
+      "每日赠送 · 按到期分批": "Daily grant · batches by expiry",
+      "添加 PAT 或访问令牌": "Add a PAT or access token",
+      "用当前模型发一次真实请求": "Send a real request with the current model",
+      "只删除本机保存的 PAT": "Only removes locally stored PATs",
+      "区间读取失败，当前仍显示": "Failed to load this range; still showing ",
+      "在 dsh 选择器中显示": "Show in the dsh selector",
+      "Credits · 已省": "Credits · saved",
+      "最大输出 tokens": "Maximum output tokens",
+      " · 只计上游实际扣费": " · upstream billed only",
+      "本机 dsh 数据目录": "Local dsh data directory",
+      "窗口内还没有账号用量。": "No account usage in this window.",
+      "当前窗口没有请求记录。": "No requests in this window.",
+      "当前窗口没有失败请求。": "No failed requests in this window.",
+      "放弃未保存的模型参数？": "Discard unsaved model parameters?",
+      "近一年每日实际扣费分布": "Daily billed credits over the last 12 months",
+      "签到失败，请刷新后重试": "Check-in failed; refresh and try again",
+      "写点什么试试这条链路…": "Write something to test this path…",
+      "；用左右方向键逐日查看": "; use left/right arrow keys to move by day",
+      "个模型匹配 · 已显示": " models match · showing ",
+      "凭据已加密保存在本机（": "Credentials are encrypted locally (",
+      "尚未自动运行 · 下次": "Auto check-in has not run · next ",
+      "已切换 PAT 账号；": "Switched PAT account; ",
+      "Qoder 客户端已从": "Qoder client updated from ",
+      "连接 Qoder 失败": "Failed to connect to Qoder",
+      "本地用量记录已清空。": "Local usage records cleared.",
+      "不需要启动第二个服务": "No second service required",
+      "目录里还没有可用模型": "No models available in the catalog",
+      "目录为空，试试刷新。": "The catalog is empty; try refreshing.",
+      "请求 CSV 已导出": "Request CSV exported",
+      "尚未连接 Qoder": "Qoder is not connected yet",
+      "先写一句要发送的内容": "Write something to send first",
+      "已切换 PAT 账号": "Switched PAT account",
+      "已退出 Qoder。": "Signed out of Qoder.",
+      "用量 CSV 已导出": "Usage CSV exported",
+      "用一句话介绍你自己。": "Introduce yourself in one sentence.",
+      "这是最近要到期的一包": "This pack expires soonest",
+      "重新连接 Qoder": "Reconnect Qoder",
+      "逐包到期见网页账号页": "Per-pack expiry is on the web account page",
+      "最大输出需要是正整数": "Max output must be a positive integer",
+      "最近一笔额度即将到期": "A quota pack is expiring soon",
+      "Credits 维度": "Credits dimension",
+      "Credits 消耗": "Credits usage",
+      "签到完成，今日共 +": "Check-in complete, today +",
+      "已恢复官方默认参数。": "Official defaults restored.",
+      "正在读取签到状态…": "Reading check-in status…",
+      "10:00 后开放": "Opens after 10:00",
+      "窗口内还没有请求。": "No requests in this window.",
+      "登录后加载模型目录": "Sign in to load the model catalog",
+      "等待浏览器完成授权": "Waiting for browser authorization",
+      "关闭客户端升级提示": "Dismiss client update notice",
+      "还没有可导出的用量": "No usage to export",
+      "上游标注为永久额度": "Upstream marks this as permanent",
+      "上游未返回到期时间": "Upstream did not return an expiry",
+      "已恢复全部隐藏账号": "All hidden accounts restored",
+      "已与已保存设置一致": "Matches saved settings",
+      "正在读取请求明细…": "Loading request details…",
+      "正在读取账号额度…": "Loading account quota…",
+      "PAT 或访问令牌": "PAT or access token",
+      "Qoder 客户端": "Qoder client",
+      "· 免费/折扣已省": " · free/discount saved",
+      "保存账号偏好失败：": "Failed to save account preferences: ",
+      "个账号未到开放时间": " accounts before opening time",
+      "Credits，共": " Credits, total ",
+      "tokens 占比": " token share",
+      "Qoder 国际版": "Qoder International",
+      "Qoder 国内版": "Qoder China",
+      "Qoder 桌面端": "Qoder Desktop",
+      "个模型有自定义参数": " models with custom parameters",
+      " · 显示前 8": " · showing top 8",
+      "本地未记录的领取": "Local record missing",
+      "登录后会发生什么": "What happens after signing in",
+      "访问令牌已刷新。": "Access token refreshed.",
+      "个账号今日已处理": " accounts handled today",
+      "连接 Qoder": "Connect Qoder",
+      "令牌不会离开本机": "Tokens never leave this machine",
+      "没有命中前缀缓存": "No prefix cache hit",
+      "模型目录读取失败": "Failed to load model catalog",
+      "模型目录已刷新。": "Model catalog refreshed.",
+      "签到流程已结束。": "Check-in finished.",
+      "签到状态读取失败": "Failed to read check-in status",
+      "授权超时，请重试": "Authorization timed out; try again",
+      "授权失败，请重试": "Authorization failed; try again",
+      "显示设置尚未保存": "Display settings are not saved",
+      "已取消本次试跑。": "Test run cancelled.",
+      "用量记录读取失败": "Failed to read usage records",
+      "账号额度使用进度": "Account quota usage",
+      "自动签到已关闭。": "Auto check-in is off.",
+      "自动签到已开启。": "Auto check-in is on.",
+      "Qoder 面板": "Qoder panel",
+      "Token 趋势": "Token trend",
+      "· 只记录元数据": " · metadata only",
+      "个账号活动待下发": " accounts awaiting campaign release",
+      "运行时：Node": "Runtime: Node",
+      "ctx · 可调": " ctx · adjustable",
+      "PAT 凭据库：": "PAT store: ",
+      "tokens）与": " tokens) and ",
+      "Qoder 账号": "Qoder account",
+      "最近 30 天": "Last 30 days",
+      "没有匹配的模型": "No matching models",
+      "本机已登录账号": "Local signed-in accounts",
+      "登录后才能试跑": "Sign in to run a test",
+      "等待浏览器授权": "Waiting for browser authorization",
+      "访问令牌待换取": "Access token pending exchange",
+      "还没有试跑记录": "No test runs yet",
+      "还没有用量数据": "No usage data yet",
+      "今日签到完成度": "Today's check-in progress",
+      "今天有额度到期": "Quota expires today",
+      "没有失败请求。": "No failed requests.",
+      "设备身份不可用": "Device identity unavailable",
+      "数据可能已过期": "Data may be stale",
+      "未指定（不传）": "Not specified (omitted)",
+      "先选择一个模型": "Select a model first",
+      "需重启 dsh": "Restart dsh",
+      "已清除账号别名": "Account alias cleared",
+      "有未保存的修改": "Unsaved changes",
+      "账号别名已保存": "Account alias saved",
+      "账号顺序已保存": "Account order saved",
+      "诊断包生成失败": "Failed to build diagnostics bundle",
+      "诊断包已下载。": "Diagnostics bundle downloaded.",
+      "重新打开授权页": "Reopen authorization page",
+      "自动签到已关闭": "Auto check-in off",
+      "自动签到已开启": "Auto check-in on",
+      "最大输出快捷值": "Max output presets",
+      "PAT 已删除": "PAT deleted",
+      "个 · 自定义": " · customized ",
+      "个账号暂无活动": " accounts have no campaign",
+      "实扣 · 已省": "Billed · saved",
+      "最近一次运行：": "Last run: ",
+      "模型显示与参数": "Model display and parameters",
+      "最近 7 天": "Last 7 days",
+      "账号签到状态": "Account check-in status",
+      " 秒未响应）": "s without a response)",
+      "本次思考档位": "Effort for this run",
+      "额度使用进度": "Quota usage",
+      "发起授权失败": "Failed to start authorization",
+      "关闭版本提示": "Dismiss version notice",
+      "可选上下文：": "Context options: ",
+      "默认思考档位": "Default reasoning effort",
+      "请求时间范围": "Request time range",
+      "筛选关键字…": "Filter keyword…",
+      "尚未自动运行": "Auto check-in has not run",
+      "设为默认模型": "Set as default model",
+      "使用 PAT": "Use PAT",
+      "刷新令牌失败": "Failed to refresh token",
+      "已恢复该账号": "Account restored",
+      "已隐藏该账号": "Account hidden",
+      "有额度已过期": "Some quota expired",
+      "诊断暂时失败": "Diagnostics temporarily failed",
+      "PAT 凭据": "PAT credentials",
+      "；本机检测到": "; detected ",
+      "· 本次请求": " · this request",
+      "· 缓存命中": " · cache hit",
+      "按天统计 ·": "Daily stats ·",
+      "插件当前使用": "the plugin's active ",
+      "的详情与参数": " details and parameters",
+      "个 / 可见": " / visible ",
+      "思考过程 ·": "Reasoning ·",
+      "今天还没领取": "Not claimed today",
+      "今天还没签到": "Not checked in today",
+      "原生模型路由": "Native model routing",
+      "本地状态目录": "Local state directory",
+      "设备身份来源": "Device identity source",
+      "数据目录搬迁": "Data directory relocation",
+      "目录缓存账号": "Catalog cache account",
+      "签到设备身份": "Check-in device identity",
+      "全部模型可见": "All models visible",
+      "有自定义参数": " with custom parameters",
+      "立即领取全部": "Claim all now",
+      "打开授权页": "Open page",
+      "等待授权…": "Waiting for authorization…",
+      " · 最近": " · next",
+      "（空回复）": "(empty reply)",
+      "本期无活动": "No campaign this period",
+      "换号/充值": "Switch / top up",
+      "活动未下发": "Campaign not released",
+      "今日已处理": "Handled today",
+      "今日已领取": "Claimed today",
+      "今日已签到": "Checked in today",
+      "可调上下文": "Adjustable context",
+      "浏览器授权": "Browser authorization",
+      "流空闲上限": "Stream idle limit",
+      "路由与目录": "Routing and catalog",
+      "缺设备身份": "Device identity missing",
+      "上下文窗口": "Context window",
+      "上游未返回": "Not returned upstream",
+      "授权已过期": "Authorization expired",
+      "未命名账号": "Unnamed account",
+      "温度快捷值": "Temperature presets",
+      "需重新登录": "Sign in again",
+      "选择器可见": "Visible in selector",
+      "压缩上下文": "Compact context",
+      "账号不一致": "Account mismatch",
+      "正在读取…": "Loading…",
+      "正在检查…": "Checking…",
+      "自定义参数": "Custom parameters",
+      "，磁盘 v": ", disk v",
+      "· 更新于": " · Updated",
+      "（显示最近": " (showing latest ",
+      "次请求 ·": " requests ·",
+      "的默认模型": " as the default model",
+      "等待上游…": "Waiting for upstream…",
+      "跟随已保存": "Follow saved",
+      "默认最低档": "Lowest effort by default",
+      "上下文 ·": " context ·",
+      "套餐周期至": "Plan period until ",
+      "限时免费至": "Free until ",
+      "已加载 v": "Loaded v",
+      "个模型匹配": " models match",
+      "客户端安装": "Client installation",
+      "」立即更换": "\" to change ",
+      "等待浏览器": "Waiting for browser",
+      "已复制 ✓": "Copied ✓",
+      "个模型可见": " models visible",
+      "刷新中…": "Refreshing…",
+      "刷新状态": "Refresh status",
+      "可用模型": "Available models",
+      "重新登录": "Sign in again",
+      "已切换到": "Switched to ",
+      "切换中…": "Switching…",
+      "登录区域": "Sign-in region",
+      "检查中…": "Checking…",
+      "退出登录": "Sign out",
+      "平均耗时": "Avg latency",
+      "30 天": "30 days",
+      "完整响应": "Full response",
+      "用量趋势": "Usage trend",
+      "最近失败": "Recent failures",
+      "每日签到": "Daily check-in",
+      "自动签到": "Auto check-in",
+      "领取中…": "Claiming…",
+      "立即领取": "Claim now",
+      "本机账号": "Local account",
+      "刷新账号": "Refresh accounts",
+      "刷新目录": "Refresh catalog",
+      "保存中…": "Saving…",
+      "恢复全部": "Restore all",
+      "恢复默认": "Restore defaults",
+      "搜索模型": "Search models",
+      "生成中…": "Generating…",
+      "14 天": "14 days",
+      " 不限量": " Unlimited",
+      " 个模型": " models",
+      "（今天）": "(today)",
+      "（推算）": "(inferred)",
+      "按客户端": "By client",
+      "保存参数": "Save parameters",
+      "保存设置": "Save settings",
+      "保存失败": "Save failed",
+      "本地统计": "Local stats",
+      "本机登录": "Local sign-in",
+      "本机密钥": "Local key",
+      "插件默认": "Plugin default",
+      "查看全部": "View all",
+      "错误信息": "Error details",
+      "打开诊断": "Open diagnostics",
+      "当前账号": "Current account",
+      "导入失败": "Import failed",
+      "到期未知": "Expiry unknown",
+      "等待重置": "Wait for reset",
+      "读取中…": "Loading…",
+      "额度 —": "Quota —",
+      "发送内容": "Message",
+      "复制全部": "Copy all",
+      "更新中…": "Updating…",
+      "关闭错误": "Dismiss error",
+      "关闭提示": "Dismiss notice",
+      "官方目录": "Official catalog",
+      "继续刷新": "Resume refresh",
+      "加载目录": "Load catalog",
+      "今日请求": "Requests today",
+      "今日已领": "Claimed today",
+      "仅需处理": "Action needed only",
+      "开始使用": "Get started",
+      "立即签到": "Check in now",
+      "连接失败": "Connection failed",
+      "连接中…": "Connecting…",
+      "链路检查": "Connectivity checks",
+      "每次请求": "Per request",
+      "免费调用": "Free calls",
+      "模型参数": "Model parameters",
+      "模型上限": "Model cap",
+      "模型设置": "Model settings",
+      "默认温度": "Default temperature",
+      "目录缓存": "Catalog cache",
+      "目录刷新": "Catalog refresh",
+      "排队已满": "Queue full",
+      "平均首字": "Avg first byte",
+      "凭据文件": "Credential file",
+      "签到失败": "Check-in failed",
+      "签到中…": "Checking in…",
+      "切换失败": "Switch failed",
+      "切换账号": "Switch account",
+      "请求明细": "Request details",
+      "请求无效": "Invalid request",
+      "去账号页": "Go to account",
+      "全部成功": "All succeeded",
+      "全部模型": "All models",
+      "认证失败": "Authentication failed",
+      "筛选日志": "Filter logs",
+      "删除失败": "Delete failed",
+      "删除中…": "Deleting…",
+      "上游错误": "Upstream error",
+      "界面语言": "Interface language",
+      "上游实扣": "Upstream billed",
+      "上游首包": "Upstream first byte",
+      "设备身份": "Device identity",
+      "升级套餐": "Upgrade plan",
+      "实际生效": "Effective now",
+      "首包上限": "First-byte limit",
+      "数据目录": "Data directory",
+      "刷新令牌": "Refresh token",
+      "套餐额度": "Plan quota",
+      "图片输入": "Image input",
+      "未知来源": "Unknown source",
+      "协议来源": "Protocol source",
+      "已自定义": "Customized",
+      "用量明细": "Usage details",
+      "月初至今": "Month to date",
+      "运行环境": "Runtime",
+      "暂停刷新": "Pause refresh",
+      "暂无可领": "Nothing to claim",
+      "暂无日志": "No logs yet",
+      "诊断报告": "Diagnostics report",
+      "重试活动": "Retry campaign",
+      "重新发起": "Start again",
+      "重新检查": "Re-check",
+      "重新扫描": "Rescan",
+      "自动关闭": "Auto off",
+      "自动开启": "Auto on",
+      "· 单位": " · Unit",
+      "· 档位": " · Effort",
+      "· 温度": " · Temperature",
+      "· 下次": " · Next",
+      "不能超过": "Cannot exceed ",
+      "的数据：": " data: ",
+      "个账号。": " accounts.",
+      "官方上限": "Official cap ",
+      "加密）。": " encrypted).",
+      "令牌到期": "Token expires ",
+      "上次使用": "Last used",
+      "上次自动": "Last auto run",
+      "输出上。": " generating output.",
+      "天后到期": " days until expiry",
+      "天推算。": " days (inferred).",
+      "天有消耗": " days with usage",
+      "天有效。": " days.",
+      "显示最近": "Showing latest ",
+      "最近到期": "Next expiry ",
+      "登录凭据": "Sign-in credentials",
+      "访问令牌": "Access token",
+      "模型目录": "Model catalog",
+      "宿主能力": "Host capabilities",
+      "面板路由": "Panel routes",
+      "协议版本": "Protocol version",
+      "推理端点": "Inference endpoint",
+      "最近错误": "Recent errors",
+      "用量记录": "Usage records",
+      "生效配置": "Effective config",
+      "账号管理": "Manage accounts",
+      "签到成功": "Check-in succeeded",
+      "账号额度": "Account quota",
+      "运行日志": "Run logs",
+      "已过期": "Expired",
+      "请选择": "Select…",
+      "去签到": "Check in",
+      "去登录": "Sign in",
+      "未登录": "Not signed in",
+      "账号：": "Account: ",
+      "个模型": " models",
+      "未注册": "Not registered",
+      "不限量": "Unlimited",
+      "已隐藏": "Hidden",
+      "不可用": "Unavailable",
+      "桌面端": "Desktop",
+      "国内版": "China",
+      "国际版": "International",
+      "已复制": "Copied",
+      "流中断": "Stream interrupted",
+      "成功率": "Success rate",
+      "7 天": "7 days",
+      "窗口内": "In window",
+      "次失败": "failed",
+      "无活动": "No campaign",
+      "全不选": "Select none",
+      "自定义": "Custom",
+      "30天": "30 days",
+      "按模型": "By model",
+      "按账号": "By account",
+      "不限期": "No expiry",
+      "待领取": "Pending",
+      "非官方": "Unofficial",
+      "换模型": "Switch model",
+      "加量包": "Add-on pack",
+      "仅失败": "Failures only",
+      "旧版本": "Old version",
+      "可思考": "Reasoning",
+      "可重试": "Retryable",
+      "空响应": "Empty response",
+      "去试跑": "Test run",
+      "上个月": "Last month",
+      "输出 ": "Output ",
+      "未开放": "Not open",
+      "未指定": "Not set",
+      "无账号": "No accounts",
+      "新版本": "New version",
+      "需处理": "Action needed",
+      "需登录": "Sign-in required",
+      "需设备": "Device required",
+      "已登录": "Signed in",
+      "已连接": "Connected",
+      "已取消": "Cancelled",
+      "已显示": "Shown",
+      "已用尽": "Exhausted",
+      "诊断包": "Diagnostics bundle",
+      "资源包": "Resource pack",
+      "；其余": "; the rest",
+      "（匹配": " (matches ",
+      "次 /": " times /",
+      "次请求": " requests",
+      "待下发": "Pending release",
+      "个账号": " accounts",
+      "近一年": "Last 12 months",
+      "领取后": "Valid for ",
+      "领取于": "Claimed at ",
+      "入 /": " in / ",
+      "升级到": "updated to ",
+      "天后）": " days)",
+      "天有效": " days valid",
+      "添加于": "Added at ",
+      "用上限": "Use cap ",
+      "凭据库": "Credential store",
+      "不适用": "Not applicable",
+      "后开放": "opens after",
+      "后领取": "claim after",
+      "刷新": "Refresh",
+      "重试": "Retry",
+      "复制": "Copy",
+      "收起": "Collapse",
+      "展开": "Expand",
+      "状态": "Status",
+      "模型": "Model",
+      "取消": "Cancel",
+      "默认": "Default",
+      "未知": "Unknown",
+      "到期": "Expires",
+      "改名": "Rename",
+      "上移": "Move up",
+      "下移": "Move down",
+      "隐藏": "Hide",
+      "恢复": "Restore",
+      "切换": "Switch",
+      "剩余": "Remaining",
+      "账号": "Account",
+      "自动": "Auto",
+      "限流": "Rate limited",
+      "额度": "Quota",
+      "失败": "Failed",
+      "时间": "Time",
+      "合计": "Total",
+      "峰值": "Peak",
+      "耗时": "Elapsed",
+      "成功": "Success",
+      "今日": "Today",
+      "当前": "Current",
+      "全选": "Select all",
+      "输入": "Input",
+      "输出": "Output",
+      "免费": "Free",
+      "促销": "Promotion",
+      "概览": "Overview",
+      "用量": "Usage",
+      "请求": "Requests",
+      "签到": "Check-in",
+      "诊断": "Diagnostics",
+      "日志": "Logs",
+      "1天": "1 day",
+      "7天": "7 days",
+      "版本": "Version",
+      "别名": "Alias",
+      "不限": "Unlimited",
+      "超时": "Timeout",
+      "撤销": "Undo",
+      "登录": "Sign in",
+      "对话": "Conversation",
+      "估算": "Estimated",
+      "管理": "Manage",
+      "缓存": "Cache",
+      "回复": "Reply",
+      "今天": "Today",
+      "进程": "Process",
+      "就绪": "Ready",
+      "领取": "Claim",
+      "内容": "Content",
+      "清空": "Clear",
+      "全部": "All",
+      "筛选": "Filter",
+      "删除": "Delete",
+      "视觉": "Vision",
+      "试跑": "Test run",
+      "首字": "First byte",
+      "思考": "Reasoning",
+      "速度": "Speed",
+      "下载": "Download",
+      "已领": "Claimed",
+      "已用": "Used",
+      "异常": "Errors",
+      "运行": "Run",
+      "总量": "Total",
+      "中文": "中文",
+      "（共": " (",
+      "次）": " times)",
+      "分钟": "min",
+      "个）": ")",
+      "过期": "expired",
+      "花在": "spent on ",
+      "加密": "encrypted",
+      "天后": " days later",
+      "条）": ")",
+      "已省": "saved",
+      "最近": "Recent",
+      "匹配": "match",
+      "凭据": "Credentials",
+      "令牌": "Token",
+      "目录": "Catalog",
+      "路由": "Routing",
+      "存储": "Storage",
+      "偏好": "Preferences",
+      "自检": "Self-check",
+      "通过": "Passed",
+      "警告": "Warning",
+      "点「": "Click \"",
+      "小时": "hours",
+      "可见": "visible",
+      "次": "times",
+      "多": "More",
+      "少": "Less",
+      "无": "None",
+      "把": "Move ",
+      "出": "out",
+      "秒": "s",
+      "年": "year",
+      "日": "day",
+      "天": "days",
+      "条": "items",
+      "行": "lines",
+      "月": "month",
+      "字": "chars",
+      "入": "in",
+      "的": " ",
+    });
+    // i18n:en:end
+
+    const EN_RULES = [
+      [/(\d{4})年(\d{1,2})月(\d{1,2})日/g, '$1-$2-$3'],
+      [/(\d{1,2})月(\d{1,2})日/g, '$1/$2'],
+      [/(\d{4})年(\d{1,2})月/g, '$2/$1'],
+      [/已用 (\d+)%/g, '$1% used'],
+      [/^(\d+)% Used$/g, '$1% used'],
+      [/^1 failures$/g, '1 failure'],
+      [/^1 times$/g, '1 time'],
+      [/^1 items$/g, '1 item'],
+      [/^1 models$/g, '1 model'],
+      [/^1 accounts$/g, '1 account'],
+      [/(\d+) 天后到期/g, 'Expires in $1 days'],
+      [/共 (\d+) 条/g, '$1 items'],
+      [/(\d+) 个模型匹配 · 已显示 (\d+) 个/g, '$1 models match · showing $2'],
+      [/PAT 凭据库：(\d+) 个/g, 'PAT store: $1'],
+      [/^(.+) 点「切换」立即更换插件当前使用的账号。$/g, '$1 Click Switch to change the plugin\u2019s active account.'],
+      [/共 (\d+) 个/g, '$1'],
+      [/共 (\d+) 次/g, '$1 requests'],
+      [/(\d+) 天有效/g, 'valid for $1 days'],
+      [/(\d+) 次请求/g, '$1 requests'],
+      [/(\d+) 次失败/g, '$1 failures'],
+      [/(\d+) 个模型/g, '$1 models'],
+      [/(\d+) 个账号/g, '$1 accounts'],
+      [/(\d+) 次/g, '$1 times'],
+      [/(\d+) 条/g, '$1 items'],
+      [/(\d+) 个/g, '$1'],
+      [/ 出/g, ' out'],
+      [/ 入/g, ' in'],
+      [/(\d+) 张/g, '$1 images'],
+      [/(\d+) 分钟/g, '$1 min'],
+      [/(\d+) 小时/g, '$1h'],
+      [/(\d+) 秒/g, '$1s'],
+      [/(\d+) 字/g, '$1 chars'],
+      [/(\d+) 行/g, '$1 lines'],
+      [/(\d+) 天后/g, 'in $1 days'],
+      [/(\d+) 天/g, '$1 days'],
+    ];
+    const EN_POST_RULES = [
+      [/^(\d+)% Used$/g, '$1% used'],
+      [/\b1 failures\b/g, '1 failure'],
+      [/\b1 times\b/g, '1 time'],
+      [/\b1 items\b/g, '1 item'],
+      [/\b1 models\b/g, '1 model'],
+      [/\b1 accounts\b/g, '1 account'],
+    ];
+    const EN_PHRASES = Object.entries(EN)
+      .filter(([zh]) => zh.length >= 2)
+      .sort((a, b) => b[0].length - a[0].length);
+
+    function translateText(value) {
+      const text = String(value ?? '');
+      if (UI_LOCALE !== 'en' || !text) return text;
+      if (EN[text] !== undefined) return EN[text];
+      let out = text;
+      for (const [pattern, replacement] of EN_RULES) out = out.replace(pattern, replacement);
+      for (const [zh, en] of EN_PHRASES) {
+        if (out.includes(zh)) out = out.split(zh).join(en);
+      }
+      for (const [pattern, replacement] of EN_POST_RULES) out = out.replace(pattern, replacement);
+      return out;
+    }
+
+    const I18N_SKIP_CLASSES = new Set(['qdr-answer', 'qdr-log-view', 'qdr-thinking', 'qdr-logs']);
+    function i18nSkip(props) {
+      if (!props || typeof props !== 'object') return false;
+      if (props['data-i18n'] === 'off') return true;
+      if (typeof props.className !== 'string') return false;
+      return props.className.split(/\s+/).some((name) => I18N_SKIP_CLASSES.has(name));
+    }
+
+    function translateProps(props) {
+      if (!props || typeof props !== 'object') return props;
+      let next = null;
+      for (const key of ['placeholder', 'aria-label', 'title', 'ariaLabel', 'label', 'detail', 'hint', 'note', 'successText']) {
+        if (typeof props[key] !== 'string' || !/[\u4e00-\u9fa5]/.test(props[key])) continue;
+        if (!next) next = { ...props };
+        next[key] = translateText(props[key]);
+      }
+      return next || props;
+    }
+
+    const h = (type, props, ...children) => {
+      if (UI_LOCALE !== 'en' || i18nSkip(props)) return RAW_H(type, props, ...children);
+      const nextProps = translateProps(props);
+      const nextChildren = children.map((child) => (typeof child === 'string' ? translateText(child) : child));
+      return RAW_H(type, nextProps, ...nextChildren);
+    };
+
+    const confirmText = (message) => (typeof window !== 'undefined' && typeof window.confirm === 'function'
+      ? window.confirm(translateText(message))
+      : false);
+
+    const localeTag = () => (UI_LOCALE === 'en' ? 'en-US' : 'zh-CN');
+    const formatDate = (value, options = { year: 'numeric', month: 'short', day: 'numeric' }) => {
+      if (!value) return '';
+      const n = Number(value);
+      const epoch = Number.isFinite(n) && n > 0 ? (n < 1e10 ? n * 1000 : n) : null;
+      const date = new Date(epoch === null ? value : epoch);
+      if (Number.isNaN(date.getTime())) return '';
+      try { return new Intl.DateTimeFormat(localeTag(), options).format(date); }
+      catch { return String(value); }
+    };
+    const formatDayOnly = (value, options = { year: 'numeric', month: 'short', day: 'numeric' }) => {
+      if (!value) return '';
+      const date = new Date(`${String(value)}T00:00:00`);
+      if (Number.isNaN(date.getTime())) return String(value);
+      try { return new Intl.DateTimeFormat(localeTag(), options).format(date); }
+      catch { return String(value); }
+    };
+    const formatMonthLabel = (date) => {
+      if (!(date instanceof Date) || Number.isNaN(date.getTime())) return '';
+      try { return new Intl.DateTimeFormat(localeTag(), { month: 'short' }).format(date); }
+      catch { return `${date.getMonth() + 1}月`; }
+    };
+
+    UI_LOCALE = resolveLangMode(storedLangMode());
 
     const PANEL_HEADERS = { 'x-qoder-panel': '1', 'content-type': 'application/json', accept: 'application/json' };
     const READ_HEADERS = { accept: 'application/json' };
@@ -65,8 +938,8 @@
       return `\ufeff${lines.join('\r\n')}\r\n`;
     }
 
-    function downloadCsv(name, header, rows) {
-      const blob = new Blob([toCsv(header, rows)], { type: 'text/csv;charset=utf-8' });
+    function downloadText(name, text, mime = 'text/plain;charset=utf-8') {
+      const blob = new Blob([String(text ?? '')], { type: mime });
       const url = URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = url;
@@ -76,6 +949,12 @@
       link.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     }
+
+    function downloadCsv(name, header, rows) {
+      downloadText(name, toCsv(header, rows), 'text/csv;charset=utf-8');
+    }
+
+    const fileStamp = (ts = Date.now()) => new Date(ts).toISOString().slice(0, 19).replace(/[:T]/g, '');
 
     async function requestOnce(path, opts) {
       const { timeoutMs = REQUEST_TIMEOUT_MS, panel = false, ...init } = opts;
@@ -204,14 +1083,15 @@
       entries.sort((a, b) => Number(b[1]) - Number(a[1]));
       return ' · ' + entries.map(([action, count]) => `${ACTION_LABELS[action] || action} ${count}`).join(' · ');
     }
-    const needsAction = (item) => item && item.ok === false && item.errorAction && item.errorAction !== 'retry';
-    // 与服务端 resolveModel 同一条公式：有插件默认先取默认值，再受模型输出
-    // 上限收敛；否则用模型上限，最后才退回 Qoder CLI 的 32K。
     const autoOutputTokens = (pluginMaxTokens, modelMaxTokens, providerDefault) => {
       const cap = num(modelMaxTokens);
       const fallback = num(providerDefault) || 32000;
       const base = num(pluginMaxTokens) || cap || fallback;
       return cap > 0 ? Math.min(base, cap) : base;
+    };
+    const parseMaxTokens = (value) => {
+      const n = Number(String(value ?? '').trim());
+      return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
     };
     const dayLabel = (date) => (date ? String(date).slice(5) : '');
     const money = (n) => {
@@ -230,7 +1110,7 @@
     const rangeDateLabel = (date) => {
       if (!date) return '';
       const parts = String(date).split('-').map(Number);
-      return parts.length === 3 ? `${parts[0]}年${parts[1]}月${parts[2]}日` : String(date);
+      return parts.length === 3 ? formatDayOnly(date) : String(date);
     };
     const rangeLabel = (range) => {
       if (!range || !range.from) return '—';
@@ -261,7 +1141,7 @@
       const d = new Date(ts);
       if (Number.isNaN(d.getTime())) return '—';
       const now = new Date();
-      const time = d.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+      const time = d.toLocaleTimeString(localeTag(), { hour: '2-digit', minute: '2-digit' });
       return d.toDateString() === now.toDateString() ? time : `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${time}`;
     };
     const toEpochMs = (value) => {
@@ -273,9 +1153,7 @@
     };
     const dateLabel = (value) => {
       if (!value) return '';
-      const epoch = toEpochMs(value);
-      const d = new Date(epoch === null ? value : epoch);
-      return Number.isNaN(d.getTime()) ? '' : d.toLocaleDateString('zh-CN');
+      return formatDate(value);
     };
     const duration = (ms) => {
       const value = Number(ms);
@@ -337,6 +1215,7 @@
     function usageBadges(item) {
       const badges = [];
       if (item && item.probe === true) badges.push('试跑');
+      if (item && item.estimated === true) badges.push('估算');
       const account = String(item && item.account || '');
       if (account && account !== 'unknown') badges.push(`账号 …${account.split(':').pop()}`);
       return badges;
@@ -969,10 +1848,10 @@
         },
         h('div', { className: 'qdr-model-main' },
           h('div', { className: 'qdr-model-title' },
-            h('span', { className: 'qdr-model-name' }, model.name),
+            h('span', { className: 'qdr-model-name', 'data-i18n': 'off' }, model.name),
             model.pinned ? h(Badge, { tone: 'accent' }, '默认') : null,
             model.official === false ? h(Badge, { tone: 'neutral' }, '非官方') : null),
-          h('div', { className: 'qdr-model-id' }, model.id),
+          h('div', { className: 'qdr-model-id', 'data-i18n': 'off' }, model.id),
           h('div', { className: 'qdr-model-badges' },
             modelBadges(model, customized).map((badge, index) => h(Badge, { key: index, tone: badge.tone, title: badge.title }, badge.text)))),
         h('span', { className: `qdr-chevron${expanded ? ' qdr-chevron-on' : ''}` }, h(Icon, { name: 'chevron', size: 14 }))),
@@ -1232,21 +2111,33 @@
             : h(Button, { size: 'sm', disabled: busy, onClick: onCancel }, '取消')));
     }
 
-    function TrialPanel({ models, signedIn, pinned, presetModel, onUsage, onLogin, onCopy }) {
+    function TrialPanel({ models, signedIn, pinned, presetModel, defaults, onUsage, onLogin, onCopy }) {
       const all = models || [];
       const visible = all.filter((model) => model.visible);
       const list = visible.length ? visible : all;
       const preferred = presetModel || pinned || (list[0] && list[0].id) || (all[0] && all[0].id) || '';
       const [modelId, setModelId] = useState(preferred);
-      const [prompt, setPrompt] = useState('用一句话介绍你自己。');
+      const [prompt, setPrompt] = useState(UI_LOCALE === 'en' ? 'Introduce yourself in one sentence.' : '用一句话介绍你自己。');
       const [busy, setBusy] = useState(false);
       const [elapsed, setElapsed] = useState(0);
       const [result, setResult] = useState(null);
       const [error, setError] = useState('');
       const [effort, setEffort] = useState('');
+      const [maxTokens, setMaxTokens] = useState('');
       const alive = useRef(true);
       const abortRef = useRef(null);
       useEffect(() => () => { alive.current = false; if (abortRef.current) abortRef.current.abort(); }, []);
+      useEffect(() => {
+        const onLang = () => setPrompt((current) => (
+          current === '用一句话介绍你自己。' || current === 'Introduce yourself in one sentence.'
+            ? (UI_LOCALE === 'en' ? 'Introduce yourself in one sentence.' : '用一句话介绍你自己。')
+            : current
+        ));
+        if (typeof window !== 'undefined') window.addEventListener('qoder:lang-changed', onLang);
+        return () => {
+          if (typeof window !== 'undefined') window.removeEventListener('qoder:lang-changed', onLang);
+        };
+      }, []);
       useEffect(() => {
         if (!busy) { setElapsed(0); return undefined; }
         const timer = setInterval(() => setElapsed((value) => value + 1), 1000);
@@ -1259,6 +2150,11 @@
       // 只盯 all.length 会让试跑停在一个已经不存在的 id 上，下一次请求直接 400。
       const model = all.find((item) => item.id === modelId) || null;
       const efforts = model && Array.isArray(model.reasoningEfforts) ? model.reasoningEfforts : [];
+      const autoMax = autoOutputTokens(
+        defaults && defaults.maxTokens,
+        model && model.maxOutputTokens,
+        defaults && defaults.providerMaxTokens,
+      );
       const modelSignature = all.map((item) => item.id).join('\u0000');
       const effortSignature = efforts.join('\u0000');
       useEffect(() => {
@@ -1279,10 +2175,12 @@
         const controller = new AbortController();
         abortRef.current = controller;
         try {
+          const requestedMax = parseMaxTokens(maxTokens);
           const data = await postJson('/qoder/test', {
             model: modelId,
             prompt: prompt.trim(),
             ...(effort ? { reasoningEffort: effort } : {}),
+            ...(requestedMax ? { maxTokens: requestedMax } : {}),
           }, { signal: controller.signal });
           if (!alive.current) return;
           if (!data.ok) throw new Error(data.error || '试跑失败');
@@ -1342,6 +2240,17 @@
                 placeholder: '目录里还没有可用模型',
                 options: list.map((item) => ({ value: item.id, label: item.name, hint: item.id })),
               })),
+            h('div', { className: 'qdr-field' },
+              h('span', { className: 'qdr-field-label' }, '最大输出 tokens'),
+              h('input', {
+                className: 'qdr-input', type: 'number', min: '16', step: '1', inputMode: 'numeric',
+                value: maxTokens, disabled: Boolean(busy),
+                placeholder: `自动 ${compact(autoMax)}`,
+                'aria-label': '试跑最大输出 tokens',
+                onChange: (event) => setMaxTokens(event.target.value.replace(/[^0-9]/g, '')),
+              }),
+              h('span', { className: 'qdr-field-note' },
+                '留空使用已保存 / 官方默认；本次选择不保存')),
             efforts.length ? h('div', { className: 'qdr-field' },
               h('span', { className: 'qdr-field-label' }, '本次思考档位'),
               h(Select, {
@@ -1392,8 +2301,8 @@
               }, '复制'))),
           result.reasoning ? h('details', { className: 'qdr-thinking' },
             h('summary', null, `思考过程 · ${result.reasoning.length} 字`),
-            h('pre', null, result.reasoning)) : null,
-          h('div', { className: 'qdr-answer' }, result.text || '（空回复）'),
+            h('pre', { 'data-i18n': 'off' }, result.reasoning)) : null,
+          h('div', { className: 'qdr-answer' }, result.text || h('span', { className: 'qdr-quiet' }, '（空回复）')),
           h('div', { className: 'qdr-trial-usage' },
             usageBits.map(([label, value]) => h('span', { key: label },
               h('span', { className: 'qdr-trial-usage-label' }, label),
@@ -1416,7 +2325,7 @@
     const CREDIT_RANGES = [['1d', '1天'], ['7d', '7天'], ['30d', '30天'], ['mtd', '月初至今'], ['last-month', '上个月']];
     const shortDate = (date) => {
       const parts = String(date || '').split('-').map(Number);
-      return parts.length === 3 ? `${parts[1]}月${parts[2]}日` : String(date || '');
+      return parts.length === 3 ? formatDayOnly(date, { month: 'short', day: 'numeric' }) : String(date || '');
     };
 
     function CreditsHeatmap({ data, busy, onRefresh, error }) {
@@ -1453,7 +2362,7 @@
         if (!first) return;
         const month = first.parsed.getMonth();
         if (month !== lastMonth) {
-          months.push({ index, label: `${month + 1}月` });
+          months.push({ index, label: formatMonthLabel(first.parsed) });
           lastMonth = month;
         }
       });
@@ -1739,7 +2648,9 @@
               unavailable ? h('span', null, `无活动 ${unavailable}`) : null,
               h('span', null, `异常 ${summary.errors}`),
               data.auto
-                ? (data.lastAutoAt ? h('span', null, `上次自动 ${stamp(data.lastAutoAt)} · 下次约 ${stamp(data.lastAutoAt + 20 * 60_000)}`) : h('span', null, '尚未自动运行'))
+                ? (data.lastAutoAt
+                  ? h('span', null, `上次自动 ${stamp(data.lastAutoAt)}${data.nextRunAt ? ` · 下次 ${stamp(data.nextRunAt)}` : ''}`)
+                  : h('span', null, data.nextRunAt ? `尚未自动运行 · 下次 ${stamp(data.nextRunAt)}` : '尚未自动运行'))
                 : h('span', null, '自动签到已关闭'))));
     }
 
@@ -1833,7 +2744,7 @@
               h('div', { className: 'qdr-checkin-mark' }, (account.label || '?').slice(0, 1).toUpperCase()),
               h('div', { className: 'qdr-checkin-main' },
                 h('div', { className: 'qdr-checkin-title' },
-                  h('strong', null, account.label),
+                  h('strong', { 'data-i18n': 'off' }, account.label),
                   account.current ? h(Badge, { tone: 'green' }, '当前') : null,
                   h(Badge, { tone: account.region === 'cn' ? 'accent' : 'neutral' }, account.regionLabel),
                   h(Badge, { tone: 'neutral' }, account.sourceLabel)),
@@ -1875,6 +2786,7 @@
     }
 
     function Panel() {
+      const [langMode, setLangMode] = useState(storedLangMode());
       const [status, setStatus] = useState(null);
       const [models, setModels] = useState(null);
       const [usage, setUsage] = useState(null);
@@ -1948,6 +2860,7 @@
       const [creditsMode, setCreditsMode] = useState('all');
       const [creditsBusy, setCreditsBusy] = useState(false);
       const authKey = useRef('');
+      const localeSynced = useRef('');
       const dirtyRef = useRef(false);
       const noticeTimer = useRef(null);
       const creditsSeq = useRef(0);
@@ -1960,6 +2873,22 @@
       const checkinSeq = useRef(0);
       const diagnosticsSeq = useRef(0);
       const mounted = useRef(true);
+
+      useEffect(() => {
+        const onLang = () => setLangMode(storedLangMode());
+        if (typeof window !== 'undefined') window.addEventListener('qoder:lang-changed', onLang);
+        return () => {
+          if (typeof window !== 'undefined') window.removeEventListener('qoder:lang-changed', onLang);
+        };
+      }, []);
+
+      useEffect(() => {
+        const locale = resolveLangMode(langMode);
+        if (localeSynced.current === locale) return;
+        postJson('/qoder/prefs', { uiLocale: locale })
+          .then(() => { localeSynced.current = locale; })
+          .catch(() => {});
+      }, [langMode, status]);
 
       useLayoutEffect(() => {
         const measure = () => {
@@ -2144,7 +3073,7 @@
         }
       }, []);
 
-      const loadRequests = useCallback(async (days, { silent = false, model = requestModel, onlyFailures = requestOnlyFailures } = {}) => {
+      const loadRequests = useCallback(async (days, { silent = false, model = requestModel, onlyFailures = requestOnlyFailures, onlyActionable = requestOnlyActionable } = {}) => {
         const seq = ++requestSeq.current;
         if (!silent) setRequestsBusy(true);
         if (!silent) setRequestsError('');
@@ -2152,6 +3081,7 @@
           const params = new URLSearchParams({ days: String(days || requestDays), limit: '120' });
           if (model) params.set('model', model);
           if (onlyFailures) params.set('onlyFailures', '1');
+          if (onlyActionable) params.set('onlyActionable', '1');
           const data = await getJson(`/qoder/requests?${params.toString()}`);
           if (!mounted.current || seq !== requestSeq.current) return;
           setRequests(data);
@@ -2169,7 +3099,7 @@
         } finally {
           if (mounted.current && seq === requestSeq.current) setRequestsBusy(false);
         }
-      }, [requestDays, requestModel, requestOnlyFailures]);
+      }, [requestDays, requestModel, requestOnlyFailures, requestOnlyActionable]);
 
       const loadLogs = useCallback(async ({ silent = false, query = '' } = {}) => {
         const seq = ++logsSeq.current;
@@ -2194,11 +3124,11 @@
         }
       }, []);
 
-      const loadAccount = useCallback(async () => {
+      const loadAccount = useCallback(async (force = false) => {
         const seq = ++accountSeq.current;
         setAccountBusy(true);
         try {
-          const data = await getJson('/qoder/account', { panel: true });
+          const data = await getJson(`/qoder/account${force ? '?refresh=1' : ''}`, { panel: true });
           if (!mounted.current || seq !== accountSeq.current) return;
           setAccountData(data);
           try { window.dispatchEvent(new CustomEvent('qoder:quota-changed', { detail: { extras: data.extras } })); } catch { /* older webview */ }
@@ -2301,7 +3231,7 @@
 
       const deletePat = useCallback(async (entry) => {
         if (!entry || entry.active) return;
-        if (!window.confirm(`删除 PAT「${entry.label || entry.name || entry.uidTail}」？\n只删除本机保存的凭据，不影响 Qoder 账号或当前登录。`)) return;
+        if (!confirmText(`删除 PAT「${entry.label || entry.name || entry.uidTail}」？\n只删除本机保存的凭据，不影响 Qoder 账号或当前登录。`)) return;
         setPatBusy(`delete:${entry.id}`);
         setPatStoreError('');
         try {
@@ -2415,7 +3345,7 @@
 
       useEffect(() => {
         if (tab === 'requests' && !requestsPaused) loadRequests(requestDays);
-      }, [tab, requestDays, requestModel, requestOnlyFailures, requestsPaused, loadRequests]);
+      }, [tab, requestDays, requestModel, requestOnlyFailures, requestOnlyActionable, requestsPaused, loadRequests]);
 
       useVisibilityPoll(() => loadRequests(requestDays, { silent: true }), 30_000, tab === 'requests' && !requestsPaused);
 
@@ -2441,6 +3371,12 @@
       useEffect(() => {
         if (tab === 'diagnose' && !diagnostics && !diagnosticsError) loadDiagnostics();
       }, [tab, diagnostics, diagnosticsError, loadDiagnostics]);
+
+      const fetchDiagBundle = async () => {
+        const data = await getJson('/qoder/diagnostics?bundle=1', { panel: true, timeoutMs: DEEP_TIMEOUT_MS });
+        if (!data.bundle) throw new Error('诊断包生成失败');
+        return data.bundle;
+      };
 
       useEffect(() => {
         if (!status || !status.signedIn) return;
@@ -2633,7 +3569,7 @@
       };
 
       const logout = () => {
-        if (!window.confirm('退出 Qoder？\n这会删除本机保存的加密凭据，但不会影响 Qoder 官方客户端的登录。')) return;
+        if (!confirmText('退出 Qoder？\n这会删除本机保存的加密凭据，但不会影响 Qoder 官方客户端的登录。')) return;
         run('logout', async () => {
           await postJson('/qoder/auth/logout');
           setDevice(null);
@@ -2645,6 +3581,15 @@
           notifyAuth();
         });
       };
+
+      const refreshTokenNow = () => run('token', async () => {
+        const result = await postJson('/qoder/auth/refresh');
+        if (result.ok === false) throw new Error(result.error || '刷新令牌失败');
+        await loadStatus(false);
+        await loadModels(false);
+        await loadCheckin(true);
+        showNotice('ok', '访问令牌已刷新。');
+      });
 
       const savePrefs = () => run('prefs', async () => {
         const result = await postJson('/qoder/prefs', {
@@ -2691,7 +3636,7 @@
 
       const resetModelParams = async (model) => {
         if (modelBusy) return;
-        if (!window.confirm(`把 ${model.name} 的上下文、温度和最大输出恢复为官方默认？`)) return;
+        if (!confirmText(`把 ${model.name} 的上下文、温度和最大输出恢复为官方默认？`)) return;
         setModelBusy(model.id);
         setModelError(null);
         try {
@@ -2731,7 +3676,7 @@
             : editorDirty
               ? '模型参数还没有保存，切换页签会丢失这些修改。继续？'
               : '显示设置还没有保存，切换页签会丢失这些修改。继续？';
-          if (!window.confirm(message)) return false;
+          if (!confirmText(message)) return false;
           setEditorDirty(false);
           if (dirty) {
             dirtyRef.current = false;
@@ -2744,7 +3689,7 @@
       };
 
       const goTrial = (model) => {
-        if (editorDirty && !window.confirm('模型参数还没有保存，去试跑会丢失这些修改。继续？')) return;
+        if (editorDirty && !confirmText('模型参数还没有保存，去试跑会丢失这些修改。继续？')) return;
         setEditorDirty(false);
         const available = (models || []).filter((item) => effectivelyVisible(item));
         const target = model && model.id ? model.id
@@ -2755,7 +3700,7 @@
       };
 
       const clearUsage = () => {
-        if (!window.confirm('清空本地用量记录？\n只删除 token/延迟统计，不影响 Qoder 账号和模型。')) return;
+        if (!confirmText('清空本地用量记录？\n只删除 token/延迟统计，不影响 Qoder 账号和模型。')) return;
         run('clear', async () => {
           await postJson('/qoder/usage/clear');
           setUsage(null);
@@ -3058,6 +4003,16 @@
                 !status ? '连接中…' : signedIn ? '已连接' : '未登录')),
             h('div', { className: 'qdr-subtitle' }, 'DeepSeek Harness 原生接入 · 单进程 · 无额外端口')),
           h('div', { className: 'qdr-head-actions' },
+            h('div', { className: 'qdr-lang' }, h(Select, {
+              value: langMode,
+              onChange: (value) => { setUILangMode(value); setLangMode(value); },
+              ariaLabel: '界面语言',
+              options: [
+                { value: 'auto', label: '自动' },
+                { value: 'zh', label: '中文' },
+                { value: 'en', label: 'English' },
+              ],
+            })),
             h('button', { type: 'button', className: 'qdr-icon-btn', title: '刷新状态', onClick: () => run('status', () => loadStatus(true)), disabled: busy === 'status' }, h(Icon, { name: 'refresh', size: 15 })))),
         pageError,
         pageNotice,
@@ -3121,7 +4076,7 @@
             h('div', { className: 'qdr-account-strip' },
               h('div', { className: 'qdr-avatar' }, (status.account && status.account.name || 'Q').slice(0, 1).toUpperCase()),
               h('div', { className: 'qdr-account-main' },
-                h('div', { className: 'qdr-account-name' }, status.account && (status.account.name || status.account.email) || 'Qoder 账号'),
+                h('div', { className: 'qdr-account-name', 'data-i18n': 'off' }, status.account && (status.account.name || status.account.email) || 'Qoder 账号'),
                 h('div', { className: 'qdr-account-meta' },
                   status.regionLabel || status.region,
                   ' · ', status.account && status.account.sourceLabel || '本机登录',
@@ -3147,7 +4102,7 @@
                     h('div', { className: 'qdr-candidate-mark' }, row.sourceLabel === '桌面端' ? 'D' : 'C'),
                     h('div', { className: 'qdr-account-menu-main' },
                       h('div', { className: 'qdr-account-menu-title' },
-                        h('strong', null, row.name),
+                        h('strong', { 'data-i18n': 'off' }, row.name),
                         row.alias ? h(Badge, { tone: 'accent' }, '别名') : null,
                         current ? h(Badge, { tone: 'green' }, '当前') : null,
                         row.missing ? h(Badge, { tone: 'amber' }, '需重新登录') : null,
@@ -3170,7 +4125,7 @@
             h(QuotaCard, {
               extras, signedIn, wide: true, busy: accountBusy,
               checkin, checkinBusy,
-              onRefresh: loadAccount,
+              onRefresh: () => loadAccount(true),
               onAccount: () => setTab('account'),
               onCheckin: () => setTab('checkin'),
               onRunCheckin: () => runCheckin(''),
@@ -3282,11 +4237,11 @@
                     onPin: () => { setDraftPinned(draftPinned === model.id ? '' : model.id); setDirty(true); },
                     onOpen: () => {
                       if (open) {
-                        if (editorDirty && !window.confirm('放弃未保存的模型参数？')) return;
+                        if (editorDirty && !confirmText('放弃未保存的模型参数？')) return;
                         setEditorDirty(false);
                         setExpanded('');
                       } else {
-                        if (editorDirty && !window.confirm('当前模型有未保存的参数，切换会丢失。继续？')) return;
+                        if (editorDirty && !confirmText('当前模型有未保存的参数，切换会丢失。继续？')) return;
                         setEditorDirty(false);
                         setModelError(null);
                         setExpanded(model.id);
@@ -3330,6 +4285,10 @@
         }, h(TrialPanel, {
           key: 'trial-' + trialSeq + '-' + ((status && status.account && status.account.uid) || 'anon'),
           models, signedIn, pinned: draftPinned, presetModel: trialModel,
+          defaults: {
+            maxTokens: status && status.config ? status.config.defaultMaxTokens : 0,
+            providerMaxTokens: status && status.config ? status.config.providerDefaultMaxTokens : 32000,
+          },
           onUsage: () => { setUsage(null); setCredits(null); loadStatus(false); loadAccount(); },
           onLogin: () => setTab('account'),
           onCopy: copy,
@@ -3458,8 +4417,8 @@
                   recentShown.map((item, index) => h('div', { className: 'qdr-usage-row', key: index },
                     h('div', { className: 'qdr-usage-top' },
                       h(StatusDot, { tone: item.ok ? 'ok' : 'bad' }),
-                      h('span', { className: 'qdr-usage-model' }, modelLabel(item.model)),
-                      h('span', { className: 'qdr-usage-id' }, item.model || '—'),
+                      h('span', { className: 'qdr-usage-model', 'data-i18n': 'off' }, modelLabel(item.model)),
+                      h('span', { className: 'qdr-usage-id', 'data-i18n': 'off' }, item.model || '—'),
                       h('span', { className: `qdr-usage-status qdr-usage-status-${item.ok ? 'ok' : 'bad'}` },
                         item.ok ? (item.status === 'test' ? '试跑' : '成功') : statusLabel(item.status)),
                       usageBadges(item).map((label, badgeIndex) => h('span', { className: 'qdr-usage-badge', key: badgeIndex }, label)),
@@ -3527,15 +4486,15 @@
                 h('thead', null, h('tr', null,
                   ['时间', '模型', '状态', '首字', '耗时', '输入', '输出', '缓存', '账号', 'Credits'].map((label) => h('th', { key: label, scope: 'col' }, label)))),
                 h('tbody', null, (requests.items || [])
-                  .filter((item) => !requestOnlyActionable || needsAction(item))
                   .map((item, index) => h(React.Fragment, { key: `${item.at}-${index}` },
                   h('tr', null,
                     h('td', { className: 'qdr-req-time' }, stamp(item.at)),
                     h('td', null,
-                      h('div', { className: 'qdr-req-model' }, modelLabel(item.model)),
-                      h('div', { className: 'qdr-req-id' }, item.model || '—')),
+                      h('div', { className: 'qdr-req-model', 'data-i18n': 'off' }, modelLabel(item.model)),
+                      h('div', { className: 'qdr-req-id', 'data-i18n': 'off' }, item.model || '—')),
                     h('td', null, h('span', { className: `qdr-usage-status qdr-usage-status-${item.ok ? 'ok' : 'bad'}` },
-                      item.ok ? (item.probe ? '试跑' : '成功') : statusLabel(item.status))),
+                      item.ok ? (item.probe ? '试跑' : '成功') : statusLabel(item.status)),
+                    item.estimated ? h('span', { className: 'qdr-usage-badge', title: '上游没有返回 usage，按文本字符数估算' }, '估算') : null),
                     h('td', { className: 'qdr-req-num' }, item.firstByteMs ? duration(item.firstByteMs) : '—'),
                     h('td', { className: 'qdr-req-num' }, item.latencyMs ? duration(item.latencyMs) : '—'),
                     h('td', { className: 'qdr-req-num' }, compact(item.promptTokens)),
@@ -3544,7 +4503,7 @@
                       item.cachedTokens
                         ? `${compact(item.cachedTokens)}${item.promptTokens ? ` · ${Math.round(item.cachedTokens / item.promptTokens * 100)}%` : ''}`
                         : '—'),
-                    h('td', { className: 'qdr-req-account' }, item.accountLabel || item.account || '—'),
+                    h('td', { className: 'qdr-req-account', 'data-i18n': 'off' }, item.accountLabel || item.account || '—'),
                     h('td', { className: 'qdr-req-num' }, item.billable === false ? '免费' : (item.credits ? money(item.credits) : '—'))),
                   !item.ok && item.error ? h('tr', { className: 'qdr-req-error-row' },
                     h('td', { colSpan: 10 },
@@ -3599,7 +4558,7 @@
                         if (event.key === 'Enter') event.currentTarget.blur();
                         else if (event.key === 'Escape') setAccountEditing('');
                       },
-                    }) : h('strong', null, row.name),
+                    }) : h('strong', { 'data-i18n': 'off' }, row.name),
                     row.alias ? h(Badge, { tone: 'accent' }, '别名') : null,
                     row.current ? h(Badge, { tone: 'green' }, '当前') : null,
                     row.hidden ? h(Badge, { tone: 'amber' }, '已隐藏') : null,
@@ -3635,6 +4594,13 @@
                       onClick: () => toggleAccountHidden(row, true),
                     }, '隐藏'),
                   row.current
+                    ? h('button', {
+                      type: 'button', className: 'qdr-text-btn',
+                      disabled: busy === 'token' || Boolean(accountActionBusy),
+                      onClick: refreshTokenNow,
+                    }, busy === 'token' ? '刷新中…' : '刷新令牌')
+                    : null,
+                  row.current
                     ? h(Badge, { tone: 'green' }, '当前账号')
                     : h(Button, {
                       size: 'sm', variant: 'secondary', icon: 'swap',
@@ -3657,7 +4623,7 @@
               showHiddenAccounts ? h('div', { className: 'qdr-account-list qdr-account-list-hidden' }, hiddenAccountRows.map((row) => h('div', { className: 'qdr-account-row qdr-account-row-hidden', key: row.key },
                 h('div', { className: 'qdr-account-mark' }, (row.name || '?').slice(0, 1).toUpperCase()),
                 h('div', { className: 'qdr-account-main' },
-                  h('div', { className: 'qdr-account-title' }, h('strong', null, row.name), row.alias ? h(Badge, { tone: 'accent' }, '别名') : null),
+                  h('div', { className: 'qdr-account-title' }, h('strong', { 'data-i18n': 'off' }, row.name), row.alias ? h(Badge, { tone: 'accent' }, '别名') : null),
                   h('div', { className: 'qdr-account-meta' }, [row.regionLabel, row.sourceLabel, row.email || (row.uid ? `uid …${row.uid.slice(-6)}` : '本机账号')].filter(Boolean).join(' · '))),
                 h(Button, { size: 'sm', variant: 'ghost', disabled: Boolean(accountActionBusy), onClick: () => toggleAccountHidden(row, false) }, '恢复')))) : null,
               h('button', {
@@ -3673,7 +4639,7 @@
                 h(Button, { size: 'sm', icon: 'bolt', disabled: Boolean(busy) || !(status.catalog && status.catalog.count), title: status.catalog && status.catalog.count ? '用当前模型发一次真实请求' : '目录为空，先刷新目录或登录', onClick: () => goTrial() }, '去试跑'),
                 h(Button, { size: 'sm', variant: 'ghost', icon: 'logout', disabled: busy === 'logout', onClick: logout }, '退出登录')) : null)),
 
-          signedIn ? h(QuotaCard, { extras, signedIn, busy: accountBusy, onRefresh: loadAccount }) : null,
+          signedIn ? h(QuotaCard, { extras, signedIn, busy: accountBusy, onRefresh: () => loadAccount(true) }) : null,
 
           h(DeviceCard, {
             state: device, busy: busy === 'device', region, setRegion,
@@ -3693,7 +4659,7 @@
               h('div', { className: 'qdr-account-mark' }, 'P'),
               h('div', { className: 'qdr-account-main' },
                 h('div', { className: 'qdr-account-title' },
-                  h('strong', null, entry.label || entry.name || `uid …${entry.uidTail || '—'}`),
+                  h('strong', { 'data-i18n': 'off' }, entry.label || entry.name || `uid …${entry.uidTail || '—'}`),
                   entry.active ? h(Badge, { tone: 'green' }, '当前') : null),
                 h('div', { className: 'qdr-account-meta' },
                   [entry.regionLabel, entry.uidTail ? `uid …${entry.uidTail}` : '', entry.email,
@@ -3756,6 +4722,11 @@
                   size: 'sm', variant: logsPaused ? 'primary' : 'secondary', icon: logsPaused ? 'bolt' : 'pause',
                   onClick: () => setLogsPaused((value) => !value),
                 }, logsPaused ? '继续刷新' : '暂停刷新'),
+                h(Button, {
+                  size: 'sm', variant: 'ghost', icon: 'download',
+                  disabled: !(logs && (logs.lines || []).length),
+                  onClick: () => downloadText(`qoder-log-${fileStamp()}.txt`, (logs.lines || []).join('\n')),
+                }, '下载'),
                 h(Button, { size: 'sm', variant: 'ghost', icon: 'copy', onClick: () => copy((logs && logs.lines || []).join('\n'), '日志') }, '复制全部'),
                 h(Button, { size: 'sm', icon: 'refresh', disabled: logsBusy, onClick: () => loadLogs({ query: logsApplied }) }, logsBusy ? '读取中…' : '刷新'))),
             logsError ? h('div', { className: 'qdr-inline-warn', role: 'alert' }, h('span', null, logsError)) : null,
@@ -3773,11 +4744,17 @@
                 h(Button, {
                   size: 'sm', variant: 'secondary', icon: 'copy', disabled: busy === 'diag-bundle',
                   onClick: () => run('diag-bundle', async () => {
-                    const data = await getJson('/qoder/diagnostics?bundle=1', { panel: true, timeoutMs: DEEP_TIMEOUT_MS });
-                    if (!data.bundle) throw new Error('诊断包生成失败');
-                    await copy(JSON.stringify(data.bundle, null, 2), '诊断包');
+                    await copy(JSON.stringify(await fetchDiagBundle(), null, 2), '诊断包');
                   }),
                 }, busy === 'diag-bundle' ? '生成中…' : '诊断包'),
+                h(Button, {
+                  size: 'sm', variant: 'ghost', icon: 'download', disabled: busy === 'diag-bundle',
+                  onClick: () => run('diag-download', async () => {
+                    const bundle = await fetchDiagBundle();
+                    downloadText(`qoder-diagnostics-${fileStamp()}.json`, JSON.stringify(bundle, null, 2), 'application/json;charset=utf-8');
+                    showNotice('ok', '诊断包已下载。');
+                  }),
+                }, '下载'),
                 h(Button, { size: 'sm', variant: 'ghost', icon: 'copy', disabled: !diagnostics, onClick: () => {
                   const lines = [
                     `qoder-to-dsh ${status.version || ''} · provider=${status.provider || 'qoder'}`,
@@ -3817,7 +4794,7 @@
             h('div', { className: 'qdr-card-head' },
               h('div', null, h('div', { className: 'qdr-card-title' }, '运行日志'), h('div', { className: 'qdr-card-sub' }, '已脱敏，不包含令牌或对话内容')),
               h(Button, { size: 'sm', variant: 'ghost', icon: 'copy', disabled: !(diagnostics && diagnostics.logs), onClick: () => copy((diagnostics.logs || []).join('\n'), '日志') }, '复制')),
-            h('pre', { className: 'qdr-logs' }, ((diagnostics && diagnostics.logs) || ['暂无日志']).slice(-24).join('\n')))) : null),
+            h('pre', { className: 'qdr-logs', 'data-i18n': 'off' }, ((diagnostics && diagnostics.logs) || ['暂无日志']).slice(-24).join('\n')))) : null),
 
         h('div', { className: 'qdr-footer' },
           h('span', null, 'qoder-to-dsh · 非官方接入，仅使用本机自有账号'),
@@ -3842,6 +4819,7 @@
 .qdr-title{font-size:1.0625rem;font-weight:680;letter-spacing:-.02em;margin:0;line-height:1.2}
 .qdr-subtitle{font-size:0.71875rem;color:var(--qdr-muted);margin-top:3px;letter-spacing:.01em;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .qdr-head-actions{display:flex;gap:4px;flex:none}
+.qdr-lang{width:98px;flex:none}
 .qdr-icon-btn{width:30px;height:30px;border:1px solid transparent;background:transparent;border-radius:10px;color:var(--qdr-muted);display:flex;align-items:center;justify-content:center;cursor:pointer;transition:background .18s,border-color .18s,color .18s,transform .18s}
 .qdr-icon-btn:hover{background:var(--qdr-soft);border-color:var(--qdr-line)}
 .qdr-icon-btn:active:not(:disabled){transform:scale(.88)}
@@ -4414,6 +5392,7 @@ select.qdr-select option{background:var(--qdr-card);color:var(--qdr-fg)}
       const [accountExtras, setAccountExtras] = useState(null);
       const [quotaTried, setQuotaTried] = useState(false);
       const [authEpoch, setAuthEpoch] = useState(0);
+      const [, setLangEpoch] = useState(0);
       const alive = useRef(true);
       const statusSeq = useRef(0);
       const quotaSeq = useRef(0);
@@ -4426,6 +5405,8 @@ select.qdr-select option{background:var(--qdr-card);color:var(--qdr-fg)}
       useEffect(() => {
         alive.current = true;
         loadStatus();
+        const onLang = () => { if (alive.current) setLangEpoch((value) => value + 1); };
+        window.addEventListener('qoder:lang-changed', onLang);
         const onAuth = () => {
           if (!alive.current) return;
           statusSeq.current += 1;
@@ -4450,6 +5431,7 @@ select.qdr-select option{background:var(--qdr-card);color:var(--qdr-fg)}
           alive.current = false;
           window.removeEventListener('qoder:auth-changed', onAuth);
           window.removeEventListener('qoder:quota-changed', onQuota);
+          window.removeEventListener('qoder:lang-changed', onLang);
         };
       }, [loadStatus]);
       useVisibilityPoll(loadStatus, 45_000);
@@ -4634,6 +5616,10 @@ select.qdr-select option{background:var(--qdr-card);color:var(--qdr-fg)}
     exports.startVisibilityPoll = startVisibilityPoll;
     exports.toEpochMs = toEpochMs;
     exports.autoOutputTokens = autoOutputTokens;
+    exports.parseMaxTokens = parseMaxTokens;
+    exports.translateText = translateText;
+    exports.setUILangMode = setUILangMode;
+    exports.resolveLangMode = resolveLangMode;
     return module.exports;
   }
 

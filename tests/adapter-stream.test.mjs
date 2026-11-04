@@ -99,6 +99,20 @@ test('stream accepts reasoning deltas and records a successful request', async (
   assert.equal(record.account, 'uid:test1234');
 });
 
+test('missing upstream usage is estimated into the local ledger', async () => {
+  const body = sseBody([
+    { choices: [{ delta: { content: 'hello' }, finish_reason: 'stop' }] },
+  ]);
+  const chunks = await collect(adapterFor(fakeClient(body)));
+  const usage = chunks.find((chunk) => chunk.type === 'usage').usage;
+  assert.equal(usage.estimated, true);
+  const record = lastUsage();
+  assert.equal(record.estimated, true);
+  assert.ok(record.promptTokens > 0);
+  assert.ok(record.completionTokens > 0);
+  assert.ok(record.totalTokens > 0);
+});
+
 test('a consumer that stops early is recorded as aborted, not success', async () => {
   const body = sseBody([
     { choices: [{ delta: { content: 'partial answer' } }] },

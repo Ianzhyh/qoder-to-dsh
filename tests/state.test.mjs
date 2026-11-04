@@ -7,10 +7,12 @@ import { join } from 'node:path';
 import {
   appendUsage, clearUsage, creditsReport, ensureUsageDaily, flushUsage, isProbe, localDayKey,
   normalizeCheckin, normalizePrefs, normalizeUsageRecord, readUsage, readUsageDaily,
-  reconcileUsage, redact, summarizeUsage, usageDailyPath,
+  reconcileUsage, redact, summarizeRequests, summarizeUsage, usageDailyPath,
 } from '../lib/state.mjs';
 
 test('normalizePrefs keeps the three visibility intents distinct', () => {
+  assert.equal(normalizePrefs({ uiLocale: 'en' }).uiLocale, 'en');
+  assert.equal(normalizePrefs({ uiLocale: 'fr' }).uiLocale, 'zh');
   assert.equal(normalizePrefs({ visible: null }).visible, null);
   assert.deepEqual(normalizePrefs({ visible: [] }).visible, []);
   assert.deepEqual(normalizePrefs({ visible: ['a', 'a', 'b'] }).visible, ['a', 'b']);
@@ -23,6 +25,31 @@ test('normalizePrefs keeps the three visibility intents distinct', () => {
   assert.equal(prefs.pinned, 'model-a');
   assert.deepEqual(prefs.contextWindowByModel, { a: 100000 });
   assert.deepEqual(prefs.paramsByModel, { a: { temperature: 2, maxTokens: 10, reasoningEffort: 'high' } });
+});
+
+test('summarizeRequests exposes estimated records without changing success status', () => {
+  const now = Date.now();
+  const result = summarizeRequests([
+    { at: now, model: 'auto', ok: true, status: 'ok', estimated: true, promptTokens: 12, completionTokens: 3, totalTokens: 15 },
+  ], { days: 7, limit: 20, now });
+  assert.equal(result.items.length, 1);
+  assert.equal(result.items[0].estimated, true);
+  assert.equal(result.items[0].ok, true);
+  assert.equal(result.items[0].promptTokens, 12);
+});
+
+test('summarizeRequests filters failures that need manual action', () => {
+  const now = Date.now();
+  const records = [
+    { at: now, model: 'auto', ok: false, status: 'http-429', errorAction: 'retry' },
+    { at: now, model: 'auto', ok: false, status: 'http-402', errorAction: 'switch' },
+    { at: now, model: 'auto', ok: false, status: 'http-400', errorAction: 'fail' },
+    { at: now, model: 'auto', ok: true, status: 'ok' },
+  ];
+  const result = summarizeRequests(records, { days: 7, limit: 20, onlyActionable: true, now });
+  assert.equal(result.items.length, 2);
+  assert.deepEqual(result.items.map((item) => item.errorAction).sort(), ['fail', 'switch']);
+  assert.equal(result.total, 2);
 });
 
 test('usage records carry credits and reject invalid timestamps', () => {

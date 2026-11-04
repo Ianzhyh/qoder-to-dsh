@@ -16,7 +16,7 @@ process.env.QODER_REGION = 'global';
 process.env.APPDATA = join(home, 'appdata');
 process.env.USERPROFILE = join(home, 'user');
 
-const { apply, resolveConfig, quotaCheck } = await import('../dsh-plugin/lib/index.js');
+const { apply, resolveConfig, quotaCheck, sanitizePrefs } = await import('../dsh-plugin/lib/index.js');
 
 const routes = [];
 const tools = [];
@@ -107,8 +107,19 @@ test('plugin registers one adapter, its tools, command and all panel routes', ()
   assert.ok(adapters[0].adapter && typeof adapters[0].adapter.stream === 'function');
   assert.deepEqual(tools.map((item) => item.name).sort(), ['qoder_diagnose', 'qoder_models', 'qoder_status', 'qoder_usage']);
   assert.deepEqual(commands.map((item) => item.name), ['qoder']);
-  assert.equal(routes.length, 26);
+  assert.equal(routes.length, 27);
   assert.ok(effects.length >= 2);
+});
+
+test('sanitizePrefs keeps unknown top-level keys for future-version rollback', () => {
+  const saved = sanitizePrefs(
+    { visible: ['qmodel_38max'], pinned: 'auto' },
+    { visible: null, pinned: '', includeAll: true, contextWindowByModel: {}, paramsByModel: {}, futureFlag: true, nested: { keep: 1 }, at: 123 },
+  );
+  assert.equal(saved.futureFlag, true);
+  assert.deepEqual(saved.nested, { keep: 1 });
+  assert.equal('at' in saved, false, 'at 由 normalizePrefs 重新生成，不当作配置回写');
+  assert.deepEqual(saved.visible, ['qmodel_38max']);
 });
 
 test('resolveConfig clamps model defaults and keeps zero timeouts meaningful', () => {
@@ -178,6 +189,8 @@ test('requests endpoint filters by day, model and failures', async () => {
   const { appendUsage } = await import('../lib/state.mjs');
   appendUsage({ at: Date.now(), model: 'req-a', ok: true, totalTokens: 3, promptTokens: 100, cachedTokens: 40, account: 'uid:abcd1234' });
   appendUsage({ at: Date.now(), model: 'req-b', ok: false, totalTokens: 4, error: 'boom' });
+  appendUsage({ at: Date.now(), model: 'req-act', ok: false, totalTokens: 4, error: 'quota', errorAction: 'switch' });
+  appendUsage({ at: Date.now(), model: 'req-retry', ok: false, totalTokens: 4, error: '429', errorAction: 'retry' });
   appendUsage({ at: Date.now() - 10 * 86400000, model: 'req-old', ok: false, totalTokens: 5 });
 
   const week = await call('GET', '/qoder/requests?days=7&limit=50');
@@ -194,6 +207,12 @@ test('requests endpoint filters by day, model and failures', async () => {
   const byModel = await call('GET', '/qoder/requests?days=7&model=req-a');
   assert.ok(byModel.json.items.every((item) => item.model === 'req-a'));
   assert.ok(byModel.json.models.includes('req-a'));
+
+  const actionable = await call('GET', '/qoder/requests?days=7&onlyActionable=1&limit=50');
+  assert.ok(actionable.json.items.every((item) => item.errorAction && item.errorAction !== 'retry'));
+  assert.ok(actionable.json.items.some((item) => item.model === 'req-act'));
+  assert.ok(!actionable.json.items.some((item) => item.model === 'req-retry'));
+  assert.equal(actionable.json.total, actionable.json.items.length);
 
   const usage = await call('GET', '/qoder/usage?days=7&limit=50');
   assert.ok(Array.isArray(usage.json.summary.byAccount));
@@ -589,6 +608,23 @@ test('auth routes keep a consistent envelope and reject malformed writes', async
   const malformed = await call('POST', '/qoder/auth/pat', { panel: true, raw: '{' });
   assert.equal(malformed.status, 400);
   assert.equal(malformed.json.ok, false);
+
+  const refreshWithoutHeader = await call('POST', '/qoder/auth/refresh', { body: {} });
+  assert.equal(refreshWithoutHeader.status, 403);
+  const refreshLoggedOut = await call('POST', '/qoder/auth/refresh', { panel: true, body: {} });
+  assert.equal(refreshLoggedOut.status, 400);
+  assert.equal(refreshLoggedOut.json.ok, false);
+});
+
+test('slash command follows the saved UI locale', async () => {
+  const saved = await call('POST', '/qoder/prefs', { panel: true, body: { uiLocale: 'en' } });
+  assert.equal(saved.status, 200);
+  assert.equal(saved.json.prefs.uiLocale, 'en');
+  const result = await commands[0].handler({ rawInput: 'status' });
+  assert.equal(result.kind, 'success');
+  assert.match(result.text, /Sign-in|signed in|Today/);
+  assert.ok(!/登录：|今日：/.test(result.text), result.text);
+  await call('POST', '/qoder/prefs', { panel: true, body: { uiLocale: 'zh' } });
 });
 
 test('cleanup', () => {

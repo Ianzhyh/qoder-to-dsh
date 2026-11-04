@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 
 import {
-  ADDON_VALIDITY_FALLBACK_DAYS, addonBatches, beijingDateKey, beijingHour, campaignEndMs, campaignStartMs,
-  checkinCanClaim, claimCampaigns, inCampaignWindow, summarizeCampaigns, summarizeCheckinAccounts, validityDaysOf,
+  ADDON_VALIDITY_FALLBACK_DAYS, addonBatches, beijingDateKey, beijingOpenAt, beijingHour, campaignEndMs, campaignStartMs,
+  checkinCanClaim, claimCampaigns, inCampaignWindow, nextRunAt, summarizeCampaigns, summarizeCheckinAccounts, validityDaysOf,
 } from '../lib/checkin.mjs';
 
 const now = Date.UTC(2026, 9, 25, 4, 0, 0);
@@ -280,6 +280,28 @@ test('addonBatches spreads the pooled remaining first-expire-first-consumed', ()
   assert.equal(view.batches[2].validityDays, 30);
   assert.equal(view.nextExpiry, view.batches[0].expiresAt, '最近到期就是最早那批');
   assert.equal(view.fallbackDays, ADDON_VALIDITY_FALLBACK_DAYS);
+});
+
+test('nextRunAt waits for 10:00, retries pending accounts, and stops after all settle', () => {
+  const open = Date.UTC(2026, 10, 4, 2, 0, 0);
+  const before = open - 60_000;
+  const after = open + 5 * 60_000;
+  const accounts = [{ key: 'cn:u1' }];
+  const settled = { 'cn:u1': { checkedAt: after, status: 'claimed' } };
+  const needsUser = { 'cn:u1': { checkedAt: after, status: 'device' } };
+
+  assert.equal(beijingOpenAt(before), open);
+  assert.equal(nextRunAt({ auto: true }, accounts, before), open, '10:00 前等到开放时间');
+  assert.equal(nextRunAt({ auto: true }, accounts, after), after, '10:00 后有待领取账号应立即尝试');
+  assert.equal(
+    nextRunAt({ auto: true, lastAutoAt: after - 5 * 60_000 }, accounts, after),
+    after + 15 * 60_000,
+    '20 分钟节流从上次自动运行算起',
+  );
+  assert.equal(nextRunAt({ auto: true, results: settled, lastAutoAt: after }, accounts, after), open + 86400000);
+  assert.equal(nextRunAt({ auto: true, results: needsUser }, accounts, after), open + 86400000, '缺设备/需登录不再自动空转');
+  assert.equal(nextRunAt({ auto: false }, accounts, after), 0);
+  assert.equal(nextRunAt({ auto: true }, [], after), 0);
 });
 
 test('addonBatches drops expired batches and reports untracked claims honestly', () => {

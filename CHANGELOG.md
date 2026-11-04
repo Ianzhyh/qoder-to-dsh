@@ -20,6 +20,44 @@
 6. 可选：`npm publish`，让 `dsh plugin add qoder-to-dsh` 这条最短路径可用
    （registry 上目前未占用该包名）。
 
+## [1.7.0] - 2026-11-04
+
+这一版把「数据准确性」「面板功能」「自动化」和「中英双语」一起收口。英文界面覆盖面板、聊天错误、`/qoder` 命令与 4 个只读工具；账号名、模型名、上游原文和日志正文保持原文。
+
+### Added
+
+- **中英双语**：`client.js` 内嵌中文原文 → English 字典与 `t()` / 渲染入口翻译；面板顶部新增「自动 / 中文 / English」语言选择，日期与数字用 `Intl` 本地化；新增 `lib/i18n.mjs` 覆盖聊天错误、斜杠命令与只读工具，服务端从 `prefs.json` 的 `uiLocale` 读取语言。
+- **试跑最大输出**：试跑页可填本次 `maxTokens`，留空使用已保存 / 官方默认；服务端按模型输出上限收敛。
+- **请求页统一口径**：「仅需处理」改为服务端过滤，表头计数、CSV 与空态和表格使用同一份数据。
+- **文件下载**：诊断包与日志新增下载按钮；CSV 下载复用同一套 `downloadText`。
+- **额度 TTL**：新增 `extrasTtlMs`（默认 60 秒，`QODER_EXTRAS_TTL_MS` 可调）；额度卡「刷新」强制跳过缓存。
+- **手动刷新令牌**：账号页当前账号新增「刷新令牌」；新增 `POST /qoder/auth/refresh`。
+- **签到 nextRunAt**：签到快照输出真实下次自动时间，面板不再写死 +20 分钟；调度改为 60 秒 tick，10:00 后一分钟内触发。
+- **估算徽标**：请求明细和用量最近记录对上游缺 usage 的记录显示「估算」。
+
+### Changed
+
+- **请求体预算**：`QODER_MAX_BODY_BYTES` 改按 base64 编码后体积计算，并把 tools / chat_context 纳入预算；超限提示区分「图片已裁尽」和「工具/历史过大」。
+- **usage 估算**：估算输入只统计文本与工具参数，跳过图片 base64；估算值同时写入 DSH 流与本地账本。
+- **prefs**：保存显示设置时保留未知顶层键；新增 `uiLocale`，由面板启动/切换语言时写回。
+- **README**：更新双语界面、数据准确性、面板功能、额度 TTL 与请求体预算说明；新增英文截图 `overview-light-en.png` / `narrow-checkin-en.png`，重拍中文截图。
+
+### Fixed
+
+- **usage 估算未落账**：1.6 的估算只发给 DSH，本地账本仍记 0；现在 `translator.finalUsage` 会被账本读取并标 `estimated`。
+- **估算输入虚高**：base64 图片不再被当成几十万字符的 prompt 文本。
+- **请求体漏算 tools**：大工具定义不再到上游才 413。
+- **重试码表不一致**：`EMPTY_RESPONSE` / `TOOL_CALL_LEAK` 加入宿主自动重试码表，与面板「可重试」建议一致。
+- **stop 静默丢弃**：`stop` 数组现在写入上游 `parameters.stop`。
+- **prefs 未知键被抹掉**：保存时保留 current 中未识别的顶层字段。
+- **服务端文案半中半英**：面板渲染入口统一翻译，账号名/模型名/日志用 `data-i18n="off"` 保护。
+
+### Tests
+
+- 新增 `tests/i18n.test.mjs`：英文模式无中文残留、中文模式逐字保留、动态日期/计数。
+- 新增 `tests/server-i18n.test.mjs`：服务端错误提示、命令与工具参数翻译。
+- 扩展 adapter / request-budget / qoder-api / state / checkin / plugin-host / client 测试；离线回归 312 条。
+
 ## [1.6.0] - 2026-11-02
 
 这一版把「看起来成功、实际丢了语义」和「一次任务被上游拆成 N 条」两类问题一起收口。

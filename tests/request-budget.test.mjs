@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { trimImages, __test } from '../lib/request-budget.mjs';
+import { trimImages, textChars, __test } from '../lib/request-budget.mjs';
 
 const image = (seed) => ({ type: 'image_url', image_url: { url: `data:image/png;base64,${seed}` } });
 const msg = (parts) => ({ role: 'user', content: parts });
@@ -21,10 +21,33 @@ test('drops older images until the body fits the byte budget', () => {
   const big = 'A'.repeat(4096);
   const messages = [msg(Array.from({ length: 12 }, () => image(big)))];
   const out = trimImages(messages, { maxImages: 50, maxBytes: 20_000 });
-  assert.ok(out.bytes <= 20_000, `bytes=${out.bytes}`);
+  assert.ok(out.encodedBytes <= 20_000, `encodedBytes=${out.encodedBytes}`);
   assert.ok(out.droppedByBytes > 0);
   assert.ok(out.images < 12);
   assert.equal(out.messages[0].content[11].type, 'image_url', 'newest image stays');
+});
+
+test('extraBytes (tools / chat_context) share the encoded budget', () => {
+  const messages = [msg([{ type: 'text', text: 'hello' }])];
+  const out = trimImages(messages, { maxImages: 50, maxBytes: 20_000, extraBytes: 24_000 });
+  assert.equal(out.images, 0);
+  assert.ok(out.encodedBytes > 20_000, '工具体积已经撑爆预算，应由调用方报可读错误');
+  assert.equal(out.extraBytes, 24_000);
+});
+
+test('textChars skips base64 image data and counts tool arguments', () => {
+  const messages = [
+    msg([{ type: 'text', text: 'look' }, image('A'.repeat(1024 * 1024))]),
+    {
+      role: 'assistant',
+      content: '',
+      tool_calls: [{ id: 'c1', type: 'function', function: { name: 'read', arguments: '{"path":"a"}' } }],
+    },
+    { role: 'tool', tool_call_id: 'c1', content: 'file body' },
+  ];
+  const chars = textChars(messages);
+  assert.ok(chars < 100, `base64 图片不应计入字符数：${chars}`);
+  assert.ok(chars >= 'look'.length + 'read'.length + '{"path":"a"}'.length + 'file body'.length);
 });
 
 test('maxImages=0 removes every image and leaves text untouched', () => {

@@ -117,9 +117,10 @@ export function createRouteTable({ controller, log = () => {} }) {
         const limit = Number(url.searchParams.get('limit')) || 80;
         const model = String(url.searchParams.get('model') || '');
         const onlyFailures = url.searchParams.get('onlyFailures') === '1';
+        const onlyActionable = url.searchParams.get('onlyActionable') === '1';
         sendJson(res, 200, {
           ok: true,
-          ...(await controller.requests({ days, limit, model, onlyFailures })),
+          ...(await controller.requests({ days, limit, model, onlyFailures, onlyActionable })),
         });
       }),
     },
@@ -157,7 +158,8 @@ export function createRouteTable({ controller, log = () => {} }) {
         if (!allowRead(req, res)) return;
         // 每次都会读上游 plan/quota，并可能在 401 时刷新令牌、落盘凭据。
         if (!requireSideEffectGuard(req, res)) return;
-        sendJson(res, 200, { ok: true, ...(await controller.account()) });
+        const url = new URL(req.url || '/', 'http://127.0.0.1');
+        sendJson(res, 200, { ok: true, ...(await controller.account({ force: url.searchParams.get('refresh') === '1' })) });
       }),
     },
     {
@@ -313,6 +315,15 @@ export function createRouteTable({ controller, log = () => {} }) {
         if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-qoder-panel header' });
         const body = await readJsonBody(req);
         sendJson(res, 200, { ok: true, ...(await controller.importDesktop(body)) });
+      }),
+    },
+    {
+      kind: 'exact',
+      path: '/qoder/auth/refresh',
+      handler: wrap(async (req, res) => {
+        if (req.method !== 'POST') return sendJson(res, 405, { ok: false, error: 'method not allowed' });
+        if (!guard(req)) return sendJson(res, 403, { ok: false, error: 'missing x-qoder-panel header' });
+        sendJson(res, 200, { ok: true, ...(await controller.refreshToken()) });
       }),
     },
     {

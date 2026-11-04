@@ -125,8 +125,9 @@ test('side-effect GETs carry the panel header, plain reads do not', async () => 
 });
 
 test('account and model reads opt into the panel header', () => {
-  const accountCalls = source.match(/getJson\('\/qoder\/account', \{ panel: true \}\)/g) || [];
-  assert.equal(accountCalls.length, 2, '面板与对话页胶囊都必须带面板头');
+  const accountCalls = source.match(/getJson\(`\/qoder\/account\$\{force \? '\?refresh=1' : ''\}`, \{ panel: true \}\)/g) || [];
+  const pillCalls = source.match(/getJson\('\/qoder\/account', \{ panel: true \}\)/g) || [];
+  assert.equal(accountCalls.length + pillCalls.length, 2, '面板与对话页胶囊都必须带面板头');
   assert.match(
     source,
     /getJson\('\/qoder\/models' \+ \(refresh \? '\?refresh=1' : ''\), \{ panel: true \}\)/,
@@ -275,6 +276,17 @@ test('auto output tokens follows the same clamping as the host resolver', async 
   assert.equal(exports.autoOutputTokens(16_000, 128_000, 32_000), 16_000);
   assert.equal(exports.autoOutputTokens(0, 128_000, 32_000), 128_000);
   assert.equal(exports.autoOutputTokens(0, 0, 32_000), 32_000);
+});
+
+test('parseMaxTokens only forwards a positive integer budget', () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  assert.equal(exports.parseMaxTokens('4096'), 4096);
+  assert.equal(exports.parseMaxTokens('4096.9'), 4096);
+  assert.equal(exports.parseMaxTokens(''), 0);
+  assert.equal(exports.parseMaxTokens('0'), 0);
+  assert.equal(exports.parseMaxTokens('-8'), 0);
+  assert.equal(exports.parseMaxTokens('abc'), 0);
+  assert.equal(exports.parseMaxTokens(Infinity), 0);
 });
 
 test('a per-request timeout can outlive the default so deep diagnostics can finish', async () => {

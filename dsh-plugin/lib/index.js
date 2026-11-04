@@ -28,7 +28,7 @@ import {
 } from '../../lib/state.mjs';
 import {
   ADDON_VALIDITY_FALLBACK_DAYS, addonBatches, beijingDateKey, beijingHour, buildCheckinAccounts,
-  checkinCanClaim, claimCampaigns, summarizeCheckinAccounts,
+  checkinCanClaim, claimCampaigns, nextRunAt, summarizeCheckinAccounts,
 } from '../../lib/checkin.mjs';
 import { deviceAvailability } from '../../lib/umid.mjs';
 import { normalizeQuota, quotaSummaryText } from '../../lib/quota.mjs';
@@ -39,6 +39,7 @@ import {
   findPat, publicPatStore, readPatStore, removePat, upsertPat, writePatStore,
 } from '../../lib/pat-store.mjs';
 import { toDirectory } from '../../lib/models.mjs';
+import { setLocale, tr } from '../../lib/i18n.mjs';
 
 export const name = 'qoder';
 export const inject = ['llm'];
@@ -120,6 +121,7 @@ export function resolveConfig(raw = {}) {
     region,
     regionLabel: REGIONS[region].label,
     catalogTtlMs: num(raw.catalogTtlMs, DEFAULTS.catalogTtlMs),
+    extrasTtlMs: num(raw.extrasTtlMs === undefined ? env.QODER_EXTRAS_TTL_MS : raw.extrasTtlMs, DEFAULTS.extrasTtlMs),
     streamIdleTimeoutMs: num(raw.streamIdleTimeoutMs, DEFAULTS.streamIdleTimeoutMs),
     firstByteTimeoutMs: num(raw.firstByteTimeoutMs, DEFAULTS.firstByteTimeoutMs),
     showCost: asBool(raw.showCost, true),
@@ -133,7 +135,15 @@ export function resolveConfig(raw = {}) {
   };
 }
 
-function sanitizePrefs(input, current) {
+export function sanitizePrefs(input, current) {
+  const known = new Set(['visible', 'pinned', 'includeAll', 'contextWindowByModel', 'paramsByModel', 'uiLocale']);
+  // normalizePrefs 会保留未知顶层键，但保存时如果只回写已知键，升级后回滚
+  // 或者未来版本写的字段会在一次保存后消失。这里把 current 里的未知键原样带回。
+  const extras = {};
+  for (const [key, value] of Object.entries(current || {})) {
+    if (known.has(key) || key === 'at' || key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+    extras[key] = value;
+  }
   const visible = input?.visible === null
     ? null
     : (Array.isArray(input?.visible)
@@ -164,9 +174,13 @@ function sanitizePrefs(input, current) {
     Object.assign(paramsByModel, current.paramsByModel || {});
   }
   return {
+    ...extras,
     visible,
     pinned: typeof input?.pinned === 'string' ? input.pinned : current.pinned,
     includeAll: typeof input?.includeAll === 'boolean' ? input.includeAll : current.includeAll,
+    uiLocale: input?.uiLocale === 'en' || input?.uiLocale === 'zh'
+      ? input.uiLocale
+      : (current.uiLocale === 'en' ? 'en' : 'zh'),
     contextWindowByModel,
     paramsByModel,
   };
@@ -187,6 +201,7 @@ export function apply(ctx, rawConfig = {}) {
   };
 
   const prefs = readPrefs();
+  setLocale(prefs.uiLocale);
   let notifyCatalogUpdated = () => {};
   let authChangeTimer = null;
   let checkinKickTimer = null;
@@ -194,6 +209,7 @@ export function apply(ctx, rawConfig = {}) {
   const client = new QoderClient({
     region: config.region,
     catalogTtlMs: config.catalogTtlMs,
+    extrasTtlMs: config.extrasTtlMs,
     log,
     // 后台 stale-while-revalidate 拿到新目录后，让 DSH 的选择器跟着更新。
     onAuthChange: () => {
@@ -554,6 +570,7 @@ export function apply(ctx, rawConfig = {}) {
         pinned: adapter.prefs.pinned || '',
         visible: adapter.prefs.visible,
         includeAll: adapter.prefs.includeAll !== false,
+        uiLocale: adapter.prefs.uiLocale === 'en' ? 'en' : 'zh',
         contextWindowByModel: adapter.prefs.contextWindowByModel || {},
         paramsByModel: adapter.prefs.paramsByModel || {},
       },
@@ -564,6 +581,7 @@ export function apply(ctx, rawConfig = {}) {
       checks,
       config: {
         catalogTtlMs: config.catalogTtlMs,
+        extrasTtlMs: config.extrasTtlMs,
         streamIdleTimeoutMs: config.streamIdleTimeoutMs,
         firstByteTimeoutMs: config.firstByteTimeoutMs,
         defaultMaxTokens: config.defaultMaxTokens,
@@ -615,6 +633,7 @@ export function apply(ctx, rawConfig = {}) {
     const saved = sanitizePrefs(input || {}, adapter.prefs);
     clampContextOverrides(saved.contextWindowByModel);
     writePrefs(saved);
+    setLocale(saved.uiLocale);
     adapter.setPrefs(saved);
     adapter.setContextWindows(saved.contextWindowByModel);
     adapter.setModelParams(saved.paramsByModel);
@@ -624,6 +643,7 @@ export function apply(ctx, rawConfig = {}) {
         pinned: saved.pinned,
         visible: saved.visible,
         includeAll: saved.includeAll,
+        uiLocale: saved.uiLocale,
         contextWindowByModel: saved.contextWindowByModel || {},
         paramsByModel: saved.paramsByModel || {},
       },
@@ -861,12 +881,16 @@ export function apply(ctx, rawConfig = {}) {
       };
     });
     const summary = summarizeCheckinAccounts(mapped);
+    const autoActive = checkinState.auto && config.checkin && process.env.QODER_CHECKIN !== '0';
     return {
-      auto: checkinState.auto && config.checkin && process.env.QODER_CHECKIN !== '0',
+      auto: autoActive,
       autoConfigured: checkinState.auto,
       enabled: config.checkin && process.env.QODER_CHECKIN !== '0',
       lastRunAt: checkinState.lastRunAt,
       lastAutoAt: checkinState.lastAutoAt,
+      nextRunAt: autoActive
+        ? nextRunAt({ auto: true, results: checkinState.results, lastAutoAt: checkinState.lastAutoAt }, accounts, now)
+        : 0,
       today,
       hour,
       window: '每天 10:00（UTC+8）后开放',
@@ -994,20 +1018,14 @@ export function apply(ctx, rawConfig = {}) {
 
   function autoCheckinDue() {
     if (!config.checkin || process.env.QODER_CHECKIN === '0' || !checkinState.auto) return false;
-    const now = Date.now();
-    if (beijingHour(now) < 10) return false;
-    if (checkinState.lastAutoAt && now - checkinState.lastAutoAt < 20 * 60_000) return false;
     const accounts = checkinAccounts();
     if (!accounts.length) return false;
-    const today = beijingDateKey(now);
-    const needsUser = new Set(['device', 'login']);
-    return accounts.some((account) => {
-      const saved = checkinState.results[account.key];
-      if (!saved || beijingDateKey(saved.checkedAt) !== today) return true;
-      if (saved.status === 'claimed' || saved.status === 'already') return false;
-      // 缺设备身份 / 登录失效需要用户操作，自动重试只会在整个白天重复打空请求。
-      return !needsUser.has(saved.status);
-    });
+    const now = Date.now();
+    return now >= nextRunAt({
+      auto: true,
+      results: checkinState.results,
+      lastAutoAt: checkinState.lastAutoAt,
+    }, accounts, now);
   }
 
   function kickAutoCheckin() {
@@ -1019,7 +1037,7 @@ export function apply(ctx, rawConfig = {}) {
     if (!config.checkin) return;
     autoCheckinKick = setTimeout(kickAutoCheckin, 8000);
     if (autoCheckinKick.unref) autoCheckinKick.unref();
-    autoCheckinTimer = setInterval(kickAutoCheckin, 20 * 60_000);
+    autoCheckinTimer = setInterval(kickAutoCheckin, 60_000);
     if (autoCheckinTimer.unref) autoCheckinTimer.unref();
   }
 
@@ -1050,9 +1068,9 @@ export function apply(ctx, rawConfig = {}) {
         recent: windowed.slice(-recent).reverse(),
       };
     },
-    requests: async ({ days = 14, limit = 80, model = '', onlyFailures = false } = {}) => {
+    requests: async ({ days = 14, limit = 80, model = '', onlyFailures = false, onlyActionable = false } = {}) => {
       const labels = accountLabelMap();
-      const result = summarizeRequests(usageRecords(), { days, limit, model, onlyFailures });
+      const result = summarizeRequests(usageRecords(), { days, limit, model, onlyFailures, onlyActionable });
       return {
         ...result,
         items: result.items.map((item) => ({ ...item, accountLabel: labels.get(item.account) || '' })),
@@ -1119,9 +1137,9 @@ export function apply(ctx, rawConfig = {}) {
       }
       return checkinSnapshot();
     },
-    account: async () => {
+    account: async ({ force = false } = {}) => {
       const data = await snapshot({});
-      const extras = await client.refreshExtras().catch(() => null);
+      const extras = await client.refreshExtras({ force }).catch(() => null);
       const merged = extras || data.extras || null;
       return { ...data, extras: merged ? { ...merged, addonBatches: addonBatchesForActive() } : null };
     },
@@ -1252,6 +1270,11 @@ export function apply(ctx, rawConfig = {}) {
       notifyAdaptersUpdated();
       return { ...result, savedPat };
     },
+    refreshToken: async () => {
+      if (!client.auth) throw badRequest('尚未登录 Qoder，无法刷新令牌');
+      await client.refreshAuth();
+      return { ...(await snapshot({ desktop: false })), refreshed: true };
+    },
     logout: async () => {
       const result = await client.logout();
       try { accountState = writeAccounts({ ...accountState, current: '' }); } catch (error) {
@@ -1375,41 +1398,33 @@ export function apply(ctx, rawConfig = {}) {
       try {
         commands.register({
           name: 'qoder',
-          description: 'Qoder 接入：状态 / 登录 / 模型 / 用量 / 签到 / 诊断 / 刷新',
+          description: tr('Qoder 接入：状态 / 登录 / 模型 / 用量 / 签到 / 诊断 / 刷新'),
           input: { hint: 'status | models | usage | checkin [run] | login | logout | diagnose | refresh | test [model]' },
           async handler({ rawInput }) {
             const [first = 'status', ...rest] = String(rawInput || '').trim().split(/\s+/).filter(Boolean);
             // `/qoder` 不带参数时按 status 处理：空字符串 split 后是 ['']，
             // 旧写法会把 arg 变成空串并回复“未知子命令：”。
             const arg = first || 'status';
+            const reply = (kind, text) => ({ kind, text: tr(text) });
             if (arg === 'status') {
               const data = await snapshot({});
-              return {
-                kind: 'success',
-                text: [
-                  `登录：${data.signedIn ? '已登录' : '未登录'}${data.signedIn ? `（${data.account?.name || data.account?.email || ''}）` : ''}`,
-                  `区域：${data.regionLabel}`,
-                  `路由：${data.route.registered ? '已注册' : '未注册'}${data.route.error ? `（${data.route.error}）` : ''}`,
-                  `模型：${data.catalog.count} 个 / 可见 ${data.catalog.visibleCount} 个`,
-                  `今日：${data.usage.today.requests} 次 · ${data.usage.today.tokens} tokens`,
-                ].join('\n'),
-              };
+              return reply('success', [
+                `登录：${data.signedIn ? '已登录' : '未登录'}${data.signedIn ? `（${data.account?.name || data.account?.email || ''}）` : ''}`,
+                `区域：${data.regionLabel}`,
+                `路由：${data.route.registered ? '已注册' : '未注册'}${data.route.error ? `（${data.route.error}）` : ''}`,
+                `模型：${data.catalog.count} 个 / 可见 ${data.catalog.visibleCount} 个`,
+                `今日：${data.usage.today.requests} 次 · ${data.usage.today.tokens} tokens`,
+              ].join('\n'));
             }
             if (arg === 'models') {
               const data = await directory({});
-              if (!data.models.length) return { kind: 'error', text: data.error || '目录为空，请先登录 Qoder。' };
-              return {
-                kind: 'success',
-                text: data.models.slice(0, 60).map((model) => `${model.visible ? '✓' : '·'} ${model.id}${model.pinned ? '  [默认]' : ''}`).join('\n'),
-              };
+              if (!data.models.length) return reply('error', data.error || '目录为空，请先登录 Qoder。');
+              return reply('success', data.models.slice(0, 60).map((model) => `${model.visible ? '✓' : '·'} ${model.id}${model.pinned ? '  [默认]' : ''}`).join('\n'));
             }
             if (arg === 'usage') {
               const data = await controller.usage();
               const today = data.summary.today;
-              return {
-                kind: 'success',
-                text: `今日 ${today.requests} 次 · ${today.tokens} tokens · 成功率 ${today.successRate == null ? '—' : `${Math.round(today.successRate * 100)}%`} · 平均首字 ${today.avgFirstByteMs}ms\n最近记录：${data.recent.length} 条（详情见面板）`,
-              };
+              return reply('success', `今日 ${today.requests} 次 · ${today.tokens} tokens · 成功率 ${today.successRate == null ? '—' : `${Math.round(today.successRate * 100)}%`} · 平均首字 ${today.avgFirstByteMs}ms\n最近记录：${data.recent.length} 条（详情见面板）`);
             }
             if (arg === 'checkin') {
               const data = rest[0] === 'run'
@@ -1421,61 +1436,55 @@ export function apply(ctx, rawConfig = {}) {
                   : '今天还没领取';
                 return `${account.current ? '★' : '·'} ${account.label}（${account.regionLabel}）: ${state}${account.message ? ` · ${account.message}` : ''}`;
               });
-              return {
-                kind: data.summary.errors ? 'error' : 'success',
-                text: [
-                  `自动签到：${data.auto ? '开启' : '关闭'} · ${data.window}`,
-                  `今日已处理 ${data.summary.done}/${data.summary.total} 个账号${data.summary.credits ? ` · +${data.summary.credits} Credits` : ''}`,
-                  ...lines,
-                ].join('\n'),
-              };
+              return reply(data.summary.errors ? 'error' : 'success', [
+                `自动签到：${data.auto ? '开启' : '关闭'} · ${data.window}`,
+                `今日已处理 ${data.summary.done}/${data.summary.total} 个账号${data.summary.credits ? ` · +${data.summary.credits} Credits` : ''}`,
+                ...lines,
+              ].join('\n'));
             }
             if (arg === 'diagnose') {
               const checks = await buildChecks({ deep: true });
-              return {
-                kind: checks.every((check) => check.status === 'pass') ? 'success' : 'error',
-                text: checks.map((check) => `${check.status === 'pass' ? '✓' : check.status === 'warn' ? '!' : '✗'} ${check.label}：${check.detail}`).join('\n'),
-              };
+              return reply(
+                checks.every((check) => check.status === 'pass') ? 'success' : 'error',
+                checks.map((check) => `${check.status === 'pass' ? '✓' : check.status === 'warn' ? '!' : '✗'} ${check.label}：${check.detail}`).join('\n'),
+              );
             }
             if (arg === 'refresh') {
               const result = await controller.refreshCatalog();
-              return {
-                kind: result.error ? 'error' : 'success',
-                text: result.error
+              return reply(
+                result.error ? 'error' : 'success',
+                result.error
                   ? `目录刷新失败，继续使用缓存：${result.error}（${result.models.length} 个模型）`
                   : `目录已刷新：${result.models.length} 个模型`,
-              };
+              );
             }
             if (arg === 'login') {
               if (state.pendingDevice) {
                 const result = await controller.pollDeviceAuth(state.pendingDevice.id);
-                if (result.status === 'ready') return { kind: 'success', text: `登录成功：${result.account?.name || result.account?.email || ''}` };
+                if (result.status === 'ready') return reply('success', `登录成功：${result.account?.name || result.account?.email || ''}`);
                 if (result.status === 'expired' || result.status === 'error' || result.ok === false) {
-                  return { kind: 'error', text: `授权失败：${result.error || result.message || '会话已过期'}。请重新运行 /qoder login 发起授权。` };
+                  return reply('error', `授权失败：${result.error || result.message || '会话已过期'}。请重新运行 /qoder login 发起授权。`);
                 }
                 const uri = result.verificationUri || state.pendingDevice.verificationUri || '';
-                return { kind: 'success', text: `尚未完成授权。打开：\n${uri}\n完成后再次运行 /qoder login。` };
+                return reply('success', `尚未完成授权。打开：\n${uri}\n完成后再次运行 /qoder login。`);
               }
               const started = await controller.beginDeviceAuth();
               const codeHint = started.userCode ? `，并输入代码 ${started.userCode}` : '';
-              return {
-                kind: 'success',
-                text: `请在浏览器打开 ${started.verificationUri}${codeHint}（${Math.round(started.expiresIn / 60)} 分钟内有效）。完成后再次运行 /qoder login。`,
-              };
+              return reply('success', `请在浏览器打开 ${started.verificationUri}${codeHint}（${Math.round(started.expiresIn / 60)} 分钟内有效）。完成后再次运行 /qoder login。`);
             }
             if (arg === 'logout') {
               await controller.logout();
-              return { kind: 'success', text: '已退出 Qoder，并清除本机保存的凭据。' };
+              return reply('success', '已退出 Qoder，并清除本机保存的凭据。');
             }
             if (arg === 'test') {
               const model = rest[0] || adapter.prefs.pinned || adapter.catalogCache.models[0]?.id;
-              if (!model) return { kind: 'error', text: '目录里还没有可选模型。' };
+              if (!model) return reply('error', '目录里还没有可选模型。');
               const result = await controller.test({ model, prompt: 'Reply with the single word: pong' });
               return result.ok
-                ? { kind: 'success', text: `模型 ${model} 正常：${result.text.slice(0, 120)}（${result.latencyMs}ms）` }
-                : { kind: 'error', text: `测试失败：${result.error}` };
+                ? reply('success', `模型 ${model} 正常：${result.text.slice(0, 120)}（${result.latencyMs}ms）`)
+                : reply('error', `测试失败：${result.error}`);
             }
-            return { kind: 'error', text: `未知子命令：${arg}` };
+            return reply('error', `未知子命令：${arg}`);
           },
         });
       } catch (error) {

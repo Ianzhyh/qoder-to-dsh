@@ -588,6 +588,34 @@ test('refreshExtras refreshes an expired token once and retries both quota endpo
   assert.match(planCalls.at(-1).auth, /dt-new-token/);
 });
 
+test('refreshExtras caches quota within the TTL and force bypasses it', async () => {
+  const client = new QoderClient({ region: 'global', extrasTtlMs: 60_000, log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-cache-token',
+    expiresAt: Date.now() + 3600_000,
+    user: { id: 'u-cache-quota' },
+    source: 'token',
+  }, { silent: true, persist: false });
+
+  let calls = 0;
+  const run = (force = false) => withFetch(async (url) => {
+    calls += 1;
+    const target = String(url);
+    if (target.endsWith('/api/v2/user/plan')) return json({ plan_tier_name: 'Cached Plan' });
+    if (target.endsWith('/api/v2/quota/usage')) return json({ userQuota: { remaining: 7, total: 10, unit: 'credits' } });
+    return json({});
+  }, () => client.refreshExtras({ force }));
+
+  await run();
+  assert.equal(calls, 3, '首次读取会打 plan / quota / me-usage 三条');
+  await run();
+  assert.equal(calls, 3, 'TTL 内直接复用缓存');
+  await run(true);
+  assert.equal(calls, 6, 'force 刷新必须真正打上游');
+});
+
 test('refreshExtras exchanges a refresh-only credential before fetching quota', async () => {
   const client = new QoderClient({ region: 'global', log: () => {} });
   const rawSetAuth = client.setAuth.bind(client);
@@ -916,6 +944,29 @@ test('buildChatBody forwards the temperature preference to upstream parameters',
     model: 'auto', messages: [{ role: 'user', content: 'hi' }], max_tokens: 8,
   }, null);
   assert.equal('temperature' in unset.parameters, false, '未设置时必须继续由上游决定');
+});
+
+test('buildChatBody forwards valid stop sequences and drops junk', () => {
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-stop',
+    user: { id: 'u-stop' },
+    source: 'token',
+  }, { silent: true, persist: false });
+
+  const body = client.buildChatBody({
+    model: 'auto',
+    messages: [{ role: 'user', content: 'hi' }],
+    stop: ['</answer>', '', 42, 'END'],
+  }, null);
+  assert.deepEqual(body.parameters.stop, ['</answer>', 'END']);
+
+  const empty = client.buildChatBody({
+    model: 'auto', messages: [{ role: 'user', content: 'hi' }], stop: [],
+  }, null);
+  assert.equal('stop' in empty.parameters, false);
 });
 
 test('a catalog response that dies mid-body rejects instead of crashing or hanging', async () => {
