@@ -1378,8 +1378,9 @@ export function apply(ctx, rawConfig = {}) {
       }
     },
     clearUsage: async () => {
-      clearUsageFile();
-      return { cleared: true };
+      const backups = clearUsageFile();
+      // 告知备份路径：面板的提示要能告诉用户「还能找回」，而不是只报“已清空”。
+      return { cleared: true, backups: Array.isArray(backups) ? backups : [] };
     },
   };
 

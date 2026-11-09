@@ -13,7 +13,8 @@ process.env.APPDATA = join(home, 'appdata');
 process.env.USERPROFILE = join(home, 'user');
 process.env.QODER_REGION = 'global';
 
-const { QoderClient, shouldAdoptDesktopAuth, buildAskFinishBody } = await import('../lib/qoder-api.mjs');
+const { QoderClient, shouldAdoptDesktopAuth, buildAskFinishBody, encodeAskFinishBody } = await import('../lib/qoder-api.mjs');
+const { CosySession, qoderDecode } = await import('../lib/qoder-sign.mjs');
 const { normalizeCatalog } = await import('../lib/qoder-api.mjs');
 const { QoderAdapter, StreamTranslator, CODE } = await import('../lib/adapter.mjs');
 const { PATHS, DEFAULTS } = await import('../lib/config.mjs');
@@ -1298,4 +1299,42 @@ test('ask/finish body matches the client envelope shape', () => {
     user_id: 'u-1',
     time_consumed: 1235,
   });
+});
+
+test('releaseAsk sends the encoded envelope that Encode=1 requires', async () => {
+  // 上游 ?Encode=1 要求整个请求体走 Qoder 自定义 Base64；发明文一律 500。
+  // 这条用例盯住「编码 + 能被官方解码还原」这个契约。
+  const plain = buildAskFinishBody({ modelKey: 'dfmodel', requestSetId: 'rs-1', userId: 'u-1', elapsedMs: 10 });
+  const encoded = encodeAskFinishBody(plain);
+  assert.notEqual(encoded, plain, 'Encode=1 的请求体必须经过 qoderEncode');
+  assert.deepEqual(JSON.parse(qoderDecode(encoded).toString('utf8')), JSON.parse(plain));
+
+  // releaseAsk 必须把编码后的字节同时用于签名和请求体。
+  const client = new QoderClient({ region: 'global', log: () => {} });
+  client.setAuth({
+    schemaVersion: 1,
+    region: 'global',
+    accessToken: 'dt-finish-token',
+    user: { id: 'u-finish', name: 'Finish Tester' },
+    source: 'token',
+  }, { silent: true, persist: false });
+  const captured = [];
+  const original = CosySession.prototype.headers;
+  CosySession.prototype.headers = function patched(body, url, options) {
+    captured.push({ body, url, options });
+    return original.call(this, body, url, options);
+  };
+  try {
+    await client.releaseAsk({ requestSetId: 'rs-1', modelKey: 'dfmodel', elapsedMs: 10 }).catch(() => {});
+  } finally {
+    CosySession.prototype.headers = original;
+  }
+  assert.equal(captured.length, 1, 'releaseAsk 应该真的打了一次签名请求');
+  const sentBody = captured[0].body;
+  assert.doesNotMatch(sentBody, /^\s*\{/, '请求体不能是明文 JSON');
+  assert.match(captured[0].url, /\/ask\/finish\?Encode=1$/, 'finish 走 Encode=1');
+  assert.deepEqual(
+    JSON.parse(JSON.parse(qoderDecode(sentBody).toString('utf8')).payload).request_set_id,
+    'rs-1',
+  );
 });

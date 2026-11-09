@@ -62,10 +62,13 @@ export function createRouteTable({ controller, log = () => {} }) {
     try {
       await fn(req, res);
     } catch (error) {
-      log('panel route failed', error?.message || error);
+      // 4xx 是用户输入/操作问题（空 PAT、账号不存在、body 不是 JSON），
+      // 面板已经会把 message 显示给用户；再写一条 "panel route failed" 只会
+      // 把真实故障淹掉。只有 5xx 才算需要排查的失败。
+      const status = Number(error?.statusCode) || 500;
+      if (status >= 500) log('panel route failed', error?.message || error);
       // 客户端已经断开时不要再写响应；诊断取消走的就是这条路径。
       if (res.writableEnded || res.destroyed) return;
-      const status = Number(error?.statusCode) || 500;
       if (!res.headersSent) sendJson(res, status, { ok: false, error: String(error?.message || error) });
       else try { res.end(); } catch { /* ignore */ }
     }

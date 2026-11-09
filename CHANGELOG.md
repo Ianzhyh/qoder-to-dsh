@@ -20,6 +20,54 @@
 6. 可选：`npm publish`，让 `dsh plugin add qoder-to-dsh` 这条最短路径可用
    （registry 上目前未占用该包名）。
 
+## [1.7.2] - 2026-11-09
+
+这一版收口面板前端。核心是「英文界面的真实输出」和「时间/遮挡类显示错误」：子串翻译会把后端整句拆成半中半英，CSV 导出用 UTC 对不上界面，跨年时间不显示年份，以及 backend 少一个字段就整页白屏。
+
+### Fixed
+
+- **英文界面半中半英**：`translateText` 先跑 `EN_RULES` 再对 `EN_PHRASES` 做子串 `split/join`，键是片段而非整句，于是 `本机已没有这个账号的登录态（…），重新登录后恢复。` 这类后端整句被拆成 `本机已没有这 accounts的Sign in态…`。实测 30 条后端整句中 17 条残留中文。现在 20 条后端整句与 4 条含变量模板句（`把 X 设为默认模型` / `取消 X 的默认模型` / `把 X 的上下文…恢复为官方默认？` / `X / Y 个模型匹配 · 已显示 Z 个`）整句入字典，残留归零。
+- **计数句吞掉单位**：`12 / 14 个模型匹配 · 已显示 9 个` 的正则要求纯数字开头，带 `/` 前缀的真实渲染串匹配不到，英文变成 `12 / 14 modelsmatch · Shown 9`。
+- **`今天到期` 拼词失配**：徽标由 `${daysToExpiry === 0 ? '今天' : ...}到期` 拼出，落到 `今天`→`Today` + `到期`→`Expires` 的顺序上，输出 `TodayExpires`。
+- **EN 字典重复键**：新增条目里有 17 个键在更早的位置已经存在。`Object.assign` 下后者胜，但读代码时无法判断哪份生效；新增用例直接扫源码禁止重复键。
+- **CSV 导出时间是 UTC**：页面显示 `21:30`、导出的 `time` 是 `2026-11-09T13:30:00.000Z`，对账时像是数据错，跨日统计也会把 00:00–08:00 的请求算到前一天。改为本地时间 `YYYY-MM-DD HH:mm:ss`。
+- **跨年时间不显示年份**：`stamp()` 只输出 `MM-DD HH:mm`，一年前的 11-09 和今天看起来完全一样。非同年记录现在带年份。
+- **额度已过期但文案不说**：`nextDays < 0` 时 `nextText` 不追加任何后缀，只显示「最近到期 11月9日」，看起来像还没过期；徽标那边却说「有额度已过期」，两处口径不一致。
+- **`credits` 缺 `totals` 整页白屏**：`requestOnce` 对空 body 会兜成 `{ ok: false }`，绕过 `if (!data)` 判空，随后 `data.totals.credits` 抛 `TypeError`，而面板没有 error boundary —— 整个「用量」页消失。现在结构判空并给出可重试的空态，`series[mode]` 缺键也回落成空图而不是 `undefined`。
+- **切维度后悬停列不复位**：`useLayoutEffect` 的依赖是 `[dayCount, dataRange]`，`mode` 变化但天数不变时，指引线与 tooltip 停在旧列上，显示的却是新维度的数据。
+- **语言偏好只写不读**：服务端 `prefs.uiLocale` 从没被读回来，换机器或清 localStorage 就退回 `navigator.language`；且每次挂载都无条件 POST 一遍，多窗口会互相覆盖。现在 `localStorage` 为空时采纳服务端值，POST 只在用户主动切换时发生（顺带消掉首屏一次重复请求）。
+- **首屏 `/qoder/models` 请求两次**：`loadStatus` 的首次 `authKey` 比对成功后补拉一次，与首屏 effect 的并行加载重复。
+- **签到开关存反**：`toggleCheckinAuto` 用 `checkin.auto`（受 `QODER_CHECKIN=0` 短路的**生效值**）取反，`QODER_CHECKIN=0` 时会把配置静默翻成 `true`。改用 `autoConfigured`（用户配置值），`aria-checked` 与样式同步。
+- **别名按 Esc 仍然保存**：输入框的 `onBlur` 先于 `Escape` 生效，`setAccountEditing('')` 拦不住已触发的保存。现在用一次性标志让 `onBlur` 跳过。
+- **PAT 列表乱序覆盖**：`loadPats` 是唯一没有请求切片的 loader，慢网络下「刷新 → 立刻切换」会把 POST 返回的新 `active` 标记盖回旧快照。
+- **试跑取消判定**：改用自己持有的 `AbortController` 判断取消意图，不再只看 `err.name === 'AbortError'`（宿主断开时 fetch 抛的是 `TypeError`，用户会看到英文原文）。
+
+### Tests
+
+- 新增 3 条用例：整句模板翻译、18 条后端整句零中文残留、EN 字典无重复键。
+- 离线回归 318 条（1.7.1 为 315）。
+
+## [1.7.1] - 2026-11-09
+
+这一版只修缺陷，不动功能面。核心是「上游交互、错误码与本地数据的真实性」：回合结束的租约释放一直在白打 500，用户填错 PAT 被报成服务器错误，清空用量没有任何回滚余地，对象日志退化成 `[object Object]`，成功请求被算成「需处理」。
+
+### Fixed
+
+- **释放上游租约恒定 500**：`/algo/api/v2/service/ask/finish?Encode=1` 要求请求体本身是 `qoderEncode` 结果，1.6/1.7 一直发明文 JSON，网关一律回 500 —— 实测日志里 633 条「释放 Qoder 租约失败 HTTP 500」，等于每轮对话多打一次必败请求，服务端只能等 TTL 回收队列租约。新增 `encodeAskFinishBody()`，签名与请求体统一用编码后的字节；真实网关实测由 500 变为 200。
+- **用户输入错误被当成 500**：`importPat('')`、无法识别的令牌前缀、本机没有可导入账号、令牌验证失败等抛的是裸 `Error`，路由只能按 500 返回，面板统一显示「远程服务器返回 500」。新增 `userInputError()` 承载 `statusCode`（400/401/404/502），空 PAT 现在返回 400 与「请输入 PAT」。
+- **4xx 也被记成路由失败**：`wrap()` 把所有异常都写成 `panel route failed`，日志里堆满空 PAT、`auto 必须是布尔值` 这类用户操作，真正的 5xx 反而被淹掉。现在只有 5xx 记日志。
+- **清空用量不可回滚**：`clearUsage()` 直接 `rm` 掉 `usage.json` 与 `usage.daily.json`，误点一次明细永久消失。现在先改名成 `usage.json.bak-<时间戳>`，并在面板提示备份文件名。
+- **对象日志退化为 `[object Object]`**：`log('消息序列已清洗', wireStats)` 里 `redact()` 对对象做 `String()`，614 条日志全是 `[object Object]`，看不到裁剪了几张图、多少字节。`redact()` 现在对 Error/对象做安全序列化，单行超过 4000 字符才截断。
+- **成功记录被标「需处理」**：`errorAction(undefined)` 返回 `fail`，账本里成功请求也带 `errorAction: 'fail'`（实测 97 条成功记录中 6 条），概览的失败动作分布与「仅需处理」筛选都会失真。`errorAction()` 无错误码时返回空串，成功记录不再写 `errorAction`。
+- **面板日志页重启后空白**：内存环形缓冲只覆盖本进程启动之后，`recentLogs()` 重启即空，而 `qoder.log` 里明明有历史。现在从文件尾部按需读取（只读最后一小段，不整份载入），读不到才回退内存缓冲。
+- **额度数字可能是 NaN**：`num()` 对 `'abc'` / `'1,200'` 返回 `NaN`，一路传到 `packages[].total`，额度卡会显示 `NaN / NaN`。现在非有限值一律按缺失处理，`remainingKnown` 如实置 `false`。
+
+### Tests
+
+- `ask/finish` 新增编码契约用例：断言请求体不是明文 JSON、能被 `qoderDecode` 还原、`releaseAsk` 真的带编码后的字节发起请求。
+- 路由新增 4xx/5xx 日志用例；`state` 新增备份文件与对象 detail 序列化用例；`upstream-error` 新增「无错误码不返回 fail」用例。
+- 离线回归 315 条（1.7.0 为 312）。
+
 ## [1.7.0] - 2026-11-04
 
 这一版把「数据准确性」「面板功能」「自动化」和「中英双语」一起收口。英文界面覆盖面板、聊天错误、`/qoder` 命令与 4 个只读工具；账号名、模型名、上游原文和日志正文保持原文。

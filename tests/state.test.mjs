@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -249,6 +249,11 @@ test('usage reads are cached and writes are coalesced', async () => {
     appendUsage({ at: now + 1, model: 'e', totalTokens: 6, ok: true }, path);
     clearUsage(path);
     assert.deepEqual(readUsage(path), []);
+    assert.equal(existsSync(path), false);
+    // 清空必须留可回溯的备份，否则误点一次明细就永久消失。
+    const backups = readdirSync(dir).filter((name) => name.startsWith('usage.json.bak-'));
+    assert.equal(backups.length, 1, '清空后应留下一份 .bak-<stamp>');
+    assert.ok(JSON.parse(readFileSync(join(dir, backups[0]), 'utf8')).length > 0, '备份里要有被清掉的记录');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -417,6 +422,16 @@ test('redact removes token prefixes and bearer values', () => {
   assert.ok(!text.includes('drt-abcdefghijklmnopqrstuvwxyz'));
   assert.ok(!text.includes('abcdefghijklmnop'));
   assert.ok(text.includes('<token>'));
+});
+
+test('redact and log serialize object details instead of [object Object]', () => {
+  // 旧实现 String(obj) 会把 wireStats 这类对象 detail 写成 [object Object]，
+  // 日志里看不出裁剪了多少图片/字节。
+  const detail = { images: 3, dropped: 2, bytes: 1234 };
+  assert.equal(redact(detail), JSON.stringify(detail));
+  assert.equal(redact(new Error('boom')).includes('boom'), true);
+  assert.equal(redact(undefined), '');
+  assert.equal(redact(42), '42');
 });
 
 test('creditsReport falls back to the default range for prototype keys', () => {

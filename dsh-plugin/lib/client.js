@@ -764,10 +764,51 @@
       "字": "chars",
       "入": "in",
       "的": " ",
+      // ── 后端下发的整句 ──────────────────────────────────────────
+      // 这些句子由 index.js / checkin.mjs / quota.mjs 生成，直接作为 title /
+      // detail / message 渲染。必须整句命中字典；否则子串规则会把 "账号"
+      // 换成 "Account"、"登录" 换成 "Sign in"，产出半中半英的破碎句子。
+      "本机已没有这个账号的登录态（客户端同区只保留一份），重新登录后恢复。": "This account is no longer signed in locally (the client keeps one sign-in per region). Sign in again to restore it.",
+      "Qoder 国际版按设备去重：同一台设备每天通常只有列表里第一个账号能领到 100 Credits；这不是插件故障。": "Qoder International dedupes by device: on one device usually only the first account in the list can claim 100 Credits per day. This is not a plugin failure.",
+      "10:00（UTC+8）后开放领取": "Opens for claiming after 10:00 (UTC+8)",
+      "账号不存在或已从本机移除，请刷新后重试": "The account no longer exists or was removed from this machine. Refresh and try again.",
+      "账号不存在或已失效；请重新扫描本机登录": "The account does not exist or has expired. Rescan local sign-ins.",
+      "该账号来自插件登录，无法通过本机登录切换；请重新授权": "This account signed in through the plugin, so local sign-in cannot switch to it. Authorize again instead.",
+      "PAT 不存在；刷新列表后重试": "That PAT no longer exists. Refresh the list and try again.",
+      "当前账号正在使用这条 PAT；请先切换账号或退出登录，再删除": "The current account is using this PAT. Switch accounts or sign out before deleting it.",
+      "尚未登录 Qoder，无法刷新令牌": "Not signed in to Qoder, so the token cannot be refreshed.",
+      "尚未登录 Qoder，请先在「设置 → Qoder → 账号」授权。": "Not signed in to Qoder. Authorize in Settings → Qoder → Account first.",
+      "请选择一个模型": "Pick a model first",
+      "当前模型不支持思考档位": "This model does not support reasoning effort",
+      "Qoder 返回了空回复（没有正文或思考内容）": "Qoder returned an empty reply (no text and no reasoning)",
+      "目录为空，请先登录 Qoder。": "The catalog is empty. Sign in to Qoder first.",
+      "目录里还没有可选模型。": "No selectable models in the catalog yet.",
+      "已退出 Qoder，并清除本机保存的凭据。": "Signed out of Qoder; local encrypted credentials were removed.",
+      "只有刷新令牌，首次请求会自动换取访问令牌。": "Refresh token only; the first request will exchange it for an access token.",
+      "已过期，下一次请求会自动尝试刷新。": "Expired; the next request will try to refresh it.",
+      "（本次刷新失败，显示的是缓存）": " (refresh failed; showing cache)",
+      "登录已过期，请打开 Qoder 客户端重新登录": "Sign-in expired. Open the Qoder client and sign in again.",
+      "活动未在当前时段开放": "The campaign is not open in the current window",
+      "活动尚未下发，稍后重试": "The campaign has not been issued yet; try again later",
+      "当前没有可领取的签到活动": "No check-in campaign is available right now",
+      "尚未登录 Qoder": "Not signed in to Qoder",
+      "缺少 Qoder 客户端设备身份": "Missing the Qoder client device identity",
     });
     // i18n:en:end
 
     const EN_RULES = [
+      // 带变量的整句必须先命中：否则 "把" 留在原地、"设为默认模型" 被当成子串
+      // 替换掉，英文界面就变成 "把 Claude Set as default model"。
+      [/^把 (.+) 设为默认模型$/g, 'Set $1 as default model'],
+      [/^取消 (.+) 的默认模型$/g, 'Unset $1 as default model'],
+      [/^把 (.+) 的上下文、温度和最大输出恢复为官方默认？$/g, 'Reset $1 context, temperature, and max output to official defaults?'],
+      [/^(.+) 点「切换」立即更换插件当前使用的账号。$/g, '$1 Click Switch to change the plugin\u2019s active account.'],
+      [/^已切换到 (.+)；(.+)$/g, 'Switched to $1; $2'],
+      [/^已切换到 (.+)$/g, 'Switched to $1'],
+      [/^共 (\d+) 条（显示最近 (\d+) 条）$/g, '$1 items (showing latest $2)'],
+      [/^共 (\d+) 条$/g, '$1 items'],
+      [/^(\d+) \/ (\d+) 个模型匹配 · 已显示 (\d+) 个$/g, '$1 / $2 models match · showing $3'],
+      [/^(\d+) 个模型匹配 · 已显示 (\d+) 个$/g, '$1 models match · showing $2'],
       [/(\d{4})年(\d{1,2})月(\d{1,2})日/g, '$1-$2-$3'],
       [/(\d{1,2})月(\d{1,2})日/g, '$1/$2'],
       [/(\d{4})年(\d{1,2})月/g, '$2/$1'],
@@ -778,11 +819,10 @@
       [/^1 items$/g, '1 item'],
       [/^1 models$/g, '1 model'],
       [/^1 accounts$/g, '1 account'],
-      [/(\d+) 天后到期/g, 'Expires in $1 days'],
-      [/共 (\d+) 条/g, '$1 items'],
-      [/(\d+) 个模型匹配 · 已显示 (\d+) 个/g, '$1 models match · showing $2'],
+      [/^今天到期$/g, 'Expires today'],
+      [/^(\d+) 天后到期$/g, 'Expires in $1 days'],
       [/PAT 凭据库：(\d+) 个/g, 'PAT store: $1'],
-      [/^(.+) 点「切换」立即更换插件当前使用的账号。$/g, '$1 Click Switch to change the plugin\u2019s active account.'],
+      [/^本地用量记录已清空；原文件已备份为 (.+)$/g, 'Local usage records cleared; the original file was backed up as $1'],
       [/共 (\d+) 个/g, '$1'],
       [/共 (\d+) 次/g, '$1 requests'],
       [/(\d+) 天有效/g, 'valid for $1 days'],
@@ -1142,7 +1182,20 @@
       if (Number.isNaN(d.getTime())) return '—';
       const now = new Date();
       const time = d.toLocaleTimeString(localeTag(), { hour: '2-digit', minute: '2-digit' });
-      return d.toDateString() === now.toDateString() ? time : `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${time}`;
+      if (d.toDateString() === now.toDateString()) return time;
+      const md = `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+      // 跨年的记录必须带上年份：否则一年前的 11-09 和今天看起来一模一样。
+      return d.getFullYear() === now.getFullYear() ? `${md} ${time}` : `${d.getFullYear()}-${md} ${time}`;
+    };
+    // CSV 用本地时间：页面显示 21:30、导出的却是 13:30Z，对账时会以为数据错，
+    // 跨日统计也会把 00:00-08:00 的请求算到前一天。
+    // sv-SE 的本地格式天然是 YYYY-MM-DD HH:mm:ss，Excel 也认。
+    const csvStamp = (ts) => {
+      const value = Number(ts);
+      if (!Number.isFinite(value) || value <= 0) return '';
+      const d = new Date(value);
+      if (Number.isNaN(d.getTime())) return '';
+      return d.toLocaleString('sv-SE', { hour12: false });
     };
     const toEpochMs = (value) => {
       const n = Number(value);
@@ -1668,7 +1721,7 @@
       const nextExpiry = (ledgerNext && viewNext) ? Math.min(ledgerNext, viewNext) : (ledgerNext || viewNext);
       const nextDays = nextExpiry ? Math.floor((nextExpiry - Date.now()) / 86400000) : null;
       const nextText = nextExpiry
-        ? `最近到期 ${dateLabel(nextExpiry)}${nextDays === 0 ? '（今天）' : nextDays > 0 ? `（${nextDays} 天后）` : ''}`
+        ? `最近到期 ${dateLabel(nextExpiry)}${nextDays === 0 ? '（今天）' : nextDays > 0 ? `（${nextDays} 天后）` : '（已过期）'}`
         // 只有每一份额度都明确永久时才说不限期；有包缺字段就如实说“部分未返回”。
         : (unlimited ? '不限期' : info.expiryIncomplete ? '部分额度上游未返回到期时间'
           : info.neverExpires ? '不限期（上游标注永久额度）' : '上游未返回到期时间');
@@ -2188,7 +2241,9 @@
           onUsage && onUsage();
         } catch (err) {
           if (!alive.current) return;
-          if (err && err.name === 'AbortError') setError('已取消本次试跑。');
+          // 用自己持有的 controller 判断「是用户取消」，而不是依赖错误类型名：
+          // 宿主断开时 fetch 抛的是 TypeError: Failed to fetch，用户会看到英文原文。
+          if (controller.signal.aborted || (err && err.name === 'AbortError')) setError('已取消本次试跑。');
           else setError(String(err.message || err));
         } finally {
           abortRef.current = null;
@@ -2412,8 +2467,9 @@
       const guideRef = useRef(null);
       const dayCount = Array.isArray(data?.days) ? data.days.length : 0;
       const dataRange = data?.range?.key || '';
-      // 区间或天数变化后，旧的悬停列已经不存在；继续保留会让指引线停在旧位置。
-      useLayoutEffect(() => { setHover(null); }, [dayCount, dataRange]);
+      // 区间、天数或维度变化后，旧的悬停列已经不存在（或指向另一个分组）；
+      // 继续保留会让指引线停在旧位置、tooltip 却已换成新维度的数据。
+      useLayoutEffect(() => { setHover(null); }, [dayCount, dataRange, mode]);
       if (!data) {
         if (error) return h(Empty, {
           icon: 'chart', title: 'Credits 趋势读取失败', detail: error,
@@ -2429,9 +2485,22 @@
             h('div', { className: 'qdr-skel-line', style: { height: '150px', width: '100%' } })));
       }
       const days = Array.isArray(data.days) ? data.days : [];
+      // requestOnce 对空 body 会兜成 { ok:false }，能绕过上面的 !data 判空；
+      // 缺少 totals 时直接读会抛 TypeError，而面板没有 error boundary —— 整页白屏。
+      const totals = data.totals && typeof data.totals === 'object' ? data.totals : null;
+      if (!totals) {
+        return h(Empty, {
+          icon: 'chart',
+          title: 'Credits 数据不完整',
+          detail: error || '接口没有返回 totals 字段；可重试，或重启 dsh 后刷新。',
+          action: h(Button, { size: 'sm', icon: 'refresh', onClick: onRefresh }, '重试'),
+        });
+      }
+      const dayCredits = (day) => Number(day?.credits) || 0;
       const groups = mode === 'all'
-        ? [{ key: 'all', label: '全部', credits: data.totals.credits, points: days.map((day) => day.credits) }]
-        : ((data.series && data.series[mode]) || []);
+        ? [{ key: 'all', label: '全部', credits: Number(totals.credits) || 0, points: days.map(dayCredits) }]
+        // series 缺这个维度时回落成空图而不是 undefined（否则 yMax/图例全崩）。
+        : (Array.isArray(data.series?.[mode]) ? data.series[mode] : []);
       const W = 760;
       const H = 238;
       const pad = { l: 46, r: 14, t: 16, b: 30 };
@@ -2490,7 +2559,7 @@
           h('div', null,
             h('div', { className: 'qdr-credits-label' }, 'Credits 消耗'),
             h('div', { className: 'qdr-credits-total' },
-              creditsText(data.totals.credits),
+              creditsText(totals.credits),
               h('button', {
                 type: 'button', className: 'qdr-credits-info',
                 title: '只统计本机请求元数据，不包含 prompt / 回复内容',
@@ -2699,8 +2768,9 @@
                 : null),
             h('div', { className: 'qdr-checkin-actions' },
               h('button', {
-                type: 'button', role: 'switch', 'aria-checked': Boolean(data.auto),
-                className: `qdr-switch${data.auto ? ' qdr-switch-on' : ''}`,
+                type: 'button', role: 'switch',
+                'aria-checked': Boolean(data.autoConfigured === undefined ? data.auto : data.autoConfigured),
+                className: `qdr-switch${(data.autoConfigured === undefined ? data.auto : data.autoConfigured) ? ' qdr-switch-on' : ''}`,
                 disabled: Boolean(busy) || !data.enabled,
                 title: data.enabled ? '每天 10:00 后自动领取本机所有账号' : '自动签到已被 QODER_CHECKIN=0 禁用',
                 onClick: onToggleAuto,
@@ -2845,6 +2915,8 @@
       const [accountBusy, setAccountBusy] = useState(true);
       const [accountActionBusy, setAccountActionBusy] = useState('');
       const [accountEditing, setAccountEditing] = useState('');
+      // 记住"这次 blur 是 Esc 触发的"：别名输入框的 onBlur 会先于 onKeyDown 生效。
+      const aliasCancelRef = useRef('');
       const [showHiddenAccounts, setShowHiddenAccounts] = useState(false);
       const [checkin, setCheckin] = useState(null);
       const [checkinBusy, setCheckinBusy] = useState(false);
@@ -2869,6 +2941,7 @@
       const logsSeq = useRef(0);
       const accountSeq = useRef(0);
       const modelsSeq = useRef(0);
+      const patsSeq = useRef(0);
       const statusSeq = useRef(0);
       const checkinSeq = useRef(0);
       const diagnosticsSeq = useRef(0);
@@ -2882,13 +2955,28 @@
         };
       }, []);
 
+      // 服务端 prefs.uiLocale 是跨机器/清缓存后的唯一记忆。以前这里只写不读，
+      // 于是换机器或清了 localStorage 就退回 navigator.language，而每次挂载
+      // 又无条件 POST 一遍 —— 多窗口会被“后打开的那个”覆盖。
+      const localeSeeded = useRef(false);
+      useEffect(() => {
+        if (!status || localeSeeded.current) return;
+        localeSeeded.current = true;
+        if (storedLangMode() !== 'auto') return;
+        const server = status.prefs && status.prefs.uiLocale;
+        if (server !== 'en' && server !== 'zh') return;
+        setUILangMode(server);
+        setLangMode(server);
+      }, [status]);
+
       useEffect(() => {
         const locale = resolveLangMode(langMode);
         if (localeSynced.current === locale) return;
         postJson('/qoder/prefs', { uiLocale: locale })
           .then(() => { localeSynced.current = locale; })
           .catch(() => {});
-      }, [langMode, status]);
+        // 只跟用户主动切换走；不再依赖 status，否则每次刷新状态都会多打一次 POST。
+      }, [langMode]);
 
       useLayoutEffect(() => {
         const measure = () => {
@@ -3028,10 +3116,13 @@
           setError('');
           syncDrafts(data);
           const key = `${data.signedIn}:${data.region}:${data.account && data.account.uid}`;
+          // 首次（authKey 为空）不在这里补拉：首屏 effect 已经并行发了
+          // loadModels(false)，再拉一次等于每次打开面板都多打一次上游。
           if (key !== authKey.current) {
+            const first = authKey.current === '';
             authKey.current = key;
             setRegion(data.region || 'global');
-            if (data.signedIn) loadModels(false);
+            if (!first && data.signedIn) loadModels(false);
           }
         } catch (err) {
           if (!mounted.current || seq !== statusSeq.current) return;
@@ -3200,13 +3291,16 @@
       }, [applyAccountPayload, notifyAuth, showNotice]);
 
       const loadPats = useCallback(async () => {
+        // 没有序号守卫时，慢网络下「刷新 → 立刻切换」会把 POST 返回的新列表
+        // （含新的 active 标记）覆盖回旧快照，切换成功的「当前」徽标又消失。
+        const seq = ++patsSeq.current;
         try {
           const data = await getJson('/qoder/pats');
-          if (!mounted.current) return;
+          if (!mounted.current || seq !== patsSeq.current) return;
           setPats(data);
           setPatStoreError(String(data.error || ''));
         } catch (err) {
-          if (mounted.current) setPatStoreError(String(err.message || err));
+          if (mounted.current && seq === patsSeq.current) setPatStoreError(String(err.message || err));
         }
       }, []);
 
@@ -3218,6 +3312,8 @@
           const data = await postJson('/qoder/pats/switch', { id });
           if (!mounted.current) return;
           if (data.ok === false) throw new Error(data.error || '切换失败');
+          // 让在途的 GET 作废：它带的是切换前快照，晚到会把新 active 标记盖回去。
+          patsSeq.current += 1;
           setPats(data);
           setShowPat(false);
           showNotice('ok', data.warning ? `已切换 PAT 账号；${data.warning}` : '已切换 PAT 账号');
@@ -3238,6 +3334,8 @@
           const data = await postJson('/qoder/pats/delete', { id: entry.id });
           if (!mounted.current) return;
           if (data.ok === false) throw new Error(data.error || '删除失败');
+          // 同上：避免刚删掉的条目被一份更早的列表刷回来。
+          patsSeq.current += 1;
           setPats(data);
           showNotice('ok', 'PAT 已删除');
         } catch (err) {
@@ -3320,7 +3418,10 @@
         if (checkinBusy || !checkin) return;
         setCheckinBusy(true);
         try {
-          const data = await postJson('/qoder/checkin/config', { auto: !checkin.auto });
+          // auto 是「生效值」（被 QODER_CHECKIN=0 / 插件开关短路），autoConfigured
+          // 才是用户存的配置。用 auto 取反会在 env 关闭时把配置静默翻成 true。
+          const current = checkin.autoConfigured === undefined ? checkin.auto : checkin.autoConfigured;
+          const data = await postJson('/qoder/checkin/config', { auto: !current });
           if (!mounted.current) return;
           setCheckin(data);
           showNotice('ok', data.autoConfigured ? '自动签到已开启。' : '自动签到已关闭。');
@@ -3702,12 +3803,17 @@
       const clearUsage = () => {
         if (!confirmText('清空本地用量记录？\n只删除 token/延迟统计，不影响 Qoder 账号和模型。')) return;
         run('clear', async () => {
-          await postJson('/qoder/usage/clear');
+          const result = await postJson('/qoder/usage/clear');
           setUsage(null);
           setCredits(null);
           await loadStatus(false);
           await loadCredits(creditsRange);
-          showNotice('ok', '本地用量记录已清空。');
+          // 清空会在 qoder 目录留下 .bak-<时间戳>；把路径告诉用户，
+          // 误点时还有得救，而不是一句“已清空”就再也找不回来。
+          const backups = (result && Array.isArray(result.backups)) ? result.backups : [];
+          showNotice('ok', backups.length
+            ? `本地用量记录已清空；原文件已备份为 ${backups.map((item) => String(item).split(/[\\/]/).pop()).join(' / ')}`
+            : '本地用量记录已清空。');
         });
       };
 
@@ -3731,7 +3837,7 @@
         downloadCsv('qoder-requests.csv',
           ['time', 'model', 'ok', 'status', 'probe', 'firstByteMs', 'latencyMs', 'promptTokens', 'completionTokens', 'cachedTokens', 'cacheHitRate', 'reasoningTokens', 'credits', 'savedCredits', 'account', 'client', 'errorCode', 'error'],
           items.map((item) => [
-            new Date(item.at).toISOString(), item.model, item.ok ? 'ok' : 'fail', item.status,
+            csvStamp(item.at), item.model, item.ok ? 'ok' : 'fail', item.status,
             item.probe ? 'probe' : '', item.firstByteMs, item.latencyMs,
             item.promptTokens, item.completionTokens, item.cachedTokens,
             item.promptTokens ? Number((item.cachedTokens / item.promptTokens).toFixed(4)) : '',
@@ -4553,10 +4659,18 @@
                       maxLength: 24,
                       placeholder: row.rawName || row.name,
                       'aria-label': '账号别名',
-                      onBlur: (event) => saveAccountAlias(row, event.target.value),
+                      // Esc 会先触发 blur，光靠 setAccountEditing('') 拦不住保存；
+                      // 用一个一次性标志让 onBlur 知道这次是取消。
+                      onBlur: (event) => {
+                        if (aliasCancelRef.current === row.key) return;
+                        saveAccountAlias(row, event.target.value);
+                      },
                       onKeyDown: (event) => {
                         if (event.key === 'Enter') event.currentTarget.blur();
-                        else if (event.key === 'Escape') setAccountEditing('');
+                        else if (event.key === 'Escape') {
+                          aliasCancelRef.current = row.key;
+                          setAccountEditing('');
+                        }
                       },
                     }) : h('strong', { 'data-i18n': 'off' }, row.name),
                     row.alias ? h(Badge, { tone: 'accent' }, '别名') : null,

@@ -341,3 +341,68 @@ test('unlimited quota pill never renders -1', async () => {
   assert.equal(exports.quotaPillText({ unlimited: false, remaining: 0, total: 10, remainingKnown: false }), '— / 10');
   assert.equal(exports.quotaPillText(null), '');
 });
+
+test('English templates translate whole sentences, not just their substrings', async () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  exports.setUILangMode('en');
+  // 模板句里含变量：子串规则会把 "把" 留在原地、"设为默认模型" 换掉，
+  // 产出 "把 Claude Set as default model"。整句模板必须先命中。
+  assert.equal(exports.translateText('把 Claude 设为默认模型'), 'Set Claude as default model');
+  assert.equal(exports.translateText('取消 Claude 的默认模型'), 'Unset Claude as default model');
+  assert.equal(
+    exports.translateText('把 Claude 的上下文、温度和最大输出恢复为官方默认？'),
+    'Reset Claude context, temperature, and max output to official defaults?',
+  );
+  // 计数句：结尾的 "个" 不能只留一个裸数字。
+  assert.equal(exports.translateText('12 / 14 个模型匹配 · 已显示 9 个'), '12 / 14 models match · showing 9');
+  assert.equal(exports.translateText('共 62 条（显示最近 62 条）'), '62 items (showing latest 62)');
+  // 到期徽标由两个词拼出来，必须整句命中。
+  assert.equal(exports.translateText('今天到期'), 'Expires today');
+  assert.equal(exports.translateText('7 天后到期'), 'Expires in 7 days');
+});
+
+test('backend-generated sentences have no Chinese left in English mode', async () => {
+  const { exports } = loadClient(async () => jsonResponse(200, {}));
+  exports.setUILangMode('en');
+  // 这些整句由 index.js / checkin.mjs 生成，直接作为 title / detail 渲染。
+  // 一旦落到子串替换就会变成 "本机已没有这 accounts的Sign in态…"。
+  const backend = [
+    '本机已没有这个账号的登录态（客户端同区只保留一份），重新登录后恢复。',
+    'Qoder 国际版按设备去重：同一台设备每天通常只有列表里第一个账号能领到 100 Credits；这不是插件故障。',
+    '10:00（UTC+8）后开放领取',
+    '今天还没领取',
+    '账号不存在或已从本机移除，请刷新后重试',
+    '账号不存在或已失效；请重新扫描本机登录',
+    '该账号来自插件登录，无法通过本机登录切换；请重新授权',
+    'PAT 不存在；刷新列表后重试',
+    '当前账号正在使用这条 PAT；请先切换账号或退出登录，再删除',
+    '尚未登录 Qoder，无法刷新令牌',
+    '请选择一个模型',
+    '当前模型不支持思考档位',
+    'Qoder 返回了空回复（没有正文或思考内容）',
+    '目录为空，请先登录 Qoder。',
+    '目录里还没有可选模型。',
+    '已退出 Qoder，并清除本机保存的凭据。',
+    '只有刷新令牌，首次请求会自动换取访问令牌。',
+    '已过期，下一次请求会自动尝试刷新。',
+  ];
+  const leftovers = backend
+    .map((text) => [text, exports.translateText(text)])
+    .filter(([, out]) => /[\u4e00-\u9fa5]/.test(out));
+  assert.deepEqual(leftovers, [], `英文模式仍有 ${leftovers.length} 条后端整句残留中文`);
+});
+
+test('English dictionary has no duplicate keys (later entries would silently win)', async () => {
+  const start = source.indexOf('const EN = Object.assign(');
+  const end = source.indexOf('// i18n:en:end');
+  const block = source.slice(start, end);
+  const re = /^\s*"((?:[^"\\]|\\.)*)"\s*:/gm;
+  const seen = new Set();
+  const dupes = [];
+  let match;
+  while ((match = re.exec(block))) {
+    if (seen.has(match[1])) dupes.push(match[1]);
+    else seen.add(match[1]);
+  }
+  assert.deepEqual(dupes, [], `EN 字典有 ${dupes.length} 个重复键`);
+});

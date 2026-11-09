@@ -104,3 +104,46 @@ test('trial rejects non-finite budgets instead of sending max_tokens: null', asy
   await call('POST', '/qoder/test', { raw: '{"model":"auto","maxTokens":12.9}', panel: true });
   assert.equal(seen.test.maxTokens, 12, '预算必须是整数');
 });
+
+test('user-input errors keep their 4xx status and are not logged as route failures', async () => {
+  const logged = [];
+  const table = createRouteTable({
+    controller: {
+      ...controller,
+      importPat: async () => {
+        const error = new Error('请输入 PAT');
+        error.statusCode = 400;
+        throw error;
+      },
+      status: async () => {
+        throw new Error('boom');
+      },
+    },
+    log: (message) => logged.push(String(message)),
+  });
+  const find = (path) => table.find((item) => item.path === path);
+
+  const readBody = (route, body) => {
+    const req = createReq({
+      method: 'POST',
+      url: '/qoder/auth/pat',
+      raw: body,
+      headers: { 'x-qoder-panel': '1' },
+    });
+    const res = createRes();
+    return route.handler(req, res).then(async () => { await res.done; return { status: res.statusCode, json: JSON.parse(res.body) }; });
+  };
+
+  const pat = await readBody(find('/qoder/auth/pat'), '{"token":""}');
+  assert.equal(pat.status, 400, '空 PAT 是用户输入问题，不能报 500');
+  assert.match(pat.json.error, /PAT/);
+  assert.deepEqual(logged, [], '4xx 不该写 "panel route failed" 日志');
+
+  // 5xx 仍要留日志：这才是需要排查的失败。
+  const statusRoute = find('/qoder/status');
+  const res = createRes();
+  await statusRoute.handler(createReq({ method: 'GET', url: '/qoder/status' }), res);
+  await res.done;
+  assert.equal(res.statusCode, 500);
+  assert.deepEqual(logged, ['panel route failed'], '5xx 才需要写失败日志');
+});

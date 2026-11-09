@@ -64,6 +64,10 @@ test('error actions give one next step per class', () => {
   assert.equal(errorAction(CODE.CONTEXT, 'prompt too long'), ACTION.COMPACT);
   assert.equal(errorAction(CODE.MODEL_NOT_FOUND, 'unknown model'), ACTION.PICK_MODEL);
   assert.equal(errorAction(CODE.EMPTY, ''), ACTION.RETRY);
+  // 成功记录没有错误码：不能返回 fail，否则概览与「仅需处理」会把成功算成待办。
+  assert.equal(errorAction('', ''), '');
+  assert.equal(errorAction(undefined, ''), '');
+  assert.equal(errorAction(null, 'ok'), '');
 });
 
 test('extractErrorEnvelope unwraps nested and escaped messages', () => {
