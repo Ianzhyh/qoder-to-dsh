@@ -302,6 +302,19 @@ test('nextRunAt waits for 10:00, retries pending accounts, and stops after all s
   assert.equal(nextRunAt({ auto: true, results: needsUser }, accounts, after), open + 86400000, '缺设备/需登录不再自动空转');
   assert.equal(nextRunAt({ auto: false }, accounts, after), 0);
   assert.equal(nextRunAt({ auto: true }, [], after), 0);
+
+  // 报错/无活动不该继续按 20 分钟重试：以前会从 10:00 一直重试到午夜（42 次）。
+  const errored = { 'cn:u1': { checkedAt: after, status: 'error' } };
+  assert.equal(nextRunAt({ auto: true, results: errored, lastAutoAt: after }, accounts, after), open + 86400000);
+  const unavailable = { 'cn:u1': { checkedAt: after, status: 'unavailable' } };
+  assert.equal(nextRunAt({ auto: true, results: unavailable, lastAutoAt: after }, accounts, after), open + 86400000);
+  // 活动尚未下发时仍值得今天再试一次。
+  const pending = { 'cn:u1': { checkedAt: after, status: 'pending' } };
+  assert.equal(
+    nextRunAt({ auto: true, results: pending, lastAutoAt: after }, accounts, after),
+    after + 20 * 60_000,
+    'pending 仍然可以当天重试',
+  );
 });
 
 test('addonBatches drops expired batches and reports untracked claims honestly', () => {

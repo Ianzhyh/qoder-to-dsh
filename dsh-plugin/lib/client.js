@@ -3295,7 +3295,8 @@
         // （含新的 active 标记）覆盖回旧快照，切换成功的「当前」徽标又消失。
         const seq = ++patsSeq.current;
         try {
-          const data = await getJson('/qoder/pats');
+          // 该路由会解密 PAT 凭据库，服务端要求面板头（跨站 GET 不能触发）。
+          const data = await getJson('/qoder/pats', { panel: true });
           if (!mounted.current || seq !== patsSeq.current) return;
           setPats(data);
           setPatStoreError(String(data.error || ''));
@@ -3368,7 +3369,8 @@
         if (!silent) setCheckinBusy(true);
         if (!silent) setCheckinError('');
         try {
-          const data = await getJson('/qoder/checkin');
+          // 该路由会落盘 accounts.json，服务端要求面板头。
+          const data = await getJson('/qoder/checkin', { panel: true });
           if (mounted.current && seq === checkinSeq.current) setCheckin(data);
         } catch (err) {
           if (!silent && mounted.current && seq === checkinSeq.current) setCheckinError(String(err.message || err));

@@ -147,3 +147,40 @@ test('user-input errors keep their 4xx status and are not logged as route failur
   assert.equal(res.statusCode, 500);
   assert.deepEqual(logged, ['panel route failed'], '5xx 才需要写失败日志');
 });
+
+test('QoderAuthError maps to 401 so the panel stops treating it as a network blip', async () => {
+  // QoderAuthError 只有 code='AUTH'，没有 statusCode。落到 500 时前端按
+  // `status >= 500` 判定为「网络抖动」继续轮询，用户永远停在「正在重试授权状态」。
+  const logged = [];
+  const table = createRouteTable({
+    controller: {
+      refreshToken: async () => {
+        const error = new Error('尚未登录 Qoder，无法刷新令牌');
+        error.name = 'QoderAuthError';
+        error.code = 'AUTH';
+        throw error;
+      },
+    },
+    log: (message) => logged.push(String(message)),
+  });
+  const route = table.find((item) => item.path === '/qoder/auth/refresh');
+  const res = createRes();
+  await route.handler(createReq({ method: 'POST', url: '/qoder/auth/refresh', headers: { 'x-qoder-panel': '1' } }), res);
+  await res.done;
+  assert.equal(res.statusCode, 401);
+  assert.match(JSON.parse(res.body).error, /刷新令牌/);
+  assert.deepEqual(logged, [], '401 是鉴权结果，不该记成路由失败');
+});
+
+test('side-effect GETs require the panel header', async () => {
+  // accounts / pats / checkin 都会写盘或解密凭据库；跨站 <img> 能发 GET，
+  // 但带不上自定义头。缺了这道门等于把 CSRF 保护漏掉三个入口。
+  const table = createRouteTable({ controller, log: () => {} });
+  for (const path of ['/qoder/accounts', '/qoder/pats', '/qoder/checkin']) {
+    const route = table.find((item) => item.path === path);
+    const denied = createRes();
+    await route.handler(createReq({ method: 'GET', url: path }), denied);
+    await denied.done;
+    assert.equal(denied.statusCode, 403, `${path} 必须要求面板头`);
+  }
+});

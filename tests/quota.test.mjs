@@ -77,10 +77,36 @@ test('future package arrays are accepted and grouped', () => {
     totalUsagePercentage: 0.15,
   });
   assert.equal(view.packages.length, 2);
-  assert.equal(view.totals.total, 1000);
-  assert.equal(view.totals.remaining, 850);
+  // expiresAt 1000/2000 是 1970 年，早已过期：过期包不能再算进「剩余」，
+  // 否则额度卡会显示用户根本用不到的数字。
+  assert.equal(view.totals.total, 0);
+  assert.equal(view.totals.remaining, 0);
   assert.equal(view.groups.length, 2);
   assert.deepEqual(view.groups.map((group) => group.expiresAt), [1000, 2000]);
+});
+
+test('expired packages are excluded from totals but stay visible', () => {
+  const now = Date.UTC(2026, 10, 9);
+  const view = normalizeQuota({
+    userQuota: { total: 300, used: 250, remaining: 50 },
+    dedicatedResourcePackages: [
+      { total: 100, used: 0, remaining: 100, expiresAt: now - 3 * 86400000 },
+    ],
+  }, { now });
+  assert.equal(view.totals.remaining, 50, '只剩未过期包的余额');
+  assert.equal(view.totals.total, 300);
+  const expired = view.packages.find((item) => item.source === 'dedicated');
+  assert.equal(expired.expired, true, '过期包仍然展示');
+  assert.equal(expired.remaining, 100);
+});
+
+test('groups flag an unknown remaining instead of reporting 0', () => {
+  // 上游只给 cap+used（没有 remaining）时，累加会把「未知」变成 0，
+  // 面板据此渲染出 "0 / 1,000 / 剩余 0"，与顶部 "— / 1,000" 自相矛盾。
+  const view = normalizeQuota({ orgResourcePackage: { cap: 1000, used: 400 } });
+  const group = view.groups[0];
+  assert.equal(group.total, 1000);
+  assert.equal(group.remainingKnown, false, '必须标记为未知，而不是 0');
 });
 
 test('account mismatch and old-build responses become warnings', () => {

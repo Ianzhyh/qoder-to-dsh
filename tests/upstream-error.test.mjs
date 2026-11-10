@@ -70,6 +70,33 @@ test('error actions give one next step per class', () => {
   assert.equal(errorAction(null, 'ok'), '');
 });
 
+test('numeric upstream codes survive the `code N` shape used by the classifier', () => {
+  // adapter 把 detail 与 codeLabel 拼成 "… code 110"。缺了这个前缀，
+  // 403 + {"code":110} 会落到 AUTH，把「等明天/换号」指成「重新授权」。
+  assert.equal(classifyError('billing daily count exceeded code 110', 403), CODE.QUOTA);
+  assert.equal(classifyError('quota code 112', 403), CODE.QUOTA);
+  assert.equal(classifyError('trial restricted code 114', 403), CODE.INVALID);
+  assert.equal(classifyError('TOKEN_EXPIRE code 12153', 403), CODE.AUTH);
+  // 没有 code 前缀时，裸 110 不是额度信号（不能误伤普通消息）。
+  assert.equal(classifyError('some 110 ms delay', 403), CODE.AUTH);
+});
+
+test('hard quota outranks a queued retry hint', () => {
+  // 额度不足的响应也常带 retryAfterSeconds；判成 RATE_LIMIT 会给「等着」
+  // 而不是「换号/换免费模型」，用户白等十分钟。
+  assert.equal(classifyError('insufficient quota, retryAfterSeconds: 600', 429), CODE.QUOTA);
+  assert.equal(classifyError('quota exceeded retry_after_ms: 30000', 429), CODE.QUOTA);
+  assert.equal(errorAction(CODE.QUOTA, 'insufficient quota, retryAfterSeconds: 600'), ACTION.SWITCH);
+  // 真正的模型排队仍然要给等待。
+  assert.equal(classifyError('10605 isQueued retryAfterSeconds: 30', 403), CODE.RATE_LIMIT);
+});
+
+test('unclassified responses fall back to a code that has a hint', () => {
+  const unknown = classifyError('teapot', 418);
+  assert.ok(Object.values(CODE).includes(unknown), `${unknown} 必须是 CODE 枚举里的值`);
+  assert.equal(unknown, CODE.SERVER);
+});
+
 test('extractErrorEnvelope unwraps nested and escaped messages', () => {
   const plain = extractErrorEnvelope({
     error: { message: 'queued', code: 10605, retryAfterSeconds: 30 },

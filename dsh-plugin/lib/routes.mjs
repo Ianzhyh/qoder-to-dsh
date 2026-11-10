@@ -65,7 +65,11 @@ export function createRouteTable({ controller, log = () => {} }) {
       // 4xx 是用户输入/操作问题（空 PAT、账号不存在、body 不是 JSON），
       // 面板已经会把 message 显示给用户；再写一条 "panel route failed" 只会
       // 把真实故障淹掉。只有 5xx 才算需要排查的失败。
-      const status = Number(error?.statusCode) || 500;
+      // QoderAuthError 只有 code='AUTH' 没有 statusCode，缺了这条映射会变成 500，
+      // 而前端把 >=500 当网络抖动继续轮询 —— 用户永远停在“正在重试授权状态”。
+      const mapped = Number(error?.statusCode)
+        || (error?.code === 'AUTH' ? 401 : error?.code === 'INPUT' ? 400 : 0);
+      const status = mapped || 500;
       if (status >= 500) log('panel route failed', error?.message || error);
       // 客户端已经断开时不要再写响应；诊断取消走的就是这条路径。
       if (res.writableEnded || res.destroyed) return;
@@ -170,6 +174,9 @@ export function createRouteTable({ controller, log = () => {} }) {
       path: '/qoder/accounts',
       handler: wrap(async (req, res) => {
         if (!allowRead(req, res)) return;
+        // controller.accounts() → checkinAccounts() → syncKnownAccounts() 会写
+        // accounts.json。没有面板头时，跨站 <img> 就能触发账号扫描与落盘。
+        if (!requireSideEffectGuard(req, res)) return;
         sendJson(res, 200, { ok: true, ...(await controller.accounts()) });
       }),
     },
@@ -198,6 +205,8 @@ export function createRouteTable({ controller, log = () => {} }) {
       path: '/qoder/pats',
       handler: wrap(async (req, res) => {
         if (!allowRead(req, res)) return;
+        // 这条会解密 PAT 凭据库（需要 DPAPI / AES 密钥），不能由跨站 GET 触发。
+        if (!requireSideEffectGuard(req, res)) return;
         sendJson(res, 200, { ok: true, ...(await controller.pats()) });
       }),
     },
@@ -226,6 +235,8 @@ export function createRouteTable({ controller, log = () => {} }) {
       path: '/qoder/checkin',
       handler: wrap(async (req, res) => {
         if (!allowRead(req, res)) return;
+        // checkinSnapshot() 同样会经 checkinAccounts() 落盘 accounts.json。
+        if (!requireSideEffectGuard(req, res)) return;
         sendJson(res, 200, { ok: true, ...(await controller.checkin()) });
       }),
     },

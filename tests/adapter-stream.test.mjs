@@ -570,3 +570,67 @@ test('HTTP 430 retries once with the legacy COSY version', async () => {
   assert.equal(payloads[1].forceLegacy, true);
   assert.equal(payloads[0].forceLegacy, undefined);
 });
+
+test('a missing billable flag stays unknown so free models can be reconciled later', async () => {
+  // usage.billable !== false 会把「上游没给这个字段」钉成 true；一旦落盘，
+  // reconcileUsage 因为 billable !== undefined 直接跳过，免费模型的消耗
+  // 就被永久记成实扣，且没法回补。
+  const body = sseBody([
+    {
+      choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, credits: 5 },
+    },
+  ]);
+  await collect(adapterFor(fakeClient(body)));
+  const record = lastUsage();
+  assert.equal(record.billable, undefined, '未知必须保持 undefined，不能写成 true');
+  assert.equal(record.credits, 5);
+});
+
+test('an explicit billable:false records zero spend and the saved amount', async () => {
+  const body = sseBody([
+    {
+      choices: [{ delta: { content: 'ok' }, finish_reason: 'stop' }],
+      usage: { prompt_tokens: 10, completion_tokens: 2, total_tokens: 12, credits: 5, billable: false },
+    },
+  ]);
+  await collect(adapterFor(fakeClient(body)));
+  const record = lastUsage();
+  assert.equal(record.billable, false);
+  assert.equal(record.credits, 0);
+  assert.equal(record.savedCredits, 5);
+});
+
+test('403 with a numeric quota code is not reported as an auth failure', async () => {
+  // Qoder 常见形态：403 + {"code":110} 表示日限，{"code":112} 表示额度不足。
+  // 以前 adapter 只把 codeLabel 裸拼进分类文本，全都落到 AUTH，把「等明天/
+  // 换号」指成「重新授权」。
+  const cases = [
+    ['{"code":110,"message":"billing daily count exceeded"}', CODE.QUOTA],
+    ['{"code":112,"message":"insufficient quota"}', CODE.QUOTA],
+    ['{"code":114,"message":"trial restricted"}', CODE.INVALID],
+    ['{"code":12153,"message":"TOKEN_EXPIRE"}', CODE.AUTH],
+  ];
+  for (const [text, expected] of cases) {
+    const chunks = await collect(adapterFor(errorClient({ status: 403, text })));
+    const finish = chunks.find((chunk) => chunk.type === 'finish');
+    assert.equal(finish.reason.failure.code, expected, `${text} 应判为 ${expected}`);
+  }
+});
+
+test('catalogClientStale on the client disables the model preflight gate', () => {
+  // catalogClientStale 只由 QoderClient 赋值；adapter 以前读自己的同名字段，
+  // 而它从不被写，于是「客户端升级后放行新模型」的逃生口永远不生效。
+  const client = {
+    ...fakeClient(sseBody([])),
+    catalogClientStale: true,
+    catalogCache: { at: Date.now(), models: [{ id: 'old-model' }] },
+  };
+  const adapter = adapterFor(client);
+  adapter.catalogCache = { at: Date.now(), models: [{ id: 'old-model' }] };
+  assert.equal(adapter.modelPreflight('brand-new-model'), '', '客户端目录过期时不该拦新模型');
+
+  const fresh = adapterFor({ ...fakeClient(sseBody([])), catalogClientStale: false });
+  fresh.catalogCache = { at: Date.now(), models: [{ id: 'old-model' }] };
+  assert.match(fresh.modelPreflight('brand-new-model'), /不在当前 Qoder 目录/, '目录新鲜时仍要拦');
+});

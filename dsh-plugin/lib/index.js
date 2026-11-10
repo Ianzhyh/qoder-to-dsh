@@ -30,7 +30,7 @@ import {
   ADDON_VALIDITY_FALLBACK_DAYS, addonBatches, beijingDateKey, beijingHour, buildCheckinAccounts,
   checkinCanClaim, claimCampaigns, nextRunAt, summarizeCheckinAccounts,
 } from '../../lib/checkin.mjs';
-import { deviceAvailability } from '../../lib/umid.mjs';
+import { deviceAvailability, invalidateDeviceCache } from '../../lib/umid.mjs';
 import { normalizeQuota, quotaSummaryText } from '../../lib/quota.mjs';
 import {
   applyAccountPrefs, mergeAccounts, publicAccountRow, readAccounts, syncKnownAccounts, writeAccounts,
@@ -1184,6 +1184,8 @@ export function apply(ctx, rawConfig = {}) {
         warning = `当前账号未写入 accounts.json：${String(error?.message || error)}`;
         log('保存当前账号失败', String(error?.message || error));
       }
+      // 换号后设备身份缓存里的结论（可能是"未安装客户端"）已经不代表新账号。
+      invalidateDeviceCache();
       await directory({ refresh: true }).catch(() => {});
       notifyAdaptersUpdated();
       return { ...accountRows(), result, ...(warning ? { warning } : {}) };
@@ -1228,6 +1230,9 @@ export function apply(ctx, rawConfig = {}) {
       const result = await client.pollDeviceAuth(id);
       if (result.status === 'ready') {
         state.pendingDevice = null;
+        // 设备身份以前只在进程内缓存 60 秒且从不失效；用户刚装好客户端/换了
+        // 账号后，面板会一直报「未安装该地区 Qoder 客户端」直到重启 dsh。
+        invalidateDeviceCache();
         // 目录刷新可能横跨三个网关；不能让它拖住授权轮询，否则客户端先超时，
         // 会把已经成功的登录误报成“授权超时”。
         directory({ refresh: true }).catch(() => {});
@@ -1266,6 +1271,8 @@ export function apply(ctx, rawConfig = {}) {
           log('保存 PAT 到凭据库失败', String(error?.message || error));
         }
       }
+      // 换了账号/换了凭据：设备身份的失败缓存必须作废，否则签到仍按旧结论报错。
+      invalidateDeviceCache();
       await directory({ refresh: true }).catch(() => {});
       notifyAdaptersUpdated();
       return { ...result, savedPat };

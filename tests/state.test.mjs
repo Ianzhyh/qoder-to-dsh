@@ -335,6 +335,52 @@ test('a day with pruned details uses the daily rollup instead of undercounting',
   assert.equal(summary.seriesPartial, true);
 });
 
+test('byModel/byAccount shares use the detail total, not the daily rollup total', () => {
+  // totals 在明细被裁剪时会改用 daily；byModel 只遍历明细。分母不统一时
+  // 同页会同时出现「7 次」与「按模型合计 2 次」、占比合计 0.2857。
+  const now = Date.now();
+  const records = [
+    { at: now, model: 'a', totalTokens: 100, ok: true },
+    { at: now, model: 'a', totalTokens: 100, ok: true },
+  ];
+  const daily = {
+    days: {
+      [localDayKey(now)]: {
+        credits: 0, savedCredits: 0, promptTokens: 700, completionTokens: 0,
+        cachedTokens: 0, reasoningTokens: 0, tokens: 700, requests: 7, failures: 0,
+      },
+    },
+  };
+  const summary = summarizeUsage(records, 1, now, daily);
+  assert.equal(summary.totals.requests, 7, 'totals 来自 daily');
+  const modelRequests = summary.byModel.reduce((sum, item) => sum + item.requests, 0);
+  assert.equal(modelRequests, 2, 'byModel 来自明细');
+  const shareTotal = summary.byModel.reduce((sum, item) => sum + item.share, 0);
+  assert.ok(Math.abs(shareTotal - 1) < 1e-9, `占比合计必须是 1，实际 ${shareTotal}`);
+});
+
+test('today failure breakdown is returned and excludes probes', () => {
+  const now = Date.now();
+  const records = [
+    { at: now, model: 'a', ok: false, errorAction: 'retry', errorCode: 'TIMEOUT' },
+    { at: now, model: 'b', ok: false, status: 'test-failed', errorAction: 'retry', probe: true },
+  ];
+  const summary = summarizeUsage(records, 1, now, null);
+  // 面板的「今日请求」卡片靠这两个字段渲染「可重试 2 · 重新登录 1」。
+  assert.equal(typeof summary.today.failureByAction, 'object');
+  assert.deepEqual(summary.today.failureByAction, { retry: 1 }, '试跑不能进失败拆分');
+  assert.equal(summary.today.failures, 1);
+});
+
+test('an aborted request is not "action needed"', async () => {
+  const { isActionable } = await import('../lib/state.mjs');
+  // adapter 给 ABORTED 写 errorAction:'fail'；用户主动取消不该长期留在
+  // 「仅需处理」筛选里。
+  assert.equal(isActionable({ ok: false, status: 'aborted', errorAction: 'fail', errorCode: 'ABORTED' }), false);
+  assert.equal(isActionable({ ok: false, status: 'stream-error', errorAction: 'switch', errorCode: 'QUOTA_EXCEEDED' }), true);
+  assert.equal(isActionable({ ok: true }), false);
+});
+
 test('ensureUsageDaily repairs a daily rollup that missed newer raw records', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'qoder-daily-repair-'));
   const path = join(dir, 'usage.json');
@@ -459,17 +505,50 @@ test('normalizePrefs preserves unknown fields for forward/backward compatibility
 
 test('checkin ledger keeps one entry per account/day/credits', async () => {
   const { normalizeCheckin } = await import('../lib/state.mjs');
+  // 去重按北京时间记日（账本与签到结果都用 UTC+8），所以「跨天」的样本必须是
+  // 北京时间跨天：2026-11-07 12:00 与 2026-11-08 12:00 (UTC+8)。
+  const bj = (day) => Date.UTC(2026, 10, day, 4, 0); // 12:00 +08:00
   const clean = normalizeCheckin({
     ledger: [
-      { key: 'cn:u1', region: 'cn', at: 1_700_000_000_000, credits: 100, validityDays: 30 },
-      { key: 'cn:u1', region: 'cn', at: 1_700_000_000_000, credits: 100, validityDays: 0 },
-      { key: 'cn:u1', region: 'cn', at: 1_700_000_000_000, credits: 100, validityDays: 7 },
-      { key: 'cn:u1', region: 'cn', at: 1_700_008_640_000, credits: 100, validityDays: 0 },
-      { key: 'cn:u2', region: 'cn', at: 1_700_000_000_000, credits: 100, validityDays: 0 },
+      { key: 'cn:u1', region: 'cn', at: bj(7), credits: 100, validityDays: 30 },
+      { key: 'cn:u1', region: 'cn', at: bj(7), credits: 100, validityDays: 0 },
+      { key: 'cn:u1', region: 'cn', at: bj(7), credits: 100, validityDays: 7 },
+      { key: 'cn:u1', region: 'cn', at: bj(8), credits: 100, validityDays: 0 },
+      { key: 'cn:u2', region: 'cn', at: bj(7), credits: 100, validityDays: 0 },
       { key: 'bad', at: 0, credits: 0 },
     ],
   });
   assert.equal(clean.ledger.length, 3, '同账号同天同额度去重，跨天/跨账号保留');
   assert.equal(clean.ledger[0].validityDays, 30, '第一次出现的有效期优先');
   assert.equal(clean.ledger.every((item) => item.at > 0 && item.credits > 0), true);
+});
+
+test('checkin ledger survives an out-of-range timestamp instead of crashing the plugin', async () => {
+  const { normalizeCheckin } = await import('../lib/state.mjs');
+  // 上游把秒/纳秒写进 at（1e17 / 1.7e18）会让 toISOString 抛 RangeError；
+  // 这行在 apply() 里同步执行，一条坏记录就能让整个插件加载失败。
+  const clean = normalizeCheckin({
+    ledger: [
+      { key: 'cn:u1', at: 1e17, credits: 100 },
+      { key: 'cn:u1', at: 1.7e18, credits: 100 },
+      { key: 'cn:u1', at: 8.64e15 + 1, credits: 100 },
+      { key: 'cn:u1', at: Date.UTC(2026, 10, 7, 4, 0), credits: 100 },
+    ],
+  });
+  assert.equal(clean.ledger.length, 1, '越界记录被丢弃，合法记录保留');
+  assert.ok(clean.ledger[0].at > 0);
+});
+
+test('checkin ledger keeps both ends when it exceeds the cap', async () => {
+  const { normalizeCheckin } = await import('../lib/state.mjs');
+  // 只保留最后 N 条会让早期批次整体消失，差额被当成「到期未知」。
+  const many = Array.from({ length: 800 }, (_, i) => ({
+    key: 'cn:u1',
+    at: Date.UTC(2026, 0, 1, 4, 0) + i * 86400000,
+    credits: 10,
+  }));
+  const clean = normalizeCheckin({ ledger: many });
+  assert.equal(clean.ledger.length, 500);
+  assert.equal(clean.ledger[0].at, many[0].at, '最早的领取必须保留');
+  assert.equal(clean.ledger[clean.ledger.length - 1].at, many[many.length - 1].at, '最新的领取必须保留');
 });

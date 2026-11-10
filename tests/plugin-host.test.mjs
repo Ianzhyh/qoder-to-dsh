@@ -286,7 +286,10 @@ test('an oversized panel body is drained before the 413 so the client can read i
 });
 
 test('checkin route exposes auto state, can be toggled, and stays offline with no accounts', async () => {
-  const snapshot = await call('GET', '/qoder/checkin');
+  // 该路由会经 checkinAccounts() 落盘 accounts.json，因此要求面板头（挡跨站 GET）。
+  const readDenied = await call('GET', '/qoder/checkin');
+  assert.equal(readDenied.status, 403, '没有面板头时不能触发票据落盘');
+  const snapshot = await call('GET', '/qoder/checkin', { panel: true });
   assert.equal(snapshot.status, 200);
   assert.equal(snapshot.json.ok, true);
   assert.equal(snapshot.json.summary.total, 0);
@@ -351,7 +354,10 @@ test('quotaCheck never reports missing quota data as green', () => {
 });
 
 test('accounts routes expose display prefs and guard writes', async () => {
-  const read = await call('GET', '/qoder/accounts');
+  // 读也会写 accounts.json（syncKnownAccounts），所以同样要求面板头。
+  const noHeader = await call('GET', '/qoder/accounts');
+  assert.equal(noHeader.status, 403, '没有面板头时不能触发账号扫描与落盘');
+  const read = await call('GET', '/qoder/accounts', { panel: true });
   assert.equal(read.status, 200);
   assert.ok(Array.isArray(read.json.accounts));
   assert.ok(Array.isArray(read.json.hidden));
@@ -393,7 +399,10 @@ test('diagnostics bundle is sanitized and logs can be filtered', async () => {
 });
 
 test('PAT library lists metadata and guards switch/delete', async () => {
-  const list = await call('GET', '/qoder/pats');
+  // 读会解密 PAT 凭据库，同样要求面板头。
+  const noHeader = await call('GET', '/qoder/pats');
+  assert.equal(noHeader.status, 403, '没有面板头时不能解密凭据库');
+  const list = await call('GET', '/qoder/pats', { panel: true });
   assert.equal(list.status, 200);
   assert.ok(Array.isArray(list.json.entries));
   assert.equal(typeof list.json.count, 'number');

@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { toAdapterModels, toDirectory } from '../lib/models.mjs';
+import { shortCount, toAdapterModels, toDirectory } from '../lib/models.mjs';
 import { normalizeCatalog } from '../lib/qoder-api.mjs';
 
 const catalog = [
@@ -167,4 +167,28 @@ test('limited-time free stops being free after its end time', () => {
   assert.equal(live[0].free, true);
   assert.equal(live[0].promotion_ends_at, future * 1000);
   assert.equal(live[0].promotion_ends_at, future * 1000);
+});
+
+test('a model without a price shows unknown, not "×0 Credits"', () => {
+  // Number(null) === 0 且 isFinite(0) 为真：旧写法把「价格未知」渲染成
+  // "×0 Credits"，用户会误以为免费。
+  const models = normalizeCatalog({ chat: [{ key: 'mystery', display_name: 'Mystery', is_free: false }] }).models;
+  const row = toDirectory(models, {}).find((model) => model.id === 'mystery');
+  assert.equal(row.credits, null, '价格未知必须是 null');
+  assert.equal(row.free, false);
+});
+
+test('short counts never emit "1000K"', () => {
+  // 999949 经 Math.round(n/1000) 进位成 1000，旧实现会输出 "1000K"，
+  // 与旁边的 "1M" 两种量纲并存。
+  assert.equal(shortCount(999), '999');
+  assert.equal(shortCount(10_000), '10K');
+  assert.equal(shortCount(999_499), '999K');
+  assert.equal(shortCount(999_949), '1M');
+  assert.equal(shortCount(999_999), '1M');
+  assert.equal(shortCount(1_000_000), '1M');
+  assert.equal(shortCount(1_500_000), '1.5M');
+  for (const value of [999_499, 999_949, 999_999, 1_000_000]) {
+    assert.doesNotMatch(shortCount(value), /1000K/, `${value} 不能显示成 1000K`);
+  }
 });
